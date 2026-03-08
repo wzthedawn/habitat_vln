@@ -1,0 +1,120 @@
+{
+  "summary": {
+    "num_episodes": 1,
+    "success_rate": 0.0,
+    "spl": 0.0,
+    "oracle_success_rate": 0.0,
+    "nDTW": 0.6630620630786244,
+    "SDTW": 0.0,
+    "avg_distance_to_goal": 4.8775199750540015,
+    "avg_min_distance": 4.8775199750540015,
+    "avg_steps": 10.0,
+    "avg_trajectory_length": 2.1216342724968005,
+    "total_time_seconds": 286.78671431541443,
+    "avg_time_per_episode": 286.78671431541443
+  },
+  "by_task_level": {
+    "\u4e2d\u7b49": {
+      "count": 1,
+      "successes": 0,
+      "spl_sum": 0.0,
+      "success_rate": 0.0,
+      "spl": 0.0
+    }
+  },
+  "episodes": [
+    {
+      "episode_id": 1,
+      "scene_id": "s8pcmisQ38h",
+      "success": false,
+      "spl": 0.0,
+      "oracle_success": false,
+      "nDTW": 0.6630620630786244,
+      "SDTW": 0.0,
+      "trajectory_length": 2.1216342724968005,
+      "shortest_path_length": 10.39185905456543,
+      "steps": 10,
+      "distance_to_goal": 4.8775199750540015,
+      "min_distance_to_goal": 4.8775199750540015,
+      "instruction": "Walk down the stairs, turn right, and walk towards place with a rug. Wait near the bench and piano along the right side of the wall. ",
+      "token_usage": {
+        "total": 0,
+        "input": 0,
+        "output": 0
+      },
+      "trajectory": [
+        [
+          5.582849979400635,
+          -1.6265579462051392,
+          2.817889928817749
+        ],
+        [
+          5.582849979400635,
+          -1.6265579462051392,
+          2.817889928817749
+        ],
+        [
+          5.799129486083984,
+          -1.3936306238174438,
+          2.943281888961792
+        ],
+        [
+          6.015408992767334,
+          -1.2507351636886597,
+          3.068673849105835
+        ],
+        [
+          6.231688499450684,
+          -1.2023096084594727,
+          3.194065809249878
+        ],
+        [
+          6.447968006134033,
+          -1.5841681957244873,
+          3.218782424926758
+        ],
+        [
+          6.664247512817383,
+          -1.5457184314727783,
+          3.218782424926758
+        ],
+        [
+          6.880527019500732,
+          -1.5072687864303589,
+          3.218782424926758
+        ],
+        [
+          6.880527019500732,
+          -1.5072687864303589,
+          3.218782424926758
+        ],
+        [
+          7.05698299407959,
+          -1.4758987426757812,
+          3.218782424926758
+        ],
+        [
+          7.233438968658447,
+          -1.4445288181304932,
+          3.218782424926758
+        ]
+      ],
+      "time_elapsed": 286.7863507270813,
+      "task_level": "\u4e2d\u7b49",
+      "subtask_count": 3,
+      "evaluation_scores": [
+        0.0,
+        1.0
+      ]
+    }
+  ],
+  "config": {
+    "mp3d_path": "data/mp3d_dataset/mp3d",
+    "r2r_path": "/root/habitat-lab/data/datasets/vln/mp3d/r2r/v1/val_seen/val_seen.json",
+    "max_steps": 10,
+    "success_distance": 3.0,
+    "use_remote_llm": true,
+    "llm_server": "http://localhost:8000"
+  },
+  "timestamp": "2026-03-08T17:46:17.279122"
+}

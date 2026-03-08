@@ -1,0 +1,63 @@
+============================================================
+R2R VLN Evaluation with Multi-Agent LLM Navigation
+============================================================
+Mode: mock
+Model Type: llm
+Model Name: qwen3.5-plus
+Episodes: 20
+Max Steps: 50
+Success Distance: 3.0m
+============================================================
+[2026-03-05 21:41:42,455] [R2REvaluator] [INFO] Initializing R2R Evaluator...
+[2026-03-05 21:41:42,460] [R2REvaluator] [INFO] Loaded LLM config: model=qwen3.5-plus
+Renderer: NVIDIA GeForce RTX 4090/PCIe/SSE2 by NVIDIA Corporation
+OpenGL version: 4.6.0 NVIDIA 575.64.05
+Using optional features:
+    GL_ARB_vertex_array_object
+    GL_ARB_separate_shader_objects
+    GL_ARB_robustness
+    GL_ARB_texture_storage
+    GL_ARB_texture_view
+    GL_ARB_framebuffer_no_attachments
+    GL_ARB_invalidate_subdata
+    GL_ARB_texture_storage_multisample
+    GL_ARB_multi_bind
+    GL_ARB_direct_state_access
+    GL_ARB_get_texture_sub_image
+    GL_ARB_texture_filter_anisotropic
+    GL_KHR_debug
+    GL_KHR_parallel_shader_compile
+    GL_NV_depth_buffer_float
+Using driver workarounds:
+    no-forward-compatible-core-context
+    nv-egl-incorrect-gl11-function-pointers
+    no-layout-qualifiers-on-old-glsl
+    nv-zero-context-profile-mask
+    nv-implementation-color-read-format-dsa-broken
+    nv-cubemap-inconsistent-compressed-image-size
+    nv-cubemap-broken-full-compressed-image-query
+    nv-compressed-block-size-in-bits
+[21:41:44:825169]:[Warning]:[Metadata] SceneDatasetAttributes.cpp(107)::addNewSceneInstanceToDataset : Dataset : 'default' : Lighting Layout Attributes 'no_lights' specified in Scene Attributes but does not exist in dataset, so creating default.
+[21:41:44:825311]:[Warning]:[Scene] SemanticScene.h(331)::checkFileExists : ::loadSemanticSceneDescriptor: File `data/scene_datasets/habitat-test-scenes/apartment_1.scn` does not exist.  Aborting load.
+[21:41:44:825326]:[Warning]:[Scene] SemanticScene.cpp(123)::loadSemanticSceneDescriptor : SSD File Naming Issue! Neither SemanticAttributes-provided name : `data/scene_datasets/habitat-test-scenes/apartment_1.scn` nor constructed filename : `data/scene_datasets/habitat-test-scenes/info_semantic.json` exist on disk.
+[21:41:44:825333]:[Error]:[Scene] SemanticScene.cpp(139)::loadSemanticSceneDescriptor : SSD Load Failure! File with SemanticAttributes-provided name `data/scene_datasets/habitat-test-scenes/apartment_1.scn` exists but failed to load.
+[21:41:46:012088]:[Warning]:[Sim] Simulator.cpp(595)::instanceStageForSceneAttributes : The active scene does not contain semantic annotations : activeSemanticSceneID_ = 0
+[2026-03-05 21:41:46,014] [R2REvaluator] [INFO] Habitat environment initialized
+[2026-03-05 21:41:46,024] [R2REvaluator] [INFO] VLN Navigator initialized with model_type=llm
+[2026-03-05 21:41:46,024] [R2REvaluator] [INFO] R2R Evaluator initialization complete
+[2026-03-05 21:41:46,024] [R2REvaluator] [INFO] Generating mock R2R data...
+[2026-03-05 21:41:46,024] [R2REvaluator] [INFO] Processing scene: data/scene_datasets/habitat-test-scenes/apartment_1.glb
+[2026-03-05 21:41:46,026] [R2REvaluator] [INFO] Processing scene: data/scene_datasets/habitat-test-scenes/skokloster-castle.glb
+[2026-03-05 21:41:46,029] [R2REvaluator] [INFO] Processing scene: data/scene_datasets/habitat-test-scenes/van-gogh-room.glb
+[2026-03-05 21:41:46,031] [R2REvaluator] [INFO] Generated 18 mock episodes from 3 scenes
+[2026-03-05 21:41:46,031] [R2REvaluator] [INFO] Starting R2R evaluation with 18 episodes
+[2026-03-05 21:41:46,031] [R2REvaluator] [INFO] Episode 1/18
+Transformers not available for CLIP
+Transformers not available for CLIP
+Transformers not available for CLIP
+Transformers not available for CLIP
+Transformers not available for CLIP
+Transformers not available for CLIP
+Transformers not available for CLIP
+Transformers not available for CLIP
+Transformers not available for CLIP

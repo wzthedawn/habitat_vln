@@ -1,0 +1,242 @@
+{
+  "metrics": {
+    "SR": 0.1,
+    "SPL": 0.079,
+    "OSR": 0.15,
+    "NE": 5.22
+  },
+  "summary": {
+    "num_episodes": 20,
+    "SR": 0.1,
+    "SPL": 0.07903330469842547,
+    "OSR": 0.15,
+    "NE": 5.2203126145159615,
+    "avg_trajectory_length": 2.6863732052005767,
+    "avg_steps": 39.0
+  },
+  "by_scene": {
+    "skokloster-castle": {
+      "SR": 0.25,
+      "SPL": 0.79,
+      "OSR": 0.25,
+      "NE": 5.43,
+      "count": 8
+    },
+    "van-gogh-room": {
+      "SR": 0.0,
+      "SPL": 0,
+      "OSR": 0.167,
+      "NE": 5.24,
+      "count": 6
+    },
+    "apartment_1": {
+      "SR": 0.0,
+      "SPL": 0,
+      "OSR": 0.0,
+      "NE": 4.92,
+      "count": 6
+    }
+  },
+  "episodes": [
+    {
+      "episode_id": 0,
+      "scene": "skokloster-castle",
+      "success": false,
+      "oracle_success": false,
+      "spl": 0.0,
+      "ne": 4.45,
+      "trajectory_length": 0.0,
+      "steps": 50
+    },
+    {
+      "episode_id": 1,
+      "scene": "van-gogh-room",
+      "success": false,
+      "oracle_success": false,
+      "spl": 0.0,
+      "ne": 6.11,
+      "trajectory_length": 4.51,
+      "steps": 50
+    },
+    {
+      "episode_id": 2,
+      "scene": "van-gogh-room",
+      "success": false,
+      "oracle_success": false,
+      "spl": 0.0,
+      "ne": 5.55,
+      "trajectory_length": 0.0,
+      "steps": 50
+    },
+    {
+      "episode_id": 3,
+      "scene": "skokloster-castle",
+      "success": false,
+      "oracle_success": false,
+      "spl": 0.0,
+      "ne": 4.58,
+      "trajectory_length": 2.88,
+      "steps": 50
+    },
+    {
+      "episode_id": 4,
+      "scene": "apartment_1",
+      "success": false,
+      "oracle_success": false,
+      "spl": 0.0,
+      "ne": 3.24,
+      "trajectory_length": 2.62,
+      "steps": 9
+    },
+    {
+      "episode_id": 5,
+      "scene": "apartment_1",
+      "success": false,
+      "oracle_success": false,
+      "spl": 0.0,
+      "ne": 6.51,
+      "trajectory_length": 1.39,
+      "steps": 50
+    },
+    {
+      "episode_id": 6,
+      "scene": "skokloster-castle",
+      "success": false,
+      "oracle_success": false,
+      "spl": 0.0,
+      "ne": 6.44,
+      "trajectory_length": 6.87,
+      "steps": 50
+    },
+    {
+      "episode_id": 7,
+      "scene": "apartment_1",
+      "success": false,
+      "oracle_success": false,
+      "spl": 0.0,
+      "ne": 5.21,
+      "trajectory_length": 5.1,
+      "steps": 50
+    },
+    {
+      "episode_id": 8,
+      "scene": "skokloster-castle",
+      "success": true,
+      "oracle_success": true,
+      "spl": 0.581,
+      "ne": 1.85,
+      "trajectory_length": 1.6,
+      "steps": 1
+    },
+    {
+      "episode_id": 9,
+      "scene": "apartment_1",
+      "success": false,
+      "oracle_success": false,
+      "spl": 0.0,
+      "ne": 6.05,
+      "trajectory_length": 4.74,
+      "steps": 50
+    },
+    {
+      "episode_id": 10,
+      "scene": "van-gogh-room",
+      "success": false,
+      "oracle_success": true,
+      "spl": 0.0,
+      "ne": 3.02,
+      "trajectory_length": 1.6,
+      "steps": 1
+    },
+    {
+      "episode_id": 11,
+      "scene": "van-gogh-room",
+      "success": false,
+      "oracle_success": false,
+      "spl": 0.0,
+      "ne": 3.72,
+      "trajectory_length": 0.0,
+      "steps": 50
+    },
+    {
+      "episode_id": 12,
+      "scene": "apartment_1",
+      "success": false,
+      "oracle_success": false,
+      "spl": 0.0,
+      "ne": 5.34,
+      "trajectory_length": 8.02,
+      "steps": 50
+    },
+    {
+      "episode_id": 13,
+      "scene": "skokloster-castle",
+      "success": false,
+      "oracle_success": false,
+      "spl": 0.0,
+      "ne": 9.37,
+      "trajectory_length": 0.0,
+      "steps": 50
+    },
+    {
+      "episode_id": 14,
+      "scene": "van-gogh-room",
+      "success": false,
+      "oracle_success": false,
+      "spl": 0.0,
+      "ne": 8.62,
+      "trajectory_length": 5.06,
+      "steps": 50
+    },
+    {
+      "episode_id": 15,
+      "scene": "skokloster-castle",
+      "success": false,
+      "oracle_success": false,
+      "spl": 0.0,
+      "ne": 4.76,
+      "trajectory_length": 0.0,
+      "steps": 50
+    },
+    {
+      "episode_id": 16,
+      "scene": "van-gogh-room",
+      "success": false,
+      "oracle_success": false,
+      "spl": 0.0,
+      "ne": 4.42,
+      "trajectory_length": 2.06,
+      "steps": 50
+    },
+    {
+      "episode_id": 17,
+      "scene": "apartment_1",
+      "success": false,
+      "oracle_success": false,
+      "spl": 0.0,
+      "ne": 3.17,
+      "trajectory_length": 4.04,
+      "steps": 18
+    },
+    {
+      "episode_id": 18,
+      "scene": "skokloster-castle",
+      "success": false,
+      "oracle_success": false,
+      "spl": 0.0,
+      "ne": 9.53,
+      "trajectory_length": 1.64,
+      "steps": 50
+    },
+    {
+      "episode_id": 19,
+      "scene": "skokloster-castle",
+      "success": true,
+      "oracle_success": true,
+      "spl": 1.0,
+      "ne": 2.47,
+      "trajectory_length": 1.6,
+      "steps": 1
+    }
+  ]
+}

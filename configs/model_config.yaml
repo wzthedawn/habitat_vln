@@ -1,0 +1,156 @@
+# Model configuration for Multi-Agent VLN Navigation System
+
+# Model tier definitions
+tiers:
+  local_small:
+    models:
+      - "Qwen/Qwen3.5-4B"
+    max_tokens: 2048
+    latency_ms: 100
+    cost_per_1k_tokens: 0.0
+    capabilities:
+      - "visual_encoding"
+      - "simple_reasoning"
+      - "instruction_parsing"
+    task_types:
+      - "Type-0"
+
+  local_medium:
+    models:
+      - "Qwen/Qwen3.5-4B"
+    max_tokens: 4096
+    latency_ms: 150
+    cost_per_1k_tokens: 0.0
+    capabilities:
+      - "reasoning"
+      - "instruction_parsing"
+      - "planning"
+    task_types:
+      - "Type-0"
+      - "Type-1"
+      - "Type-2"
+
+  cloud_small:
+    models:
+      - "Qwen/Qwen3-30B-A3B-Thinking-2507"
+    max_tokens: 4096
+    latency_ms: 500
+    cost_per_1k_tokens: 0.001
+    capabilities:
+      - "reasoning"
+      - "instruction_parsing"
+      - "planning"
+      - "debate"
+    task_types:
+      - "Type-1"
+      - "Type-2"
+      - "Type-3"
+
+  cloud_large:
+    models:
+      - "qwen3.5-plus"
+    max_tokens: 8192
+    latency_ms: 1000
+    cost_per_1k_tokens: 0.004
+    capabilities:
+      - "complex_reasoning"
+      - "debate"
+      - "reflection"
+      - "spatial_reasoning"
+    task_types:
+      - "Type-3"
+      - "Type-4"
+
+# Task type to model tier mapping
+selection:
+  Type-0: "local_small"
+  Type-1: "local_medium"
+  Type-2: "local_medium"
+  Type-3: "cloud_small"
+  Type-4: "cloud_large"
+
+# Fallback chain (high to low capability)
+fallback_chain:
+  - "cloud_large"
+  - "cloud_small"
+  - "local_medium"
+  - "local_small"
+
+# Model-specific configurations
+model_configs:
+  qwen3.5-4b:
+    type: "local"
+    model_path: "/root/.cache/modelscope/hub/models/Qwen/Qwen3.5-4B"
+    device: "auto"
+    max_new_tokens: 512
+    temperature: 0.7
+
+  qwen3.5-plus:
+    type: "openai"
+    model: "qwen3.5-plus"
+    api_key: "sk-0a47c3d5c923462c9696de8d36dc08ba"
+    base_url: "https://dashscope.aliyuncs.com/compatible-mode/v1"
+    max_tokens: 4000
+    temperature: 0.7
+
+  qwen3-30b-thinking:
+    type: "openai"
+    model: "Qwen/Qwen3-30B-A3B-Thinking-2507"
+    api_key: "sk-fjoebpuejranwmbdywtoilezpypfsodztntpfpfpfskqekgj"
+    base_url: "https://api.siliconflow.cn/v1"
+    max_tokens: 8192
+    temperature: 0.7
+
+  clip-vit-base:
+    type: "clip"
+    pretrained: "openai/clip-vit-base-patch32"
+    device: "cuda"
+    batch_size: 1
+
+  llama-7b:
+    type: "llm"
+    pretrained: "meta-llama/Llama-2-7b-hf"
+    device: "cuda"
+    precision: "float16"
+    max_new_tokens: 512
+    temperature: 0.7
+
+  gpt-3.5-turbo:
+    type: "openai"
+    model: "gpt-3.5-turbo"
+    max_tokens: 2000
+    temperature: 0.7
+
+  gpt-4:
+    type: "openai"
+    model: "gpt-4"
+    max_tokens: 4000
+    temperature: 0.7
+
+  claude-opus:
+    type: "anthropic"
+    model: "claude-opus-4"
+    max_tokens: 4000
+    temperature: 0.7
+
+# Visual encoder configuration
+visual_encoder:
+  default: "clip-vit-base"
+  alternatives:
+    - "vit-base"
+    - "dinov2"
+  image_size: 224
+  normalize: true
+
+# API configurations (set via environment variables in practice)
+api:
+  openai:
+    api_key_env: "OPENAI_API_KEY"
+    organization: ""
+    base_url: ""
+    timeout: 30
+
+  anthropic:
+    api_key_env: "ANTHROPIC_API_KEY"
+    base_url: ""
+    timeout: 30

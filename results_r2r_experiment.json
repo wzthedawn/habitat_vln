@@ -1,0 +1,150 @@
+{
+  "summary": {
+    "num_episodes": 10,
+    "success_rate": 0.7,
+    "oracle_success_rate": 0.7,
+    "spl": 0.7,
+    "avg_distance_to_goal": 2.56,
+    "avg_steps": 9.7,
+    "avg_path_length": 1.32
+  },
+  "by_scene": {
+    "skokloster-castle": {
+      "success_rate": 1.0,
+      "spl": 1.0,
+      "count": 4
+    },
+    "van-gogh-room": {
+      "success_rate": 0.5,
+      "spl": 1.0,
+      "count": 2
+    },
+    "apartment_1": {
+      "success_rate": 0.5,
+      "spl": 1.0,
+      "count": 4
+    }
+  },
+  "episodes": [
+    {
+      "episode_id": 0,
+      "scene": "skokloster-castle",
+      "success": true,
+      "oracle_success": true,
+      "spl": 1.0,
+      "distance": 2.03,
+      "min_distance": 2.03,
+      "steps": 1,
+      "path_length": 1.92,
+      "geodesic_distance": 3.59
+    },
+    {
+      "episode_id": 1,
+      "scene": "van-gogh-room",
+      "success": true,
+      "oracle_success": true,
+      "spl": 1.0,
+      "distance": 0.86,
+      "min_distance": 0.86,
+      "steps": 1,
+      "path_length": 0.0,
+      "geodesic_distance": 0.86
+    },
+    {
+      "episode_id": 2,
+      "scene": "van-gogh-room",
+      "success": false,
+      "oracle_success": false,
+      "spl": 0.0,
+      "distance": 3.77,
+      "min_distance": 3.76,
+      "steps": 30,
+      "path_length": 1.75,
+      "geodesic_distance": 4.75
+    },
+    {
+      "episode_id": 3,
+      "scene": "skokloster-castle",
+      "success": true,
+      "oracle_success": true,
+      "spl": 1.0,
+      "distance": 2.95,
+      "min_distance": 2.95,
+      "steps": 1,
+      "path_length": 1.6,
+      "geodesic_distance": 4.37
+    },
+    {
+      "episode_id": 4,
+      "scene": "apartment_1",
+      "success": false,
+      "oracle_success": false,
+      "spl": 0.0,
+      "distance": 4.0,
+      "min_distance": 3.54,
+      "steps": 30,
+      "path_length": 3.3,
+      "geodesic_distance": 3.54
+    },
+    {
+      "episode_id": 5,
+      "scene": "apartment_1",
+      "success": true,
+      "oracle_success": true,
+      "spl": 1.0,
+      "distance": 1.33,
+      "min_distance": 1.33,
+      "steps": 1,
+      "path_length": 0.0,
+      "geodesic_distance": 1.33
+    },
+    {
+      "episode_id": 6,
+      "scene": "skokloster-castle",
+      "success": true,
+      "oracle_success": true,
+      "spl": 1.0,
+      "distance": 1.65,
+      "min_distance": 1.65,
+      "steps": 1,
+      "path_length": 0.94,
+      "geodesic_distance": 2.22
+    },
+    {
+      "episode_id": 7,
+      "scene": "apartment_1",
+      "success": true,
+      "oracle_success": true,
+      "spl": 1.0,
+      "distance": 2.95,
+      "min_distance": 2.95,
+      "steps": 1,
+      "path_length": 0.38,
+      "geodesic_distance": 3.31
+    },
+    {
+      "episode_id": 8,
+      "scene": "skokloster-castle",
+      "success": true,
+      "oracle_success": true,
+      "spl": 1.0,
+      "distance": 1.58,
+      "min_distance": 1.58,
+      "steps": 1,
+      "path_length": 0.71,
+      "geodesic_distance": 2.26
+    },
+    {
+      "episode_id": 9,
+      "scene": "apartment_1",
+      "success": false,
+      "oracle_success": false,
+      "spl": 0.0,
+      "distance": 4.48,
+      "min_distance": 3.61,
+      "steps": 30,
+      "path_length": 2.58,
+      "geodesic_distance": 4.13
+    }
+  ]
+}

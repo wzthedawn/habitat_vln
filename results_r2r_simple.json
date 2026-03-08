@@ -1,0 +1,92 @@
+{
+  "summary": {
+    "num_episodes": 10,
+    "success_rate": 1.0,
+    "spl": 2.52309515079021,
+    "avg_distance_to_goal": 2.7094289443599955,
+    "avg_steps": 8.2
+  },
+  "episodes": [
+    {
+      "episode_id": 0,
+      "success": true,
+      "spl": 3.5009521312797944,
+      "distance_to_goal": 2.8517477625745755,
+      "steps": 3,
+      "instruction": "Walk to destination"
+    },
+    {
+      "episode_id": 1,
+      "success": true,
+      "spl": 1.6491527394120782,
+      "distance_to_goal": 2.8745766187223016,
+      "steps": 11,
+      "instruction": "Walk to destination"
+    },
+    {
+      "episode_id": 2,
+      "success": true,
+      "spl": 1.8057085315122348,
+      "distance_to_goal": 2.759954447962844,
+      "steps": 7,
+      "instruction": "Navigate to the goal"
+    },
+    {
+      "episode_id": 3,
+      "success": true,
+      "spl": 3.456528204148042,
+      "distance_to_goal": 2.771014639262116,
+      "steps": 3,
+      "instruction": "Walk to destination"
+    },
+    {
+      "episode_id": 4,
+      "success": true,
+      "spl": 1.779012670652524,
+      "distance_to_goal": 2.7169541955809935,
+      "steps": 9,
+      "instruction": "Navigate to the goal"
+    },
+    {
+      "episode_id": 5,
+      "success": true,
+      "spl": 1.472540343572195,
+      "distance_to_goal": 2.5950778005322857,
+      "steps": 13,
+      "instruction": "Navigate to the goal"
+    },
+    {
+      "episode_id": 6,
+      "success": true,
+      "spl": 1.5709098413705065,
+      "distance_to_goal": 2.8983829266475976,
+      "steps": 12,
+      "instruction": "Navigate to the goal"
+    },
+    {
+      "episode_id": 7,
+      "success": true,
+      "spl": 7.086005015161993,
+      "distance_to_goal": 2.2719377251095154,
+      "steps": 1,
+      "instruction": "Find the target"
+    },
+    {
+      "episode_id": 8,
+      "success": true,
+      "spl": 1.5653800758987864,
+      "distance_to_goal": 2.6966115379027853,
+      "steps": 15,
+      "instruction": "Walk to destination"
+    },
+    {
+      "episode_id": 9,
+      "success": true,
+      "spl": 1.3447619548939487,
+      "distance_to_goal": 2.65803178930494,
+      "steps": 8,
+      "instruction": "Walk to destination"
+    }
+  ],
+  "timestamp": "2026-03-05T19:55:28.687149"
+}

@@ -1,0 +1,218 @@
+# Architecture configuration for task-type to Agent/Strategy mapping
+
+# Main architecture definitions for each task type
+architectures:
+  Type-0:
+    level: "weak"
+    agents: []
+    strategies: []
+    model_tier: "local_small"
+    description: "Simple navigation - single step instruction"
+    max_tokens_budget: 100
+    confidence_threshold: 0.5
+
+  Type-1:
+    level: "strong"
+    agents:
+      - "perception"
+      - "decision"
+    strategies:
+      - "ReAct"
+    model_tier: "local_medium"
+    description: "Path following - corridor navigation"
+    max_tokens_budget: 300
+    confidence_threshold: 0.6
+
+  Type-2:
+    level: "strong"
+    agents:
+      - "perception"
+      - "trajectory"
+      - "decision"
+    strategies:
+      - "ReAct"
+      - "CoT"
+    model_tier: "local_medium"
+    description: "Target search - object finding"
+    max_tokens_budget: 500
+    confidence_threshold: 0.65
+
+  Type-3:
+    level: "strong"
+    agents:
+      - "instruction"
+      - "perception"
+      - "trajectory"
+      - "decision"
+    strategies:
+      - "CoT"
+      - "Reflection"
+    model_tier: "cloud_small"
+    description: "Spatial reasoning - cross-room navigation"
+    max_tokens_budget: 1000
+    confidence_threshold: 0.7
+
+  Type-4:
+    level: "strong"
+    agents:
+      - "instruction"
+      - "perception"
+      - "trajectory"
+      - "decision"
+    strategies:
+      - "CoT"
+      - "Debate"
+      - "Reflection"
+    model_tier: "cloud_large"
+    description: "Complex decision - ambiguous scenes"
+    max_tokens_budget: 2000
+    confidence_threshold: 0.75
+
+# Strategy execution order
+strategy_order:
+  ReAct: 1
+  CoT: 2
+  Debate: 3
+  Reflection: 4
+
+# Agent priority (execution order)
+agent_priority:
+  instruction: 1
+  perception: 2
+  trajectory: 3
+  decision: 4
+
+# Agent role definitions with fixed model assignments
+agent_roles:
+  instruction:
+    name: "InstructionAgent"
+    description: "Decomposes and interprets navigation instructions"
+    model: "qwen3.5-plus"
+    model_tier: "cloud_large"
+    model_type: "api"
+    inputs:
+      - "instruction"
+    outputs:
+      - "subtasks"
+      - "landmarks"
+      - "goals"
+    priority: 1
+    required_for:
+      - "Type-3"
+      - "Type-4"
+
+  perception:
+    name: "PerceptionAgent"
+    description: "Analyzes visual observations and environment state"
+    model: "qwen3.5-plus"
+    model_tier: "cloud_large"
+    model_type: "api"
+    inputs:
+      - "visual_features"
+      - "observation"
+    outputs:
+      - "room_type"
+      - "objects"
+      - "landmarks"
+      - "obstacles"
+    priority: 2
+    required_for:
+      - "Type-1"
+      - "Type-2"
+      - "Type-3"
+      - "Type-4"
+
+  trajectory:
+    name: "TrajectoryAgent"
+    description: "Plans and evaluates navigation trajectories"
+    model: "qwen3.5-plus"
+    model_tier: "cloud_large"
+    model_type: "api"
+    inputs:
+      - "position"
+      - "goal"
+      - "history"
+    outputs:
+      - "waypoints"
+      - "path_confidence"
+      - "progress"
+    priority: 3
+    required_for:
+      - "Type-2"
+      - "Type-3"
+      - "Type-4"
+
+  decision:
+    name: "DecisionAgent"
+    description: "Makes final navigation decisions"
+    model: "Qwen/Qwen3-30B-A3B-Thinking-2507"
+    model_tier: "cloud_small"
+    model_type: "api"
+    inputs:
+      - "all_agent_outputs"
+      - "context"
+    outputs:
+      - "action"
+      - "confidence"
+      - "reasoning"
+    priority: 4
+    required_for:
+      - "Type-1"
+      - "Type-2"
+      - "Type-3"
+      - "Type-4"
+
+# Weak level model (for Type-0 simple tasks)
+weak_level:
+  model: "Qwen/Qwen3.5-4B"
+  model_tier: "local_small"
+  model_type: "local"
+  model_path: "/root/.cache/modelscope/hub/models/Qwen/Qwen3.5-4B"
+
+# Strategy configurations
+strategy_configs:
+  ReAct:
+    description: "Reasoning + Acting interleaved strategy"
+    max_iterations: 10
+    best_for:
+      - "simple_reasoning"
+      - "path_following"
+
+  CoT:
+    description: "Chain of Thought reasoning"
+    max_reasoning_steps: 5
+    best_for:
+      - "complex_reasoning"
+      - "spatial_reasoning"
+
+  Debate:
+    description: "Multi-agent debate for consensus"
+    max_rounds: 3
+    best_for:
+      - "ambiguous_decisions"
+      - "conflict_resolution"
+
+  Reflection:
+    description: "Self-evaluation and improvement"
+    reflection_depth: 3
+    best_for:
+      - "learning"
+      - "course_correction"
+
+# Adaptive architecture settings
+adaptive:
+  enabled: true
+  confidence_adjustment: true
+  fallback_on_low_confidence: true
+  min_confidence_for_strong: 0.5
+
+  # Conditions for upgrading architecture level
+  upgrade_conditions:
+    steps_without_progress: 10
+    backtrack_count: 3
+    low_confidence_count: 5
+
+  # Conditions for downgrading architecture level
+  downgrade_conditions:
+    consecutive_failures: 2
+    timeout_count: 3

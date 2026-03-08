@@ -1,0 +1,250 @@
+{
+  "summary": {
+    "num_episodes": 3,
+    "success_rate": 0.3333333333333333,
+    "spl": 1.0743001852467375,
+    "oracle_success_rate": 0.3333333333333333,
+    "ndtw": 0.3694773094056168,
+    "avg_distance_to_goal": 5.530246627024533,
+    "avg_steps": 7.0
+  },
+  "token_summary": {
+    "total_tokens": 23912,
+    "avg_per_episode": 7970.666666666667
+  },
+  "by_scene": {
+    "data/scene_datasets/habitat-test-scenes/apartment_1.glb": {
+      "count": 1,
+      "successes": 0,
+      "spl_sum": 0,
+      "success_rate": 0.0,
+      "spl": 0.0
+    },
+    "data/scene_datasets/habitat-test-scenes/skokloster-castle.glb": {
+      "count": 1,
+      "successes": 0,
+      "spl_sum": 0,
+      "success_rate": 0.0,
+      "spl": 0.0
+    },
+    "data/scene_datasets/habitat-test-scenes/van-gogh-room.glb": {
+      "count": 1,
+      "successes": 1,
+      "spl_sum": 3.2229005557402126,
+      "success_rate": 1.0,
+      "spl": 3.2229005557402126
+    }
+  },
+  "episodes": [
+    {
+      "episode_id": 0,
+      "scene_id": "data/scene_datasets/habitat-test-scenes/apartment_1.glb",
+      "success": false,
+      "spl": 0,
+      "oracle_success": false,
+      "nDTW": 0.4351824695312171,
+      "trajectory_length": 0.10394501686096191,
+      "shortest_path_length": 8.112438376976229,
+      "steps": 10,
+      "distance_to_goal": 8.216383370508822,
+      "instruction": "Find your way to the target.",
+      "token_usage": {
+        "total": 19321,
+        "input": 3208,
+        "output": 16113,
+        "api_calls": 10
+      },
+      "trajectory": [
+        [
+          6.013587951660156,
+          -1.600250005722046,
+          -2.1955349445343018
+        ],
+        [
+          6.013587951660156,
+          -1.600250005722046,
+          -2.2994799613952637
+        ],
+        [
+          6.013587951660156,
+          -1.600250005722046,
+          -2.2994799613952637
+        ],
+        [
+          6.013587951660156,
+          -1.600250005722046,
+          -2.2994799613952637
+        ],
+        [
+          6.013587951660156,
+          -1.600250005722046,
+          -2.2994799613952637
+        ],
+        [
+          6.013587951660156,
+          -1.600250005722046,
+          -2.2994799613952637
+        ],
+        [
+          6.013587951660156,
+          -1.600250005722046,
+          -2.2994799613952637
+        ],
+        [
+          6.013587951660156,
+          -1.600250005722046,
+          -2.2994799613952637
+        ],
+        [
+          6.013587951660156,
+          -1.600250005722046,
+          -2.2994799613952637
+        ],
+        [
+          6.013587951660156,
+          -1.600250005722046,
+          -2.2994799613952637
+        ],
+        [
+          6.013587951660156,
+          -1.600250005722046,
+          -2.2994799613952637
+        ]
+      ]
+    },
+    {
+      "episode_id": 0,
+      "scene_id": "data/scene_datasets/habitat-test-scenes/skokloster-castle.glb",
+      "success": false,
+      "spl": 0,
+      "oracle_success": false,
+      "nDTW": 0.018422605218176527,
+      "trajectory_length": 1.2748372392254606,
+      "shortest_path_length": 10.79034812852126,
+      "steps": 10,
+      "distance_to_goal": 7.527587662277539,
+      "instruction": "Walk towards the goal location.",
+      "token_usage": {
+        "total": 4591,
+        "input": 332,
+        "output": 4259,
+        "api_calls": 1
+      },
+      "trajectory": [
+        [
+          1.8288052082061768,
+          -1.600250005722046,
+          0.5210793018341064
+        ],
+        [
+          1.8288052082061768,
+          -1.600250005722046,
+          0.27107930183410645
+        ],
+        [
+          1.8288052082061768,
+          -1.600250005722046,
+          0.021079301834106445
+        ],
+        [
+          1.8288052082061768,
+          -1.600250005722046,
+          -0.22892069816589355
+        ],
+        [
+          1.8288052082061768,
+          -1.600250005722046,
+          -0.47892069816589355
+        ],
+        [
+          1.8288052082061768,
+          -1.4362709522247314,
+          -0.6994799375534058
+        ],
+        [
+          1.8288052082061768,
+          -1.4362709522247314,
+          -0.6994799375534058
+        ],
+        [
+          1.8288052082061768,
+          -1.4362709522247314,
+          -0.6994799375534058
+        ],
+        [
+          1.8288052082061768,
+          -1.4362709522247314,
+          -0.6994799375534058
+        ],
+        [
+          1.8288052082061768,
+          -1.4362709522247314,
+          -0.6994799375534058
+        ],
+        [
+          1.8288052082061768,
+          -1.4362709522247314,
+          -0.6994799375534058
+        ]
+      ]
+    },
+    {
+      "episode_id": 0,
+      "scene_id": "data/scene_datasets/habitat-test-scenes/van-gogh-room.glb",
+      "success": true,
+      "spl": 3.2229005557402126,
+      "oracle_success": true,
+      "nDTW": 0.6548268534674568,
+      "trajectory_length": 0.25,
+      "shortest_path_length": 0.8057251389350532,
+      "steps": 1,
+      "distance_to_goal": 0.8467688482872385,
+      "instruction": "Walk towards the goal location.",
+      "token_usage": {
+        "total": 0,
+        "input": 0,
+        "output": 0,
+        "api_calls": 0
+      },
+      "trajectory": [
+        [
+          3.280217409133911,
+          -1.600250005722046,
+          3.439605236053467
+        ],
+        [
+          3.280217409133911,
+          -1.600250005722046,
+          3.189605236053467
+        ]
+      ]
+    }
+  ],
+  "config": {
+    "mode": "mock",
+    "scene_path": "",
+    "scenes_dir": "data/scene_datasets/habitat-test-scenes",
+    "data_path": "",
+    "connectivity_path": "",
+    "num_episodes": 3,
+    "max_steps": 10,
+    "success_distance": 3.0,
+    "forward_amount": 0.25,
+    "turn_angle": 15.0,
+    "model_type": "llm",
+    "model_name": "qwen3.5-plus",
+    "api_key": "sk-0a47c3d5c923462c9696de8d36dc08ba",
+    "api_base": "https://dashscope.aliyuncs.com/compatible-mode/v1",
+    "config_file": "configs/qwen_config.yaml",
+    "output": "results_r2r.json",
+    "verbose": true,
+    "llm_config": {
+      "model_name": "qwen3.5-plus",
+      "api_key": "sk-0a47c3d5c923462c9696de8d36dc08ba",
+      "base_url": "https://dashscope.aliyuncs.com/compatible-mode/v1",
+      "max_tokens": 2000,
+      "temperature": 0.7
+    }
+  },
+  "timestamp": "2026-03-05T21:35:25.473384"
+}

@@ -1,0 +1,137 @@
+# Default configuration for Multi-Agent VLN Navigation System
+
+system:
+  name: "Multi-Agent VLN Navigator"
+  version: "1.0.0"
+  log_level: "INFO"
+
+# Navigation settings
+navigation:
+  max_steps: 500
+  stop_distance: 0.2
+  turn_angle: 15.0  # degrees
+  collision_threshold: 0.1
+  forward_step_size: 0.25
+
+# Task classifier settings
+classifier:
+  rule_threshold: 0.9
+  use_llm_fallback: true
+  cache_results: true
+
+# Supernet settings
+supernet:
+  architecture_search: false
+  adaptive_selection: true
+  default_architecture: "Type-1"
+
+# Agent settings
+agents:
+  default_model: "local"
+  fallback_model: "llm"
+  parallel_execution: false
+  timeout: 30.0
+
+  instruction_agent:
+    enabled: true
+    max_subtasks: 10
+
+  perception_agent:
+    enabled: true
+    object_detection: true
+    room_classification: true
+
+  trajectory_agent:
+    enabled: true
+    waypoint_limit: 10
+    backtracking_threshold: 0.3
+
+  decision_agent:
+    enabled: true
+    confidence_threshold: 0.6
+
+# Strategy settings
+strategies:
+  default_strategy: "ReAct"
+  max_iterations: 10
+  timeout: 30.0
+
+  ReAct:
+    max_iterations: 10
+    thought_template: "default"
+
+  CoT:
+    max_reasoning_steps: 5
+    include_verification: true
+
+  Debate:
+    max_rounds: 3
+    consensus_threshold: 0.7
+    require_unanimous: false
+
+  Reflection:
+    reflection_depth: 3
+    include_lessons: true
+    history_window: 5
+
+# Optimization settings
+optimization:
+  context_compression: true
+  compression_level: "standard"  # minimal, standard, detailed, full
+  cache_prompts: true
+  max_history_length: 50
+  token_budget_per_task:
+    Type-0: 100
+    Type-1: 300
+    Type-2: 500
+    Type-3: 1000
+    Type-4: 2000
+
+# Fallback settings
+fallback:
+  enabled: true
+  max_retries: 3
+  cascading_levels: 5
+  degrade_threshold: 2
+
+  levels:
+    - name: "strong_full"
+      agents: ["instruction", "perception", "trajectory", "decision"]
+      strategies: ["CoT", "Debate", "Reflection"]
+    - name: "strong_simplified"
+      agents: ["perception", "decision"]
+      strategies: ["ReAct"]
+    - name: "strong_minimal"
+      agents: ["decision"]
+      strategies: ["ReAct"]
+    - name: "weak"
+      agents: []
+      strategies: []
+    - name: "safe"
+      action: "observe"
+
+# Environment settings
+environment:
+  type: "habitat"
+  scene_id: ""
+  sensor_height: 1.5
+  sensor_pitch: 0.0
+
+  sensors:
+    rgb:
+      enabled: true
+      height: 224
+      width: 224
+    depth:
+      enabled: true
+      height: 224
+      width: 224
+    semantic:
+      enabled: false
+
+# Visualization settings
+visualization:
+  enabled: false
+  save_trajectory_plots: true
+  save_action_videos: false
+  output_dir: "output/"
