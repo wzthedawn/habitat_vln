@@ -39,6 +39,7 @@ import random
 import math
 import time
 import numpy as np
+from concurrent.futures import ThreadPoolExecutor, as_completed
 
 # Add project root to path
 sys.path.insert(0, str(Path(__file__).parent))
@@ -46,6 +47,12 @@ sys.path.insert(0, str(Path(__file__).parent))
 from utils.logger import setup_logger
 from utils.token_tracker import get_token_tracker
 from utils.timeout_fallback import TimeoutError, timeout, StepTimeout, DEFAULT_TIMEOUTS
+
+# Strategy imports
+from strategies.cot import CoTStrategy
+from strategies.reflection import ReflectionStrategy
+from strategies.debate import DebateStrategy
+from strategies.base_strategy import StrategyResult
 
 
 @dataclass
@@ -320,12 +327,16 @@ class MultiAgentVLNEvaluator:
             success = result["success"]
             min_distance = result["min_distance"]
             evaluation_scores = result.get("evaluation_scores", [])
+            task_level = result.get("task_level", "中等")
+            subtask_count = result.get("subtask_count", 0)
 
         except Exception as e:
             self.logger.error(f"Episode {episode.episode_id} 失败: {e}")
             trajectory = [episode.start_position]
             steps = 0
             min_distance = self._distance(episode.start_position, episode.goal_position)
+            task_level = "中等"
+            subtask_count = 0
 
         # 计算指标
         final_pos = trajectory[-1] if trajectory else episode.start_position
@@ -347,10 +358,6 @@ class MultiAgentVLNEvaluator:
         # nDTW
         ndtw = self._calculate_ndtw(trajectory, episode.reference_path)
         sdtw = ndtw if success else 0.0
-
-        # 获取任务等级
-        task_level = result.get("task_level", "中等")
-        subtask_count = result.get("subtask_count", 0)
 
         return EvaluationResult(
             episode_id=episode.episode_id,
@@ -417,6 +424,11 @@ class MultiAgentVLNEvaluator:
                 .with_instruction(episode.instruction) \
                 .with_position(tuple(start_pos)) \
                 .with_visual_features(visual_features) \
+                .with_metadata({
+                    "episode_id": episode.episode_id,
+                    "goal_position": tuple(episode.goal_position),
+                    "success_distance": self.config.get("success_distance", 3.0),
+                }) \
                 .build()
 
             # 4. 处理指令 - InstructionAgent
@@ -425,7 +437,11 @@ class MultiAgentVLNEvaluator:
                 context.metadata["instruction_output"] = instruction_output.data
                 task_level = instruction_output.data.get("task_level", "中等")
                 subtask_count = len(instruction_output.data.get("subtasks", []))
+                subtasks = instruction_output.data.get("subtasks", [])
                 self.logger.info(f"  任务等级: {task_level}, 子任务数: {subtask_count}")
+                # Log each subtask with its individual level
+                for st in subtasks:
+                    self.logger.info(f"    子任务{st['id']}: [{st['level']}] {st['description'][:50]}...")
 
             # 5. 重置TrajectoryAgent的地图
             if self.trajectory_agent:
@@ -435,14 +451,26 @@ class MultiAgentVLNEvaluator:
             if self.evaluation_agent:
                 self.evaluation_agent.reset_history()
 
+            # 7. 重置DecisionAgent的stuck检测计数器
+            if self.decision_agent:
+                self.decision_agent.reset_stuck_counter()
+
             max_steps = self.config.get("max_steps", 100)
             success_distance = self.config.get("success_distance", 3.0)
             task_level = "中等"  # Default
+
+            # ThreadPoolExecutor for parallel execution
+            executor = ThreadPoolExecutor(max_workers=2)
 
             # 7. 导航主循环
             while steps < max_steps:
                 self.logger.info(f"\n{'='*60}")
                 self.logger.info(f"Step {steps + 1}/{max_steps}")
+
+                # Log current subtask info
+                current_subtask = context.get_current_subtask()
+                if current_subtask:
+                    self.logger.info(f"当前子任务 [{current_subtask.level}]: {current_subtask.description[:50]}...")
                 self.logger.info(f"{'='*60}")
 
                 # 获取RGB和Depth图像
@@ -454,50 +482,90 @@ class MultiAgentVLNEvaluator:
                 context.metadata['rgb_image'] = rgb_image
                 context.metadata['depth_image'] = depth_image
 
-                # PerceptionAgent处理
-                if self.perception_agent:
-                    perception_output = self.perception_agent.process(context)
-                    context.metadata["perception_output"] = perception_output.data
-                    self.logger.info(f"[PerceptionAgent] 房间: {perception_output.data.get('room_type', 'unknown')}")
-                    self.logger.info(f"[PerceptionAgent] 物体: {[o['name'] for o in perception_output.data.get('objects', [])[:5]]}")
-                    self.logger.info(f"[PerceptionAgent] 场景: {perception_output.data.get('scene_description', '')[:100]}")
+                # 并行执行PerceptionAgent和TrajectoryAgent (降低频率: 每5步/每10步)
+                perception_future = None
+                trajectory_future = None
 
-                # TrajectoryAgent处理
-                if self.trajectory_agent:
-                    trajectory_output = self.trajectory_agent.process(context)
-                    context.metadata["trajectory_output"] = trajectory_output.data
-                    self.logger.info(f"[TrajectoryAgent] 已走步数: {trajectory_output.data.get('steps_taken', 0)}")
-                    self.logger.info(f"[TrajectoryAgent] 摘要: {trajectory_output.data.get('summary', '')[:100]}")
+                if self.perception_agent and steps % 5 == 0:
+                    perception_future = executor.submit(self.perception_agent.process, context)
 
-                # DecisionAgent决策
+                if self.trajectory_agent and steps % 10 == 0:
+                    trajectory_future = executor.submit(self.trajectory_agent.process, context)
+
+                # 收集并行执行结果
+                if perception_future is not None:
+                    try:
+                        perception_output = perception_future.result(timeout=60)
+                        context.metadata["perception_output"] = perception_output.data
+                        self.logger.info(f"[PerceptionAgent] 房间: {perception_output.data.get('room_type', 'unknown')}")
+                        self.logger.info(f"[PerceptionAgent] 物体: {[o['name'] for o in perception_output.data.get('objects', [])[:5]]}")
+                        self.logger.info(f"[PerceptionAgent] 场景: {perception_output.data.get('scene_description', '')[:100]}")
+                    except Exception as e:
+                        self.logger.warning(f"[PerceptionAgent] 执行失败: {e}")
+
+                if trajectory_future is not None:
+                    try:
+                        trajectory_output = trajectory_future.result(timeout=60)
+                        context.metadata["trajectory_output"] = trajectory_output.data
+                        self.logger.info(f"[TrajectoryAgent] 已走距离: {trajectory_output.data.get('distance_traveled', 0):.1f}米")
+                        self.logger.info(f"[TrajectoryAgent] 进度: {trajectory_output.data.get('progress_percentage', 0):.1f}%")
+                        self.logger.info(f"[TrajectoryAgent] 摘要: {trajectory_output.data.get('trajectory_summary', '')[:100]}")
+                    except Exception as e:
+                        self.logger.warning(f"[TrajectoryAgent] 执行失败: {e}")
+
+                # DecisionAgent决策 (每步都调用)
                 action_name = "forward"
-                if self.decision_agent:
-                    decision_output = self.decision_agent.process(context)
-                    action_name = decision_output.data.get("action", "forward")
-                    context.metadata["decision_output"] = decision_output.data
-                    self.logger.info(f"[DecisionAgent] 动作: {action_name}")
-                    self.logger.info(f"[DecisionAgent] 推理: {decision_output.data.get('reasoning', '')[:150]}")
 
-                # EvaluationAgent评估 (根据任务等级)
+                # Get task level from current subtask (not global task level)
+                current_subtask = context.get_current_subtask()
+                task_level = current_subtask.level if current_subtask else "中等"
+                use_strategy_mode = self.config.get("use_strategy_mode", False)
+
+                if use_strategy_mode and task_level in ["中等", "困难"]:
+                    # 使用策略模式进行决策 (Reflection或Debate)
+                    strategy = self._select_strategy(task_level)
+                    agents_list = [a for a in [self.perception_agent, self.trajectory_agent,
+                                                 self.decision_agent] if a is not None]
+                    strategy_result = strategy.execute(context, agents_list)
+
+                    if strategy_result.success and strategy_result.action:
+                        action_name = strategy_result.action.to_habitat_action()
+                        self.logger.info(f"[Strategy:{strategy.name}] 动作: {action_name}")
+                        self.logger.info(f"[Strategy:{strategy.name}] 置信度: {strategy_result.confidence:.2f}")
+                        self.logger.info(f"[Strategy:{strategy.name}] 推理: {strategy_result.reasoning[:150]}")
+
+                        context.metadata["strategy_output"] = {
+                            "strategy": strategy.name,
+                            "action": action_name,
+                            "confidence": strategy_result.confidence,
+                            "reasoning": strategy_result.reasoning,
+                        }
+                    else:
+                        # 策略失败，回退到直接DecisionAgent调用
+                        if self.decision_agent:
+                            decision_output = self.decision_agent.process(context)
+                            action_name = decision_output.data.get("action", "forward")
+                            self.logger.info(f"[DecisionAgent] 策略回退，动作: {action_name}")
+                else:
+                    # 直接调用DecisionAgent (简单任务或策略模式未启用)
+                    if self.decision_agent:
+                        decision_output = self.decision_agent.process(context)
+                        action_name = decision_output.data.get("action", "forward")
+                        context.metadata["decision_output"] = decision_output.data
+                        self.logger.info(f"[DecisionAgent] 动作: {action_name}")
+                        self.logger.info(f"[DecisionAgent] 推理: {decision_output.data.get('reasoning', '')[:150]}")
+
+                # EvaluationAgent评估
                 if self.evaluation_agent:
-                    # 获取任务等级
-                    task_level = context.metadata.get("instruction_output", {}).get("task_level", "中等")
-
-                    # 根据任务等级决定是否调用评估
                     should_eval = self._should_call_evaluation(task_level, steps)
-
                     if should_eval:
                         eval_output = self.evaluation_agent.process(context)
                         context.metadata["evaluation_output"] = eval_output.data
                         eval_score = eval_output.data.get("score", 0.5)
                         evaluation_scores.append(eval_score)
                         self.logger.info(f"[EvaluationAgent] 评分: {eval_score:.2f}")
-                        self.logger.info(f"[EvaluationAgent] 反馈: {eval_output.data.get('feedback', '')[:100]}")
-
-                        # 检查是否需要重新规划
                         if eval_output.data.get("replan_needed", False):
                             self.logger.info(f"  评估触发重新规划 at step {steps}")
-                            # 重置InstructionAgent的子任务
                             if self.instruction_agent:
                                 new_instruction = self.instruction_agent.process(context)
                                 context.metadata["instruction_output"] = new_instruction.data
@@ -533,6 +601,12 @@ class MultiAgentVLNEvaluator:
             self.logger.error(f"  Habitat错误: {e}")
             import traceback
             traceback.print_exc()
+        finally:
+            # 清理ThreadPoolExecutor
+            try:
+                executor.shutdown(wait=False)
+            except NameError:
+                pass  # executor wasn't created yet
 
         return {
             "trajectory": trajectory,
@@ -559,6 +633,11 @@ class MultiAgentVLNEvaluator:
                     pass  # Already correct
                 elif rgb.max() <= 1.0:
                     rgb = (rgb * 255).astype(np.uint8)
+
+                # Handle RGBA -> RGB conversion (Habitat outputs RGBA by default)
+                if rgb.ndim == 3 and rgb.shape[-1] == 4:
+                    rgb = rgb[:, :, :3]  # Take only RGB channels, drop Alpha
+                    self.logger.debug(f"Converted RGBA to RGB: {rgb.shape}")
             else:
                 rgb = np.zeros((self.image_height, self.image_width, 3), dtype=np.uint8)
 
@@ -668,6 +747,23 @@ class MultiAgentVLNEvaluator:
             return True  # 每步都评估
         return False
 
+    def _select_strategy(self, task_level: str):
+        """
+        根据任务等级选择推理策略。
+
+        Args:
+            task_level: 任务等级 (简单/中等/困难)
+
+        Returns:
+            对应的策略实例
+        """
+        if task_level == "简单":
+            return CoTStrategy()
+        elif task_level == "中等":
+            return ReflectionStrategy()
+        else:  # 困难
+            return DebateStrategy()
+
     def _run_simulated_episode(self, episode: R2REpisode) -> Dict[str, Any]:
         """模拟模式运行episode"""
         trajectory = [episode.start_position.copy()]
@@ -683,6 +779,10 @@ class MultiAgentVLNEvaluator:
         context = NavContextBuilder() \
             .with_instruction(episode.instruction) \
             .with_position(tuple(current)) \
+            .with_metadata({
+                "goal_position": tuple(episode.goal_position),
+                "success_distance": self.config.get("success_distance", 3.0),
+            }) \
             .build()
 
         # 处理指令
@@ -890,6 +990,10 @@ def main():
     parser.add_argument("--remote-timeout", type=float, default=60.0,
                         help="远程LLM请求超时时间(秒)")
 
+    # Strategy mode arguments
+    parser.add_argument("--use-strategy-mode", action="store_true", default=False,
+                        help="使用策略模式进行决策 (CoT/Reflection/Debate)")
+
     args = parser.parse_args()
 
     config = {
@@ -903,6 +1007,7 @@ def main():
         "use_remote_llm": args.use_remote_llm,
         "llm_server": args.llm_server,
         "remote_timeout": args.remote_timeout,
+        "use_strategy_mode": args.use_strategy_mode,
     }
 
     print("=" * 70)
@@ -919,6 +1024,7 @@ def main():
     print(f"远程LLM: {'启用' if args.use_remote_llm else '禁用'}")
     if args.use_remote_llm:
         print(f"LLM服务器: {args.llm_server}")
+    print(f"策略模式: {'启用' if args.use_strategy_mode else '禁用'}")
     print("=" * 70)
 
     evaluator = MultiAgentVLNEvaluator(config, log_level=args.log_level)

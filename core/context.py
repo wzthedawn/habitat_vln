@@ -23,12 +23,13 @@ class SubTask:
     id: int
     description: str
     status: str = "pending"  # pending, in_progress, completed, failed
+    level: str = "中等"  # 子任务难度等级 (简单/中等/困难)
     required_agents: List[str] = field(default_factory=list)
     dependencies: List[int] = field(default_factory=list)
     result: Optional[str] = None
 
     def __str__(self) -> str:
-        return f"SubTask({self.id}: {self.description[:30]}... [{self.status}])"
+        return f"SubTask({self.id}: {self.description[:30]}... [{self.status}] [{self.level}])"
 
 
 @dataclass

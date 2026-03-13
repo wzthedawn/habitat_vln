@@ -179,55 +179,69 @@ class ModelManager:
             True if all models loaded successfully
         """
         if self._models_loaded:
+            self.logger.info("[load_all_models] Models already loaded, skipping")
             return True
 
-        self.logger.info("Loading all models...")
+        self.logger.info("=" * 60)
+        self.logger.info("[load_all_models] Loading all models...")
+        self.logger.info(f"[load_all_models] use_remote={self.use_remote}, device={self.device}")
 
         try:
             # Check CUDA availability
             import torch
             if self.device == "cuda" and not torch.cuda.is_available():
-                self.logger.warning("CUDA not available, falling back to CPU")
+                self.logger.warning("[load_all_models] CUDA not available, falling back to CPU")
                 self.device = "cpu"
 
             # Load YOLO
+            self.logger.info("[load_all_models] Loading YOLO...")
             if not self._load_yolo():
-                self.logger.warning("YOLO loading failed, using fallback")
+                self.logger.warning("[load_all_models] YOLO loading failed, using fallback")
+            else:
+                self.logger.info("[load_all_models] YOLO loaded successfully")
 
             # Load LLMs if requested
             if load_llms:
+                self.logger.info("[load_all_models] Loading LLMs...")
                 self.load_all_llms()
 
             self._models_loaded = True
-            self.logger.info("Model loading complete")
+            self.logger.info(f"[load_all_models] Complete. Loaded models: {list(self._models.keys())}")
+            self.logger.info("=" * 60)
             return True
 
         except Exception as e:
-            self.logger.error(f"Failed to load models: {e}")
+            self.logger.error(f"[load_all_models] Failed to load models: {e}")
+            import traceback
+            traceback.print_exc()
             return False
 
     def _load_yolo(self) -> bool:
         """Load YOLOv5 model."""
         model_key = "yolov5s"
+        self.logger.info(f"[_load_yolo] Attempting to load {model_key}...")
 
         if model_key in self._models:
+            self.logger.info(f"[_load_yolo] {model_key} already loaded")
             return True
 
         try:
             from ultralytics import YOLO
 
             model_name = self.MODEL_CONFIGS[model_key]["model_name"]
-            self.logger.info(f"Loading {model_name} (YOLOv5 for numpy 2.x compatibility)...")
+            self.logger.info(f"[_load_yolo] Loading {model_name} (YOLOv5 for numpy 2.x compatibility)...")
 
             self._models[model_key] = YOLO(model_name)
-            self.logger.info(f"YOLOv5 loaded successfully")
+            self.logger.info(f"[_load_yolo] YOLOv5 loaded successfully, model type: {type(self._models[model_key])}")
             return True
 
-        except ImportError:
-            self.logger.warning("ultralytics not installed, YOLO unavailable")
+        except ImportError as e:
+            self.logger.warning(f"[_load_yolo] ultralytics not installed, YOLO unavailable: {e}")
             return False
         except Exception as e:
-            self.logger.error(f"Failed to load YOLO: {e}")
+            self.logger.error(f"[_load_yolo] Failed to load YOLO: {e}")
+            import traceback
+            traceback.print_exc()
             return False
 
     def load_llm(self, model_key: str) -> bool:
@@ -541,13 +555,25 @@ class ModelManager:
         Returns:
             List of detection dictionaries
         """
+        # Use very low threshold for indoor scenes to detect more objects
+        confidence_threshold = min(confidence_threshold, 0.05)
+
+        self.logger.info(f"[detect_objects] Called with image type: {type(image)}, threshold: {confidence_threshold}")
+
         yolo = self.get_model("yolov5s")
+        self.logger.info(f"[detect_objects] YOLO model: {yolo is not None}")
 
         if yolo is None:
+            self.logger.warning("[detect_objects] YOLO model not loaded - returning empty list")
             return []
 
         if image is None:
+            self.logger.warning("[detect_objects] YOLO input image is None - returning empty list")
             return []
+
+        # Debug logging for input image (INFO level for visibility)
+        if isinstance(image, np.ndarray):
+            self.logger.info(f"[detect_objects] YOLO input: shape={image.shape}, dtype={image.dtype}, min={image.min()}, max={image.max()}")
 
         try:
             import tempfile
@@ -578,8 +604,8 @@ class ModelManager:
                 pil_image.save(tmp_path)
 
             try:
-                # Run inference on file path
-                results = yolo(tmp_path, verbose=False)
+                # Run inference on file path with specified confidence threshold
+                results = yolo(tmp_path, conf=confidence_threshold, verbose=False)
             finally:
                 # Clean up temp file
                 os.unlink(tmp_path)
@@ -604,6 +630,29 @@ class ModelManager:
                         "bbox": [x1, y1, x2, y2],
                         "class_id": class_id,
                     })
+
+            # Log detection results (INFO level for visibility)
+            self.logger.info(f"YOLO detected {len(detections)} objects with conf >= {confidence_threshold}")
+            for det in detections[:5]:
+                self.logger.info(f"  - {det['name']}: {det['confidence']:.2f}")
+
+            # Save debug image if no objects detected
+            if len(detections) == 0:
+                self.logger.warning("[YOLO DEBUG] No objects detected! Saving debug image...")
+                try:
+                    import cv2
+                    debug_path = "/tmp/yolo_debug.jpg"
+                    if isinstance(image, np.ndarray):
+                        # Ensure proper format for saving
+                        if image.dtype != np.uint8:
+                            if image.max() <= 1.0:
+                                image = (image * 255).astype(np.uint8)
+                            else:
+                                image = image.astype(np.uint8)
+                        cv2.imwrite(debug_path, cv2.cvtColor(image, cv2.COLOR_RGB2BGR))
+                        self.logger.warning(f"[YOLO DEBUG] Image saved to {debug_path}")
+                except Exception as e:
+                    self.logger.warning(f"[YOLO DEBUG] Failed to save debug image: {e}")
 
             return detections
 

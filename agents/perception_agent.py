@@ -148,7 +148,7 @@ class PerceptionAgent(BaseAgent):
             landmarks = self._match_landmarks(context, objects)
 
             # Generate template-based description
-            scene_description = self._generate_description(objects, room_type, landmarks)
+            scene_description = self._generate_description(objects, room_type, landmarks, context)
 
             # Update context
             context.room_type = room_type
@@ -315,11 +315,12 @@ class PerceptionAgent(BaseAgent):
         objects: List[Dict],
         room_type: str,
         landmarks: List[Dict],
+        context: NavContext = None,
     ) -> str:
         """Generate visual description using LLM or template-based fallback."""
         # Try LLM-enhanced description first
         if self.use_llm and self._model_manager:
-            llm_description = self._generate_llm_description(objects, room_type, landmarks)
+            llm_description = self._generate_llm_description(objects, room_type, landmarks, context)
             if llm_description:
                 return llm_description
 
@@ -331,6 +332,7 @@ class PerceptionAgent(BaseAgent):
         objects: List[Dict],
         room_type: str,
         landmarks: List[Dict],
+        context: NavContext = None,
     ) -> str:
         """Generate LLM-enhanced visual description."""
         if not self._model_manager:
@@ -340,12 +342,18 @@ class PerceptionAgent(BaseAgent):
             # Build prompt for LLM
             prompt = self._build_perception_prompt(objects, room_type, landmarks)
 
-            # Generate description
+            # Get episode_id for conversation context isolation
+            episode_id = context.metadata.get("episode_id", 0) if context else 0
+            conversation_id = f"perception_ep{episode_id}"
+
+            # Generate description with conversation context
             response = self._model_manager.generate(
                 "qwen-2b-perception",
                 prompt,
-                max_new_tokens=200,
-                temperature=0.3
+                max_new_tokens=50,  # Reduced from 200 for faster inference
+                temperature=0.3,
+                conversation_id=conversation_id,
+                keep_context=True,
             )
 
             if response:
@@ -403,21 +411,17 @@ class PerceptionAgent(BaseAgent):
                 lm_descs.append(f"{direction}{lm.get('distance', 0):.1f}米处有{lm.get('name')}")
             landmark_str = "目标地标: " + ", ".join(lm_descs)
 
-        prompt = f"""你是一个室内导航助手。请用简洁的中文描述当前视觉场景，帮助导航决策。
+        prompt = f"""你是室内导航助手。根据视觉信息用1句话描述场景。
 
-场景信息:
-- 房间类型: {room_type if room_type != "unknown" else "未知"}
-- 前方物体: {', '.join(front_objs[:3]) if front_objs else '无'}
-- 左侧物体: {', '.join(left_objs[:3]) if left_objs else '无'}
-- 右侧物体: {', '.join(right_objs[:3]) if right_objs else '无'}
-- {landmark_str}
+场景:
+- 房间: {room_type if room_type != "unknown" else "未知"}
+- 前方: {', '.join(front_objs[:3]) if front_objs else '无'}
+- 左侧: {', '.join(left_objs[:3]) if left_objs else '无'}
+- 右侧: {', '.join(right_objs[:3]) if right_objs else '无'}
+{landmark_str}
 
-请用1-2句话描述场景，重点关注:
-1. 当前位置特征
-2. 可用于导航的地标
-3. 前进方向的情况
-
-直接输出描述，不要其他内容。"""
+要求: 用1句话(不超过50字)描述场景，重点说明位置特征和前方情况。
+直接输出描述，不要解释。"""
 
         return prompt
 

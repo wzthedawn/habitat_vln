@@ -1,9 +1,12 @@
 """Evaluation Agent for assessing navigation decisions.
 
-This agent uses Qwen3.5-9B (local, INT8) for:
+This agent uses Qwen3.5-4B (local, INT8) for:
 1. Decision evaluation and scoring
 2. Feedback generation
 3. Re-planning trigger logic
+
+Note: Originally designed for Qwen3.5-9B, but uses Qwen3.5-4B for efficiency
+and compatibility with the current model server configuration.
 """
 
 from typing import Dict, Any, Optional, List
@@ -19,7 +22,9 @@ class EvaluationAgent(BaseAgent):
     """
     Agent responsible for evaluating navigation decisions.
 
-    Uses Qwen3.5-9B (local, INT8) for evaluation.
+    Uses Qwen3.5-4B (local, INT8) for evaluation.
+    This allows sharing the model with DecisionAgent while maintaining
+    independent conversation contexts.
 
     Key responsibilities:
     1. Evaluate decision quality (score 0.0-1.0)
@@ -82,12 +87,12 @@ class EvaluationAgent(BaseAgent):
             else:
                 self._model_manager.load_all_models()
 
-                # Load Qwen3.5-9B for evaluation
-                self.logger.info("Loading Qwen3.5-9B for evaluation...")
-                if self._model_manager.load_llm("qwen-9b"):
-                    self.logger.info("Qwen3.5-9B loaded successfully")
+                # Load Qwen3.5-4B for evaluation (shares with DecisionAgent)
+                self.logger.info("Loading Qwen3.5-4B for evaluation...")
+                if self._model_manager.load_llm("qwen-4b"):
+                    self.logger.info("Qwen3.5-4B loaded successfully for evaluation")
                 else:
-                    self.logger.warning("Failed to load Qwen3.5-9B, using fallback evaluation")
+                    self.logger.warning("Failed to load Qwen3.5-4B, using fallback evaluation")
 
             self._initialized = True
             self.logger.info("EvaluationAgent initialized")
@@ -172,16 +177,23 @@ class EvaluationAgent(BaseAgent):
         context: NavContext,
         decision: Dict[str, Any]
     ) -> Dict[str, Any]:
-        """Evaluate decision using Qwen9B."""
+        """Evaluate decision using Qwen4B (shared with DecisionAgent but independent context)."""
         prompt = self._build_evaluation_prompt(context, decision)
 
         try:
             if self._model_manager:
+                # Get episode_id for conversation context isolation
+                # Note: Uses independent conversation_id from DecisionAgent
+                episode_id = context.metadata.get("episode_id", 0)
+                conversation_id = f"evaluation_ep{episode_id}"
+
                 response = self._model_manager.generate(
-                    "qwen-9b",
+                    "qwen-4b",  # Use qwen-4b instead of qwen-9b
                     prompt,
-                    max_new_tokens=400,
-                    temperature=0.3  # Lower temperature for more consistent evaluation
+                    max_new_tokens=200,  # Reduced from 400 for efficiency
+                    temperature=0.3,  # Lower temperature for more consistent evaluation
+                    conversation_id=conversation_id,
+                    keep_context=True,
                 )
                 return self._parse_evaluation_response(response)
             else:

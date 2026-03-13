@@ -34,13 +34,14 @@ class InstructionAgent(BaseAgent):
         # Rooms
         "room", "kitchen", "bedroom", "bathroom", "living room",
         "dining room", "hallway", "corridor", "office", "garage",
-        "stairs", "staircase", "entrance", "door", "exit",
+        "stairs", "staircase", "stairway", "entrance", "door", "exit",
         # Furniture
         "chair", "table", "desk", "bed", "sofa", "couch",
         "cabinet", "shelf", "bookshelf", "wardrobe", "dresser",
         "counter", "sink", "toilet", "bathtub", "shower",
+        "piano", "keyboard", "bench",
         # Objects
-        "carpet", "rug", "curtain", "window", "plant", "lamp",
+        "carpet", "rug", "mat", "curtain", "window", "plant", "lamp",
         "tv", "television", "refrigerator", "oven", "stove",
         "picture", "painting", "mirror", "clock",
     }
@@ -124,11 +125,18 @@ class InstructionAgent(BaseAgent):
 
             return AgentOutput.success_output(
                 data={
-                    "subtasks": [{"id": s.id, "description": s.description, "status": s.status} for s in subtasks],
+                    "subtasks": [
+                        {
+                            "id": s.id,
+                            "description": s.description,
+                            "status": s.status,
+                            "level": s.level,  # Include individual subtask level
+                        } for s in subtasks
+                    ],
                     "landmarks": parsed["landmarks"],
                     "goals": parsed["goals"],
                     "directions": parsed["directions"],
-                    "task_level": task_level,
+                    "task_level": task_level,  # Overall task level (for reference)
                     "complexity": parsed["complexity"],
                     "parsed_instruction": parsed,
                 },
@@ -287,7 +295,7 @@ class InstructionAgent(BaseAgent):
 
     def _determine_task_level(self, parsed: Dict[str, Any]) -> str:
         """
-        Determine task difficulty level.
+        Determine task difficulty level for the entire instruction.
 
         Returns:
             "简单", "中等", or "困难"
@@ -317,8 +325,42 @@ class InstructionAgent(BaseAgent):
         # Default to 中等
         return "中等"
 
+    def _determine_subtask_level(self, segment: str) -> str:
+        """
+        Determine difficulty level for a single subtask segment.
+
+        Args:
+            segment: Subtask description text
+
+        Returns:
+            "简单", "中等", or "困难"
+        """
+        segment_lower = segment.lower()
+
+        # Extract features from current subtask
+        has_direction = any(word in segment_lower for word in ["turn", "left", "right", "forward", "back", "straight"])
+        has_landmark = any(word in segment_lower for word in self.LANDMARK_KEYWORDS)
+        has_goal = any(word in segment_lower for word in ["find", "reach", "go to", "stop at", "locate", "arrive", "walk to", "go through"])
+        has_condition = any(word in segment_lower for word in self.CONDITIONAL_KEYWORDS)
+        has_sequence = any(word in segment_lower for word in self.SEQUENCE_KEYWORDS)
+
+        # 简单: Basic operations (pure direction commands, no landmarks)
+        if has_direction and not has_landmark and not has_goal:
+            return "简单"
+
+        # 困难: Conditional judgment or multi-step sequences
+        if has_condition or has_sequence:
+            return "困难"
+
+        # 中等: Involves landmarks or goals
+        if has_landmark or has_goal:
+            return "中等"
+
+        # Default to 中等
+        return "中等"
+
     def _create_subtasks(self, parsed: Dict[str, Any], task_level: str) -> List[SubTask]:
-        """Create subtasks from parsed instruction."""
+        """Create subtasks from parsed instruction with individual difficulty levels."""
         subtasks = []
 
         # Split instruction by conjunctions and sequences
@@ -329,10 +371,14 @@ class InstructionAgent(BaseAgent):
             # Determine if this segment is completed
             status = "in_progress" if i == 0 else "pending"
 
+            # Calculate individual level for each subtask
+            subtask_level = self._determine_subtask_level(segment)
+
             subtask = SubTask(
                 id=i,
                 description=segment.strip(),
                 status=status,
+                level=subtask_level,  # Use subtask's own level
                 required_agents=self._determine_required_agents(segment),
             )
             subtasks.append(subtask)
@@ -343,6 +389,7 @@ class InstructionAgent(BaseAgent):
                 id=0,
                 description=instruction,
                 status="in_progress",
+                level=task_level,  # Fall back to overall task level
                 required_agents=["perception", "trajectory", "decision"],
             ))
 
@@ -370,7 +417,32 @@ class InstructionAgent(BaseAgent):
             parts = segment.split(".")
             final_segments.extend(p.strip() for p in parts if p.strip())
 
-        return final_segments if final_segments else [text]
+        # Further split by comma if it separates direction instructions
+        # e.g., "Walk down the stairs, turn right" -> ["Walk down the stairs", "turn right"]
+        refined_segments = []
+        for segment in final_segments:
+            # Check if segment contains direction change after comma
+            lower = segment.lower()
+            if ", " in segment:
+                parts = segment.split(", ")
+                for i, part in enumerate(parts):
+                    part_lower = part.lower()
+                    # If this part starts with a direction keyword, it's a separate subtask
+                    if any(part_lower.startswith(kw) for kw in ["turn ", "go ", "walk ", "move "]) and i > 0:
+                        refined_segments.append(part.strip())
+                    elif i == 0:
+                        # First part is always added
+                        refined_segments.append(part.strip())
+                    else:
+                        # Merge with previous if not a separate instruction
+                        if refined_segments:
+                            refined_segments[-1] += ", " + part.strip()
+                        else:
+                            refined_segments.append(part.strip())
+            else:
+                refined_segments.append(segment)
+
+        return refined_segments if refined_segments else [text]
 
     def _determine_required_agents(self, segment: str) -> List[str]:
         """Determine which agents are needed for a segment."""

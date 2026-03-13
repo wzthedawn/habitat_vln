@@ -1,0 +1,162 @@
+<!DOCTYPE html>
+<html>
+<head>
+    <title>VLN 实验轨迹可视化</title>
+    <style>
+        body { font-family: Arial, sans-serif; margin: 20px; background: #1a1a2e; color: #eee; }
+        .container { max-width: 1200px; margin: 0 auto; }
+        .header { text-align: center; padding: 20px; background: #16213e; border-radius: 10px; margin-bottom: 20px; }
+        .stats { display: grid; grid-template-columns: repeat(4, 1fr); gap: 15px; margin-bottom: 20px; }
+        .stat-card { background: #16213e; padding: 15px; border-radius: 10px; text-align: center; }
+        .stat-value { font-size: 2em; color: #4ecca3; font-weight: bold; }
+        .stat-label { color: #aaa; }
+        .trajectory-container { background: #16213e; border-radius: 10px; padding: 20px; }
+        canvas { background: #0f0f1a; border-radius: 5px; }
+        .legend { display: flex; justify-content: center; gap: 30px; margin-top: 15px; }
+        .legend-item { display: flex; align-items: center; gap: 8px; }
+        .legend-color { width: 20px; height: 20px; border-radius: 50%; }
+        .progress-bar { background: #333; border-radius: 10px; height: 20px; margin: 20px 0; }
+        .progress-fill { background: linear-gradient(90deg, #4ecca3, #45b7d1); height: 100%; border-radius: 10px; width: 46%; transition: width 0.5s; }
+    </style>
+</head>
+<body>
+    <div class="container">
+        <div class="header">
+            <h1>🧭 VLN 多智能体导航轨迹</h1>
+            <p>Episode 1 | max_steps=100 | 远程LLM服务</p>
+        </div>
+        
+        <div class="progress-bar">
+            <div class="progress-fill"></div>
+        </div>
+        
+        <div class="stats">
+            <div class="stat-card">
+                <div class="stat-value">46</div>
+                <div class="stat-label">当前步数</div>
+            </div>
+            <div class="stat-card">
+                <div class="stat-value">35</div>
+                <div class="stat-label">前进次数</div>
+            </div>
+            <div class="stat-card">
+                <div class="stat-value">11</div>
+                <div class="stat-label">右转次数</div>
+            </div>
+            <div class="stat-card">
+                <div class="stat-value">5.1m</div>
+                <div class="stat-label">实际位移</div>
+            </div>
+        </div>
+        
+        <div class="trajectory-container">
+            <canvas id="trajectoryCanvas" width="800" height="500"></canvas>
+            <div class="legend">
+                <div class="legend-item">
+                    <div class="legend-color" style="background: #4ecca3;"></div>
+                    <span>起点 (Start)</span>
+                </div>
+                <div class="legend-item">
+                    <div class="legend-color" style="background: #ff6b6b;"></div>
+                    <span>终点 (End)</span>
+                </div>
+                <div class="legend-item">
+                    <div class="legend-color" style="background: #ffd93d;"></div>
+                    <span>路径轨迹</span>
+                </div>
+            </div>
+        </div>
+    </div>
+    
+    <script>
+        const canvas = document.getElementById('trajectoryCanvas');
+        const ctx = canvas.getContext('2d');
+        
+        // 轨迹数据
+        const trajectory = [{{x: 0.00, y: 0.00, heading: 0.0}, {x: 0.25, y: 0.00, heading: 0.0}, {x: 0.50, y: 0.00, heading: 0.0}, {x: 0.75, y: 0.00, heading: 0.0}, {x: 1.00, y: 0.00, heading: 0.0}, {x: 1.22, y: 0.12, heading: 30.0}, {x: 1.43, y: 0.25, heading: 30.0}, {x: 1.65, y: 0.37, heading: 30.0}, {x: 1.87, y: 0.50, heading: 30.0}, {x: 2.08, y: 0.62, heading: 30.0}, {x: 2.30, y: 0.75, heading: 30.0}, {x: 2.52, y: 0.87, heading: 30.0}, {x: 2.73, y: 1.00, heading: 30.0}, {x: 2.91, y: 1.18, heading: 45.0}, {x: 3.09, y: 1.35, heading: 45.0}, {x: 3.21, y: 1.57, heading: 60.0}, {x: 3.28, y: 1.81, heading: 75.0}, {x: 3.34, y: 2.05, heading: 75.0}, {x: 3.40, y: 2.29, heading: 75.0}, {x: 3.40, y: 2.54, heading: 90.0}, {x: 3.34, y: 2.79, heading: 105.0}, {x: 3.28, y: 3.03, heading: 105.0}, {x: 3.21, y: 3.27, heading: 105.0}, {x: 3.15, y: 3.51, heading: 105.0}, {x: 3.02, y: 3.73, heading: 120.0}, {x: 2.90, y: 3.94, heading: 120.0}, {x: 2.72, y: 4.12, heading: 135.0}, {x: 2.54, y: 4.30, heading: 135.0}, {x: 2.33, y: 4.42, heading: 150.0}, {x: 2.11, y: 4.55, heading: 150.0}, {x: 1.89, y: 4.67, heading: 150.0}, {x: 1.68, y: 4.80, heading: 150.0}, {x: 1.43, y: 4.86, heading: 165.0}, {x: 1.19, y: 4.93, heading: 165.0}, {x: 0.95, y: 4.99, heading: 165.0}, {x: 0.71, y: 5.06, heading: 165.0}}];
+        
+        // 计算边界
+        const xs = trajectory.map(p => p.x);
+        const ys = trajectory.map(p => p.y);
+        const minX = Math.min(...xs), maxX = Math.max(...xs);
+        const minY = Math.min(...ys), maxY = Math.max(...ys);
+        
+        // 缩放到画布
+        const padding = 50;
+        const scaleX = (canvas.width - 2 * padding) / (maxX - minX || 1);
+        const scaleY = (canvas.height - 2 * padding) / (maxY - minY || 1);
+        const scale = Math.min(scaleX, scaleY);
+        
+        function toCanvas(x, y) {
+            return {
+                x: padding + (x - minX) * scale,
+                y: canvas.height - padding - (y - minY) * scale
+            };
+        }
+        
+        // 绘制网格
+        ctx.strokeStyle = '#333';
+        ctx.lineWidth = 0.5;
+        for (let i = 0; i <= 10; i++) {
+            ctx.beginPath();
+            ctx.moveTo(padding + i * (canvas.width - 2 * padding) / 10, padding);
+            ctx.lineTo(padding + i * (canvas.width - 2 * padding) / 10, canvas.height - padding);
+            ctx.stroke();
+            ctx.beginPath();
+            ctx.moveTo(padding, padding + i * (canvas.height - 2 * padding) / 10);
+            ctx.lineTo(canvas.width - padding, padding + i * (canvas.height - 2 * padding) / 10);
+            ctx.stroke();
+        }
+        
+        // 绘制轨迹
+        ctx.beginPath();
+        ctx.strokeStyle = '#ffd93d';
+        ctx.lineWidth = 2;
+        trajectory.forEach((p, i) => {
+            const pos = toCanvas(p.x, p.y);
+            if (i === 0) ctx.moveTo(pos.x, pos.y);
+            else ctx.lineTo(pos.x, pos.y);
+        });
+        ctx.stroke();
+        
+        // 绘制起点
+        const start = toCanvas(trajectory[0].x, trajectory[0].y);
+        ctx.beginPath();
+        ctx.arc(start.x, start.y, 10, 0, Math.PI * 2);
+        ctx.fillStyle = '#4ecca3';
+        ctx.fill();
+        ctx.fillStyle = '#fff';
+        ctx.font = '12px Arial';
+        ctx.textAlign = 'center';
+        ctx.fillText('S', start.x, start.y + 4);
+        
+        // 绘制终点
+        const end = toCanvas(trajectory[trajectory.length - 1].x, trajectory[trajectory.length - 1].y);
+        ctx.beginPath();
+        ctx.arc(end.x, end.y, 10, 0, Math.PI * 2);
+        ctx.fillStyle = '#ff6b6b';
+        ctx.fill();
+        ctx.fillStyle = '#fff';
+        ctx.fillText('E', end.x, end.y + 4);
+        
+        // 绘制方向箭头
+        const lastP = trajectory[trajectory.length - 1];
+        const arrowLen = 20;
+        const arrowX = end.x + arrowLen * Math.cos(lastP.heading * Math.PI / 180);
+        const arrowY = end.y - arrowLen * Math.sin(lastP.heading * Math.PI / 180);
+        ctx.beginPath();
+        ctx.moveTo(end.x, end.y);
+        ctx.lineTo(arrowX, arrowY);
+        ctx.strokeStyle = '#ff6b6b';
+        ctx.lineWidth = 2;
+        ctx.stroke();
+        
+        // 标注坐标
+        ctx.fillStyle = '#888';
+        ctx.font = '10px Arial';
+        ctx.textAlign = 'left';
+        ctx.fillText(`({trajectory[0].x.toFixed(1)}, {trajectory[0].y.toFixed(1)})`, start.x + 15, start.y);
+        ctx.fillText(`({lastP.x.toFixed(1)}, {lastP.y.toFixed(1)})`, end.x + 15, end.y);
+    </script>
+</body>
+</html>

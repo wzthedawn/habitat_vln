@@ -147,7 +147,7 @@ class TrajectoryAgent(BaseAgent):
 
             # Generate trajectory summary (template-based)
             trajectory_summary = self._generate_trajectory_summary(
-                position, rotation, trajectory
+                position, rotation, trajectory, context
             )
 
             # Get current heading
@@ -400,11 +400,12 @@ class TrajectoryAgent(BaseAgent):
         position: Tuple[float, float, float],
         rotation: float,
         trajectory: List[Tuple],
+        context: NavContext = None,
     ) -> str:
         """Generate trajectory summary using LLM or template-based fallback."""
         # Try LLM-enhanced summary first
         if self.use_llm and self._model_manager:
-            llm_summary = self._generate_llm_trajectory_summary(position, rotation, trajectory)
+            llm_summary = self._generate_llm_trajectory_summary(position, rotation, trajectory, context)
             if llm_summary:
                 return llm_summary
 
@@ -416,6 +417,7 @@ class TrajectoryAgent(BaseAgent):
         position: Tuple[float, float, float],
         rotation: float,
         trajectory: List[Tuple],
+        context: NavContext = None,
     ) -> str:
         """Generate LLM-enhanced trajectory summary."""
         if not self._model_manager:
@@ -429,28 +431,27 @@ class TrajectoryAgent(BaseAgent):
             backtrack_score = self._check_backtracking(trajectory) if len(trajectory) >= 3 else 1.0
 
             # Build prompt
-            prompt = f"""你是一个导航轨迹分析助手。请用简洁的中文总结当前导航状态。
+            prompt = f"""导航状态:
+- 已走: {distance:.1f}米
+- 朝向: {heading}
+- 探索: {visited_cells}个区域
+- 状态: {"卡住" if is_stuck else "正常"}
 
-导航状态:
-- 已行走距离: {distance:.1f}米
-- 当前朝向: {heading}
-- 已探索区域: {visited_cells}个
-- 是否卡住: {"是" if is_stuck else "否"}
-- 路径质量: {"良好" if backtrack_score > 0.7 else "一般" if backtrack_score > 0.4 else "较差"}
+要求: 用1句话(不超过30字)总结进度。
+直接输出，不要解释。"""
 
-请用1句话总结当前导航进度，包括:
-1. 行走距离
-2. 当前状态（正常/卡住/偏离）
-3. 探索情况
+            # Get episode_id for conversation context isolation
+            episode_id = context.metadata.get("episode_id", 0) if context else 0
+            conversation_id = f"trajectory_ep{episode_id}"
 
-直接输出总结，不要其他内容。"""
-
-            # Generate summary
+            # Generate summary with conversation context
             response = self._model_manager.generate(
                 "qwen-2b-trajectory",
                 prompt,
-                max_new_tokens=100,
-                temperature=0.2
+                max_new_tokens=30,  # Reduced from 100 for faster inference
+                temperature=0.2,
+                conversation_id=conversation_id,
+                keep_context=True,
             )
 
             if response:

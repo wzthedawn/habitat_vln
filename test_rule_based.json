@@ -1,0 +1,154 @@
+{
+  "summary": {
+    "num_episodes": 2,
+    "success_rate": 0.0,
+    "spl": 0.0,
+    "oracle_success_rate": 0.0,
+    "nDTW": 0.651262453928682,
+    "SDTW": 0.0,
+    "avg_distance_to_goal": 5.485012513796451,
+    "avg_min_distance": 5.485012513796451,
+    "avg_steps": 5.0,
+    "avg_trajectory_length": 1.1148034320369538,
+    "total_time_seconds": 11.888998031616211,
+    "avg_time_per_episode": 5.9444990158081055
+  },
+  "by_task_level": {
+    "\u4e2d\u7b49": {
+      "count": 2,
+      "successes": 0,
+      "spl_sum": 0.0,
+      "success_rate": 0.0,
+      "spl": 0.0
+    }
+  },
+  "episodes": [
+    {
+      "episode_id": 1,
+      "scene_id": "s8pcmisQ38h",
+      "success": false,
+      "spl": 0.0,
+      "oracle_success": false,
+      "nDTW": 0.651262453928682,
+      "SDTW": 0.0,
+      "trajectory_length": 1.1148034320369538,
+      "shortest_path_length": 10.39185905456543,
+      "steps": 5,
+      "distance_to_goal": 5.485012513796451,
+      "min_distance_to_goal": 5.485012513796451,
+      "instruction": "Walk down the stairs, turn right, and walk towards place with a rug. Wait near the bench and piano along the right side of the wall. ",
+      "token_usage": {
+        "total": 0,
+        "input": 0,
+        "output": 0
+      },
+      "trajectory": [
+        [
+          5.582849979400635,
+          -1.6265579462051392,
+          2.817889928817749
+        ],
+        [
+          5.824213981628418,
+          -1.3679449558258057,
+          2.8830320835113525
+        ],
+        [
+          6.065577983856201,
+          -1.3278502225875854,
+          2.948174238204956
+        ],
+        [
+          6.306941986083984,
+          -1.3179821968078613,
+          3.0133163928985596
+        ],
+        [
+          6.306941986083984,
+          -1.3179821968078613,
+          3.0133163928985596
+        ],
+        [
+          6.556941509246826,
+          -1.3473442792892456,
+          3.0137693881988525
+        ]
+      ],
+      "time_elapsed": 9.967737674713135,
+      "task_level": "\u4e2d\u7b49",
+      "subtask_count": 3,
+      "evaluation_scores": [
+        0.5,
+        0.5
+      ]
+    },
+    {
+      "episode_id": 2,
+      "scene_id": "s8pcmisQ38h",
+      "success": false,
+      "spl": 0.0,
+      "oracle_success": false,
+      "nDTW": 0.651262453928682,
+      "SDTW": 0.0,
+      "trajectory_length": 1.1148034320369538,
+      "shortest_path_length": 10.39185905456543,
+      "steps": 5,
+      "distance_to_goal": 5.485012513796451,
+      "min_distance_to_goal": 5.485012513796451,
+      "instruction": "Go down the stairs, and take a right . walk forward towards the leather chairs next to the table. Once you reach the bench on your right stop and stand on the wood between the bench and the carpet. ",
+      "token_usage": {
+        "total": 0,
+        "input": 0,
+        "output": 0
+      },
+      "trajectory": [
+        [
+          5.582849979400635,
+          -1.6265579462051392,
+          2.817889928817749
+        ],
+        [
+          5.824213981628418,
+          -1.3679449558258057,
+          2.8830320835113525
+        ],
+        [
+          6.065577983856201,
+          -1.3278502225875854,
+          2.948174238204956
+        ],
+        [
+          6.306941986083984,
+          -1.3179821968078613,
+          3.0133163928985596
+        ],
+        [
+          6.306941986083984,
+          -1.3179821968078613,
+          3.0133163928985596
+        ],
+        [
+          6.556941509246826,
+          -1.3473442792892456,
+          3.0137693881988525
+        ]
+      ],
+      "time_elapsed": 1.9211416244506836,
+      "task_level": "\u4e2d\u7b49",
+      "subtask_count": 5,
+      "evaluation_scores": [
+        0.5,
+        0.5
+      ]
+    }
+  ],
+  "config": {
+    "mp3d_path": "data/mp3d_dataset/mp3d",
+    "r2r_path": "/root/habitat-lab/data/datasets/vln/mp3d/r2r/v1/val_seen/val_seen.json",
+    "max_steps": 30,
+    "success_distance": 3.0,
+    "use_remote_llm": false,
+    "llm_server": "http://localhost:8000"
+  },
+  "timestamp": "2026-03-12T11:08:01.847891"
+}
