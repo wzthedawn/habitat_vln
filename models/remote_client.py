@@ -18,6 +18,7 @@ Usage:
 """
 
 import asyncio
+import base64
 import logging
 import time
 from typing import Dict, Optional, Any, List
@@ -44,6 +45,20 @@ class GenerateResult:
     tokens_generated: int
     latency_ms: float
     conversation_id: Optional[str] = None
+    error: Optional[str] = None
+
+    @property
+    def success(self) -> bool:
+        return self.error is None and bool(self.response)
+
+
+@dataclass
+class GenerateVisionResult:
+    """Result from vision-language generation."""
+    response: str
+    model: str
+    tokens_generated: int
+    latency_ms: float
     error: Optional[str] = None
 
     @property
@@ -330,7 +345,7 @@ class RemoteLLMClient:
         Returns:
             Fallback response string
         """
-        # Perception fallback
+        # Perception fallback (4B model)
         if "perception" in model:
             return "前方视野开阔，未检测到明显障碍物。当前场景需要进一步探索。"
 
@@ -344,11 +359,138 @@ class RemoteLLMClient:
             return "动作: forward\n理由: 继续探索环境"
 
         # Evaluation fallback
-        elif "evaluation" in model or "9b" in model:
+        elif "evaluation" in model:
             return '{"score": 0.5, "feedback": "评估完成", "suggestions": []}'
 
         # Generic fallback
         return "继续执行。"
+
+    def generate_vision(
+        self,
+        image: Any,
+        prompt: str,
+        model: str = "qwen-4b-perception",
+        max_new_tokens: Optional[int] = None,
+        temperature: Optional[float] = None,
+    ) -> GenerateVisionResult:
+        """Generate text from image using VLM (sync).
+
+        Args:
+            image: PIL Image or numpy array
+            prompt: Input prompt
+            model: VLM model identifier
+            max_new_tokens: Maximum tokens to generate
+            temperature: Sampling temperature
+
+        Returns:
+            GenerateVisionResult with response and metadata
+        """
+        if not REQUESTS_AVAILABLE:
+            raise ImportError("requests is not installed. Install with: pip install requests")
+
+        # Convert image to base64
+        image_base64 = self._image_to_base64(image)
+
+        payload = {
+            "model": model,
+            "prompt": prompt,
+            "image_base64": image_base64,
+        }
+
+        if max_new_tokens is not None:
+            payload["max_new_tokens"] = max_new_tokens
+        if temperature is not None:
+            payload["temperature"] = temperature
+
+        last_error = None
+
+        for attempt in range(self.max_retries):
+            try:
+                response = requests.post(
+                    f"{self.server_url}/generate_vision",
+                    json=payload,
+                    timeout=self.timeout
+                )
+
+                if response.status_code == 200:
+                    data = response.json()
+                    return GenerateVisionResult(
+                        response=data.get("response", ""),
+                        model=data.get("model", model),
+                        tokens_generated=data.get("tokens_generated", 0),
+                        latency_ms=data.get("latency_ms", 0),
+                        error=data.get("error"),
+                    )
+                else:
+                    last_error = f"HTTP {response.status_code}: {response.text}"
+                    if response.status_code < 500:
+                        break
+
+            except requests.Timeout:
+                last_error = f"Request timed out after {self.timeout}s"
+                self.logger.warning(f"Timeout (attempt {attempt + 1}/{self.max_retries})")
+            except requests.RequestException as e:
+                last_error = f"Connection error: {e}"
+                self.logger.warning(f"Connection error (attempt {attempt + 1}/{self.max_retries}): {e}")
+
+            if attempt < self.max_retries - 1:
+                time.sleep(self.retry_delay)
+
+        return GenerateVisionResult(
+            response="",
+            model=model,
+            tokens_generated=0,
+            latency_ms=0,
+            error=last_error or "Unknown error",
+        )
+
+    def _image_to_base64(self, image: Any) -> str:
+        """Convert image to base64 string.
+
+        Args:
+            image: PIL Image, numpy array, or file path
+
+        Returns:
+            Base64 encoded image string
+        """
+        from io import BytesIO
+
+        # Handle numpy array
+        if hasattr(image, 'shape'):  # numpy array
+            import numpy as np
+            from PIL import Image as PILImage
+
+            # Ensure uint8 type
+            if image.dtype != np.uint8:
+                if image.max() <= 1.0:
+                    image = (image * 255).astype(np.uint8)
+                else:
+                    image = image.astype(np.uint8)
+
+            pil_image = PILImage.fromarray(image)
+
+        # Handle PIL Image
+        elif hasattr(image, 'save'):
+            pil_image = image
+
+        # Handle file path
+        elif isinstance(image, str):
+            from PIL import Image as PILImage
+            pil_image = PILImage.open(image)
+
+        else:
+            raise ValueError(f"Unsupported image type: {type(image)}")
+
+        # Convert to RGB if necessary
+        if pil_image.mode != 'RGB':
+            pil_image = pil_image.convert('RGB')
+
+        # Save to buffer
+        buffer = BytesIO()
+        pil_image.save(buffer, format='JPEG', quality=90)
+        image_base64 = base64.b64encode(buffer.getvalue()).decode('utf-8')
+
+        return image_base64
 
     async def health_check_async(self) -> Dict[str, Any]:
         """Check server health (async).

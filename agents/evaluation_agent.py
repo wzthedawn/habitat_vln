@@ -127,12 +127,14 @@ class EvaluationAgent(BaseAgent):
             score = evaluation.get("score", 0.5)
             feedback = evaluation.get("feedback", "")
             suggestions = evaluation.get("suggestions", [])
+            vertical_nav_ok = evaluation.get("vertical_nav_ok", True)  # NEW
 
             # Track history
             self._evaluation_history.append({
                 "step": context.step_count,
                 "score": score,
                 "feedback": feedback,
+                "vertical_nav_ok": vertical_nav_ok,
             })
             self._recent_scores.append(score)
 
@@ -152,6 +154,7 @@ class EvaluationAgent(BaseAgent):
                 "feedback": feedback,
                 "suggestions": suggestions,
                 "replan_needed": replan_needed,
+                "vertical_nav_ok": vertical_nav_ok,  # NEW
             }
             context.metadata["last_evaluation_score"] = score
 
@@ -161,6 +164,7 @@ class EvaluationAgent(BaseAgent):
                     "feedback": feedback,
                     "suggestions": suggestions,
                     "replan_needed": replan_needed,
+                    "vertical_nav_ok": vertical_nav_ok,  # NEW
                     "score_level": self._get_score_level(score),
                     "recent_avg_score": sum(self._recent_scores[-5:]) / max(len(self._recent_scores[-5:]), 1),
                 },
@@ -188,7 +192,7 @@ class EvaluationAgent(BaseAgent):
                 conversation_id = f"evaluation_ep{episode_id}"
 
                 response = self._model_manager.generate(
-                    "qwen-4b",  # Use qwen-4b instead of qwen-9b
+                    "qwen-4b-evaluation",  # Use dedicated evaluation model config
                     prompt,
                     max_new_tokens=200,  # Reduced from 400 for efficiency
                     temperature=0.3,  # Lower temperature for more consistent evaluation
@@ -208,7 +212,7 @@ class EvaluationAgent(BaseAgent):
         context: NavContext,
         decision: Dict[str, Any]
     ) -> str:
-        """Build prompt for evaluation."""
+        """Build prompt for evaluation with vertical navigation awareness."""
         # Get instruction info
         instruction = context.instruction
         task_level = context.metadata.get("task_level", "中等")
@@ -229,6 +233,8 @@ class EvaluationAgent(BaseAgent):
         distance = trajectory.get("distance_traveled", 0)
         visited = trajectory.get("visited", False)
         corrections = trajectory.get("corrections", [])
+        y_change = trajectory.get("y_change", 0.0)
+        y_direction = trajectory.get("y_direction", "稳定")
 
         # Get decision info
         action = decision.get("action", "unknown")
@@ -237,44 +243,74 @@ class EvaluationAgent(BaseAgent):
         # Build history summary
         history_summary = self._build_history_summary(context)
 
-        prompt = f"""你是一个导航决策评估专家。请评估当前的导航决策是否合理。
+        # === NEW: Spatial evaluation information ===
+        import math
+        current_pos = context.position
+        goal_pos = context.metadata.get("goal_position")
 
-## 导航指令
-{instruction}
+        if goal_pos:
+            vert_dist = goal_pos[1] - current_pos[1]
+            horiz_dist = math.sqrt((goal_pos[0]-current_pos[0])**2 + (goal_pos[2]-current_pos[2])**2)
+            floor_relation = "目标在下层" if vert_dist < -0.5 else "目标在上层" if vert_dist > 0.5 else "同层"
+        else:
+            vert_dist = 0
+            horiz_dist = 0
+            floor_relation = "未知"
 
-## 任务等级
-{task_level}
+        # Height change trend evaluation
+        y_trend = "稳定"
+        if len(context.trajectory) >= 3:
+            recent_y = [p[1] for p in context.trajectory[-3:]]
+            y_change_recent = recent_y[-1] - recent_y[0]
+            if abs(y_change_recent) > 0.1:
+                y_trend = f"最近{'上升' if y_change_recent > 0 else '下降'}{abs(y_change_recent):.2f}米"
 
-## 当前子任务
-{subtask_desc}
+        # === NEW: Enhanced prompt template ===
+        prompt = f"""你是导航决策评估专家。评估决策合理性。
+
+## 导航目标
+- 指令: {instruction[:80]}
+- 子任务: {subtask_desc[:60] if subtask_desc else "无"}
+
+## 空间关系 (关键评估维度)
+- 高度差: {vert_dist:+.2f}米
+- 楼层关系: {floor_relation}
+- 水平距离: {horiz_dist:.1f}米
+- 高度趋势: {y_trend}
+- 总高度变化: {y_change:+.2f}米 ({y_direction})
 
 ## 视觉感知
-房间: {room_type}
-物体: {', '.join([o.get('name', '') for o in objects]) if objects else '无'}
-地标: {', '.join([lm.get('name', '') for lm in landmarks]) if landmarks else '无'}
+- 房间: {room_type}
+- 物体: {', '.join([o.get('name', '') for o in objects]) if objects else '无'}
+- 地标: {', '.join([lm.get('name', '') for lm in landmarks]) if landmarks else '无'}
 
 ## 轨迹状态
-朝向: {heading}
-已走: {distance:.1f}米
-重复访问: {"是" if visited else "否"}
-路径问题: {len(corrections)} 个
+- 朝向: {heading}
+- 已走: {distance:.1f}米
+- 重复访问: {"是" if visited else "否"}
+- 路径问题: {len(corrections)} 个
 
 ## 当前决策
-动作: {action}
-理由: {decision_reasoning}
+- 动作: {action}
+- 理由: {decision_reasoning[:80] if decision_reasoning else "无"}
 
 ## 历史评估
 {history_summary}
 
-请评估这个决策(0.0-1.0分):
-- 0.0-0.4: 决策不佳，需要调整
-- 0.4-0.7: 决策一般，可以改进
-- 0.7-1.0: 决策良好
+## 评估要点
+1. 如果需要垂直导航（高度差>0.5m），决策是否在寻找楼梯？
+2. 高度变化方向是否与目标方向一致？
+   - 目标在下层 + 高度下降 = 正确
+   - 目标在上层 + 高度上升 = 正确
+   - 目标在下层 + 高度上升 = 错误，需要转向
+   - 目标在上层 + 高度下降 = 错误，需要转向
+3. 动作是否合理推进子任务？
 
-输出JSON格式:
+输出JSON:
 {{
   "score": 0.0-1.0,
   "feedback": "评估反馈",
+  "vertical_nav_ok": true/false,
   "suggestions": ["建议1", "建议2"]
 }}
 
@@ -300,13 +336,14 @@ class EvaluationAgent(BaseAgent):
     def _parse_evaluation_response(self, response: str) -> Dict[str, Any]:
         """Parse evaluation from LLM response."""
         try:
-            # Find JSON in response
-            json_match = re.search(r'\{[^}]+\}', response, re.DOTALL)
+            # Find JSON in response - use a more robust regex for multiline JSON
+            json_match = re.search(r'\{[^{}]*\}', response, re.DOTALL)
             if json_match:
                 evaluation = json.loads(json_match.group())
                 return {
                     "score": float(evaluation.get("score", 0.5)),
                     "feedback": evaluation.get("feedback", ""),
+                    "vertical_nav_ok": evaluation.get("vertical_nav_ok", True),  # NEW
                     "suggestions": evaluation.get("suggestions", []),
                 }
         except (json.JSONDecodeError, ValueError) as e:
@@ -321,12 +358,14 @@ class EvaluationAgent(BaseAgent):
             return {
                 "score": min(max(score, 0), 1),
                 "feedback": response[:100],
+                "vertical_nav_ok": True,  # Default
                 "suggestions": [],
             }
 
         return {
             "score": 0.5,
             "feedback": "无法解析评估结果",
+            "vertical_nav_ok": True,  # Default
             "suggestions": [],
         }
 
@@ -457,6 +496,132 @@ class EvaluationAgent(BaseAgent):
             "max_score": max(scores),
             "recent_scores": self._recent_scores[-5:],
         }
+
+    def penalize_stuck_decisions(
+        self,
+        context: NavContext,
+        decision: Dict[str, Any]
+    ) -> float:
+        """Penalize decisions that led to stuck situations.
+
+        Args:
+            context: Navigation context
+            decision: Decision to evaluate
+
+        Returns:
+            Penalty factor (0.0-1.0, lower is worse)
+        """
+        penalty = 1.0
+
+        # Check if position is in known stuck region
+        if hasattr(context, 'is_in_stuck_region') and context.is_in_stuck_region(context.position):
+            penalty *= 0.7
+
+        # Check recent action patterns that led to stuck
+        if context.action_history:
+            recent = context.action_history[-6:]
+            turn_count = sum(1 for a in recent if a.action_type.name in ["TURN_LEFT", "TURN_RIGHT"])
+            forward_count = sum(1 for a in recent if a.action_type.name == "MOVE_FORWARD")
+
+            # Penalize excessive turning without forward progress
+            if turn_count > 4 and forward_count < 2:
+                penalty *= 0.6
+
+        return penalty
+
+    def get_stuck_escape_opinion(
+        self,
+        decision_history: List[Dict[str, Any]],
+        evaluation_history: List[Dict[str, Any]],
+        context: NavContext = None
+    ) -> Dict[str, Any]:
+        """Provide stuck escape opinion based on decision history.
+
+        Analyzes past decisions and their outcomes to suggest escape routes.
+
+        Args:
+            decision_history: List of past decisions
+            evaluation_history: List of past evaluations
+            context: Navigation context (optional)
+
+        Returns:
+            Dict with escape direction, confidence, and reasoning
+        """
+        opinion = {
+            "direction": "right",
+            "confidence": 0.5,
+            "reason": "默认建议",
+            "stop_condition": "",
+            "agent_source": "evaluation",
+        }
+
+        if not decision_history or not evaluation_history:
+            opinion["reason"] = "决策历史不足"
+            return opinion
+
+        # Analyze recent decisions and their scores
+        recent_decisions = decision_history[-10:]
+        recent_evals = evaluation_history[-10:] if evaluation_history else []
+
+        # Find patterns of successful vs failed decisions
+        successful_actions = []
+        failed_actions = []
+
+        for i, decision_record in enumerate(recent_decisions):
+            decision = decision_record.get("decision", {})
+            action = decision.get("action", "unknown")
+
+            # Get corresponding evaluation if available
+            if i < len(recent_evals):
+                eval_score = recent_evals[i].get("score", 0.5)
+                if eval_score >= 0.6:
+                    successful_actions.append(action)
+                elif eval_score < 0.4:
+                    failed_actions.append(action)
+
+        # Count action frequencies
+        from collections import Counter
+        success_counts = Counter(successful_actions)
+        failed_counts = Counter(failed_actions)
+
+        # Find actions that worked vs didn't work
+        good_forward = success_counts.get("forward", 0) + success_counts.get("move_forward", 0)
+        bad_forward = failed_counts.get("forward", 0) + failed_counts.get("move_forward", 0)
+        good_left = success_counts.get("turn_left", 0) + success_counts.get("left", 0)
+        bad_left = failed_counts.get("turn_left", 0) + failed_counts.get("left", 0)
+        good_right = success_counts.get("turn_right", 0) + success_counts.get("right", 0)
+        bad_right = failed_counts.get("turn_right", 0) + failed_counts.get("right", 0)
+
+        # Recommend direction with best success rate
+        if good_forward > bad_forward and good_forward > 0:
+            opinion["direction"] = "forward"
+            opinion["confidence"] = 0.7 + (good_forward - bad_forward) * 0.05
+            opinion["reason"] = f"前进决策成功率较高({good_forward}/{good_forward + bad_forward})"
+        elif good_left > bad_left and good_left > good_right:
+            opinion["direction"] = "left"
+            opinion["confidence"] = 0.65 + (good_left - bad_left) * 0.05
+            opinion["reason"] = f"左转决策成功率较高({good_left}/{good_left + bad_left})"
+        elif good_right > bad_right and good_right > good_left:
+            opinion["direction"] = "right"
+            opinion["confidence"] = 0.65 + (good_right - bad_right) * 0.05
+            opinion["reason"] = f"右转决策成功率较高({good_right}/{good_right + bad_right})"
+        else:
+            # No clear pattern - suggest trying different direction
+            opinion["reason"] = "决策历史无明显模式，建议探索"
+
+            # Avoid recently failed directions
+            if failed_actions:
+                recent_failed = [a for a in failed_actions[-3:]]
+                if "turn_left" in recent_failed or "left" in recent_failed:
+                    opinion["direction"] = "right"
+                    opinion["reason"] += "，避免最近失败的左转"
+                elif "turn_right" in recent_failed or "right" in recent_failed:
+                    opinion["direction"] = "left"
+                    opinion["reason"] += "，避免最近失败的右转"
+
+        opinion["stop_condition"] = "决策得分>0.6或移动2米"
+
+        return opinion
 
     def reset_history(self) -> None:
         """Reset evaluation history."""

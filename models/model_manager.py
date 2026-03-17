@@ -1,17 +1,17 @@
 """Model Manager for local and remote model management.
 
 Manages Qwen3.5 series models with INT8 quantization:
-- Qwen3.5-2B (perception): For PerceptionAgent visual descriptions
+- Qwen3.5-4B (perception): For PerceptionAgent visual descriptions
 - Qwen3.5-2B (trajectory): For TrajectoryAgent path summarization
 - Qwen3.5-4B: For DecisionAgent action selection
-- Qwen3.5-9B: For EvaluationAgent decision assessment
+- Qwen3.5-4B (evaluation): For EvaluationAgent decision assessment
 - YOLOv5s: Object detection (compatible with numpy 2.x)
 
 Supports dual-environment IPC architecture:
 - Local mode: Load models directly (requires Python 3.10+)
 - Remote mode: Use HTTP API to communicate with LLM server
 
-Total VRAM (INT8): ~17GB
+Total VRAM (INT8, 方案二): ~14.1GB + Habitat ~2GB = ~18GB
 """
 
 from typing import Dict, Any, Optional, List, Tuple
@@ -45,18 +45,20 @@ class ModelManager:
 
     Manages model lifecycle:
     - YOLOv5s: Object detection (~0.5GB) - compatible with numpy 2.x
-    - Qwen3.5-2B (perception): Visual descriptions (~2.1GB INT8)
+    - Qwen3.5-4B (perception): Visual descriptions (~4GB INT8)
     - Qwen3.5-2B (trajectory): Path summarization (~2.1GB INT8)
     - Qwen3.5-4B: Navigation decisions (~4GB INT8)
-    - Qwen3.5-9B: Decision evaluation (~9GB INT8)
+    - Qwen3.5-4B (evaluation): Decision evaluation (~4GB INT8)
 
-    Total VRAM: ~17GB with INT8 quantization
+    Total VRAM: ~14.1GB with INT8 quantization (方案二)
     """
 
     _instance = None
     _lock = threading.Lock()
 
     # Model configurations with INT8 quantization
+    # 方案二: 4B perception + 2B trajectory + 4B decision + 4B evaluation + VLM
+    # Total VRAM: ~16GB + Habitat ~2GB = ~18GB (safe for 24GB GPU)
     MODEL_CONFIGS = {
         "yolov5s": {
             "type": "yolo",
@@ -64,11 +66,11 @@ class ModelManager:
             "vram_gb": 0.5,
             "load_time": 1.0,
         },
-        "qwen-2b-perception": {
+        "qwen-4b-perception": {
             "type": "llm",
-            "model_name": "/root/.cache/modelscope/hub/models/Qwen/Qwen3___5-2B",
-            "vram_gb": 2.1,
-            "load_time": 10.0,
+            "model_name": "/root/.cache/modelscope/hub/models/Qwen/Qwen3___5-4B",
+            "vram_gb": 4.0,
+            "load_time": 15.0,
             "max_new_tokens": 256,
             "temperature": 0.3,
         },
@@ -88,13 +90,22 @@ class ModelManager:
             "max_new_tokens": 150,
             "temperature": 0.1,
         },
-        "qwen-9b": {
+        "qwen-4b-evaluation": {
             "type": "llm",
-            "model_name": "/root/.cache/modelscope/hub/models/Qwen/Qwen3___5-9B",
-            "vram_gb": 9.0,
-            "load_time": 20.0,
-            "max_new_tokens": 400,
+            "model_name": "/root/.cache/modelscope/hub/models/Qwen/Qwen3___5-4B",
+            "vram_gb": 4.0,
+            "load_time": 15.0,
+            "max_new_tokens": 150,
+            "temperature": 0.2,
+        },
+        "qwen2-vl-2b": {
+            "type": "vlm",
+            "model_name": "/root/.cache/modelscope/hub/models/Qwen/Qwen2-VL-2B-Instruct",
+            "vram_gb": 4.0,
+            "load_time": 15.0,
+            "max_new_tokens": 256,
             "temperature": 0.3,
+            "optional": True,  # VLM is optional, won't fail if not available
         },
     }
 
@@ -341,7 +352,8 @@ class ModelManager:
 
         self.logger.info("Loading all LLM models...")
 
-        llm_keys = ["qwen-2b-perception", "qwen-2b-trajectory", "qwen-4b", "qwen-9b"]
+        # 方案二: 4B perception + 2B trajectory + 4B decision + 4B evaluation
+        llm_keys = ["qwen-4b-perception", "qwen-2b-trajectory", "qwen-4b", "qwen-4b-evaluation"]
         success = True
 
         for key in llm_keys:
@@ -395,6 +407,112 @@ class ModelManager:
             temperature=temperature,
             **kwargs
         )
+
+    def generate_vision(
+        self,
+        image: Any,
+        prompt: str,
+        model_key: str = "qwen-4b-perception",
+        max_new_tokens: int = None,
+        temperature: float = None,
+    ) -> Dict[str, Any]:
+        """Generate text from image using VLM.
+
+        Uses remote VLM server for inference.
+
+        Args:
+            image: PIL Image or numpy array
+            prompt: Input prompt for generation
+            model_key: VLM model identifier
+            max_new_tokens: Maximum tokens to generate
+            temperature: Sampling temperature
+
+        Returns:
+            Dictionary with 'response', 'objects', 'scene_description', 'nav_hint'
+        """
+        if not self.use_remote or not self._remote_client:
+            self.logger.warning("VLM requires remote server mode")
+            return self._get_vlm_fallback(prompt)
+
+        config = self.MODEL_CONFIGS.get(model_key, {})
+        if max_new_tokens is None:
+            max_new_tokens = config.get("max_new_tokens", 256)
+        if temperature is None:
+            temperature = config.get("temperature", 0.3)
+
+        try:
+            result = self._remote_client.generate_vision(
+                image=image,
+                prompt=prompt,
+                model=model_key,
+                max_new_tokens=max_new_tokens,
+                temperature=temperature,
+            )
+
+            if result.error:
+                self.logger.warning(f"VLM generation error: {result.error}")
+                return self._get_vlm_fallback(prompt)
+
+            # Parse VLM response
+            return self._parse_vlm_response(result.response)
+
+        except Exception as e:
+            self.logger.error(f"VLM generation failed: {e}")
+            return self._get_vlm_fallback(prompt)
+
+    def _parse_vlm_response(self, response: str) -> Dict[str, Any]:
+        """Parse VLM response into structured format.
+
+        Args:
+            response: Raw VLM response text
+
+        Returns:
+            Dictionary with parsed fields
+        """
+        result = {
+            "response": response,
+            "objects": [],
+            "scene_description": "",
+            "nav_hint": "",
+        }
+
+        # Try to extract structured information
+        lines = response.strip().split('\n')
+
+        for line in lines:
+            line = line.strip()
+            if not line:
+                continue
+
+            # Look for object mentions
+            if '物体' in line or 'object' in line.lower() or '检测到' in line:
+                result["objects"].append(line)
+
+            # Look for navigation hints
+            if '导航' in line or '建议' in line or '方向' in line:
+                result["nav_hint"] = line
+
+        # First meaningful line as scene description
+        if lines:
+            result["scene_description"] = lines[0].strip()
+
+        return result
+
+    def _get_vlm_fallback(self, prompt: str) -> Dict[str, Any]:
+        """Get fallback VLM response.
+
+        Args:
+            prompt: Original prompt
+
+        Returns:
+            Fallback response dictionary
+        """
+        return {
+            "response": "视觉分析暂时不可用。",
+            "objects": [],
+            "scene_description": "视觉分析暂时不可用，请继续探索。",
+            "nav_hint": "继续前进探索环境。",
+        }
 
     def _generate_remote(
         self,
@@ -555,8 +673,9 @@ class ModelManager:
         Returns:
             List of detection dictionaries
         """
-        # Use very low threshold for indoor scenes to detect more objects
-        confidence_threshold = min(confidence_threshold, 0.05)
+        # Ensure minimum threshold of 0.25 to avoid false positives in indoor scenes
+        # Indoor scenes often trigger outdoor objects (car, train, airplane) at low confidence
+        confidence_threshold = max(confidence_threshold, 0.25)
 
         self.logger.info(f"[detect_objects] Called with image type: {type(image)}, threshold: {confidence_threshold}")
 

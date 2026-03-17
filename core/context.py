@@ -3,6 +3,7 @@
 from dataclasses import dataclass, field
 from typing import List, Optional, Tuple, Dict, Any
 from enum import Enum
+import numpy as np
 
 from .action import Action
 
@@ -14,6 +15,27 @@ class TaskType(Enum):
     TYPE_2 = "Type-2"  # Target search - object finding
     TYPE_3 = "Type-3"  # Spatial reasoning - cross-room
     TYPE_4 = "Type-4"  # Complex decision - ambiguous scenes
+
+
+@dataclass
+class StuckRegion:
+    """Records a region where the agent got stuck."""
+    position: Tuple[float, float, float]
+    radius: float = 1.0
+    entry_step: int = 0
+    exit_step: Optional[int] = None
+    escape_actions: List[str] = field(default_factory=list)
+    failed_attempts: List[str] = field(default_factory=list)
+
+
+@dataclass
+class PathOpinion:
+    """Path planning opinion from an agent."""
+    direction: str  # "left", "right", "forward", "backward"
+    confidence: float = 0.5
+    reason: str = ""
+    stop_condition: str = ""  # When to stop (e.g., "move 2 meters")
+    agent_source: str = ""  # Source agent name
 
 
 @dataclass
@@ -75,6 +97,15 @@ class NavContext:
     trajectory: List[Tuple[float, float, float]] = field(default_factory=list)
     decision_history: List[Dict[str, Any]] = field(default_factory=list)
 
+    # NEW: Observation history for stuck analysis
+    rgb_history: List[Any] = field(default_factory=list)
+    depth_history: List[Any] = field(default_factory=list)
+    stuck_regions: List[Dict] = field(default_factory=list)
+
+    # Current stuck state
+    is_stuck: bool = False
+    stuck_counter: int = 0
+
     # Output
     current_action: Optional[Action] = None
     confidence: float = 0.0
@@ -98,6 +129,65 @@ class NavContext:
             "decision": decision,
             "position": self.position,
         })
+
+    def add_observation(self, rgb: Any, depth: Any, max_history: int = 20) -> None:
+        """Add observation (RGB and depth) to history.
+
+        Args:
+            rgb: RGB image
+            depth: Depth image
+            max_history: Maximum history length (default 20)
+        """
+        self.rgb_history.append(rgb)
+        self.depth_history.append(depth)
+
+        # Limit history length
+        if len(self.rgb_history) > max_history:
+            self.rgb_history = self.rgb_history[-max_history:]
+            self.depth_history = self.depth_history[-max_history:]
+
+    def record_stuck_region(
+        self,
+        position: Tuple[float, float, float],
+        radius: float = 1.0,
+        escape_actions: List[str] = None,
+        failed_attempts: List[str] = None
+    ) -> None:
+        """Record a stuck region.
+
+        Args:
+            position: Position where stuck occurred
+            radius: Radius of stuck region
+            escape_actions: Actions that successfully escaped
+            failed_attempts: Actions that failed to escape
+        """
+        stuck_record = {
+            "position": position,
+            "radius": radius,
+            "entry_step": self.step_count,
+            "exit_step": None,
+            "escape_actions": escape_actions or [],
+            "failed_attempts": failed_attempts or [],
+        }
+        self.stuck_regions.append(stuck_record)
+
+    def is_in_stuck_region(self, position: Tuple[float, float, float]) -> bool:
+        """Check if position is within any known stuck region.
+
+        Args:
+            position: Position to check
+
+        Returns:
+            True if position is within a stuck region
+        """
+        import math
+        for region in self.stuck_regions:
+            dx = position[0] - region["position"][0]
+            dz = position[2] - region["position"][2]
+            dist = math.sqrt(dx*dx + dz*dz)
+            if dist < region["radius"]:
+                return True
+        return False
 
     def get_current_subtask(self) -> Optional[SubTask]:
         """Get current subtask."""

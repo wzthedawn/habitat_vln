@@ -62,6 +62,20 @@ class DecisionAgent(BaseAgent):
         self._debate_threshold = 6  # Trigger debate if stuck for 6+ steps
         self._last_debate_step = -999  # Track last debate to avoid spam
 
+        # NEW: Multi-round debate parameters
+        self._debate_rounds = 3
+        self._opinion_weights = {
+            "perception": 1.2,
+            "trajectory": 0.9,
+            "evaluation": 0.8,
+            "instruction": 1.0,
+            "decision": 0.7,
+        }
+
+        # NEW: Track escape attempts for stuck handling
+        self._escape_attempts: List[str] = []
+        self._successful_escapes: List[Dict] = []
+
         # Model reference
         self._model_manager = None
         self._initialized = False
@@ -73,6 +87,7 @@ class DecisionAgent(BaseAgent):
         self._perception_agent = None
         self._trajectory_agent = None
         self._instruction_agent = None
+        self._evaluation_agent = None
 
     @property
     def name(self) -> str:
@@ -158,12 +173,12 @@ class DecisionAgent(BaseAgent):
             # Check for position-based stuck detection (CRITICAL FIX)
             is_position_stuck = self._check_position_stuck(context.position)
             if is_position_stuck:
-                # Check if severely stuck - trigger debate
+                # Check if severely stuck - trigger multi-round debate
                 if self._stuck_counter >= self._debate_threshold and \
                    context.step_count - self._last_debate_step > 5:
-                    # Severe stuck - conduct multi-agent debate
-                    self.logger.warning(f"[Stuck Detection] Severe stuck ({self._stuck_counter} steps), triggering debate")
-                    action, confidence, reasoning, subtask_completed = self._conduct_debate(context, agent_outputs)
+                    # Severe stuck - conduct multi-round debate
+                    self.logger.warning(f"[Stuck Detection] Severe stuck ({self._stuck_counter} steps), triggering multi-round debate")
+                    action, confidence, reasoning, subtask_completed = self._handle_severe_stuck(context, agent_outputs)
 
                     context.current_action = action
                     context.confidence = confidence
@@ -187,29 +202,11 @@ class DecisionAgent(BaseAgent):
                         reasoning=reasoning,
                     )
 
-                # Light stuck - simple turn behavior
-                import random
-
-                # Alternate between turning and trying forward
-                if self._turn_counter < self._max_turns_before_forward:
-                    # Turn to find an open path
-                    self._turn_counter += 1
-                    turn = random.choice(["turn_left", "turn_right"])
-                    if turn == "turn_left":
-                        action = Action.turn_left()
-                    else:
-                        action = Action.turn_right()
-                    reasoning = f"检测到卡住(位置未变{self._stuck_counter}步)，转向({self._turn_counter}/{self._max_turns_before_forward})"
-                    self.logger.warning(f"[Stuck Detection] Turning {turn} ({self._turn_counter}/{self._max_turns_before_forward})")
-                else:
-                    # After max turns, try moving forward
-                    self._turn_counter = 0  # Reset turn counter
-                    action = Action.forward()
-                    reasoning = f"转向后尝试前进"
-                    self.logger.warning(f"[Stuck Detection] Trying forward after turns")
+                # Light stuck - use depth-informed escape
+                action, confidence, reasoning = self._handle_light_stuck(context, agent_outputs)
 
                 context.current_action = action
-                context.confidence = 0.7
+                context.confidence = confidence
 
                 # Record action - DO NOT check subtask completion for stuck recovery turns
                 # Stuck recovery turns are emergency actions, not intentional subtask execution
@@ -221,11 +218,11 @@ class DecisionAgent(BaseAgent):
                     data={
                         "action": action.to_habitat_action(),
                         "action_type": action.action_type.name,
-                        "confidence": 0.7,
+                        "confidence": confidence,
                         "reasoning": reasoning,
                         "subtask_completed": subtask_completed,
                     },
-                    confidence=0.7,
+                    confidence=confidence,
                     reasoning=reasoning,
                 )
 
@@ -343,6 +340,86 @@ class DecisionAgent(BaseAgent):
         agent_outputs: Dict[str, Any]
     ) -> tuple:
         """Make navigation decision (LLM or rule-based fallback)."""
+        # PRIORITY -1: Check for direction instructions in current subtask FIRST
+        # This ensures "turn right/left" instructions are executed before goal navigation
+        current_subtask = context.get_current_subtask()
+        if current_subtask:
+            desc = current_subtask.description.lower()
+
+            # Check if this subtask is a direction instruction
+            if "turn right" in desc or "右转" in desc:
+                # Check if we haven't turned right recently
+                recent = [a.action_type for a in context.action_history[-3:]] if context.action_history else []
+                if ActionType.TURN_RIGHT not in recent:
+                    self.logger.info(f"[DECISION] Priority: executing direction instruction - turn right")
+                    return Action.turn_right(), 0.85, "执行指令: 右转", False
+            elif "turn left" in desc or "左转" in desc:
+                # Check if we haven't turned left recently
+                recent = [a.action_type for a in context.action_history[-3:]] if context.action_history else []
+                if ActionType.TURN_LEFT not in recent:
+                    self.logger.info(f"[DECISION] Priority: executing direction instruction - turn left")
+                    return Action.turn_left(), 0.85, "执行指令: 左转", False
+
+        # PRIORITY -1: Check for vertical navigation needs (stairs) BEFORE goal navigation
+        # This is critical for multi-floor navigation
+        goal_pos = context.metadata.get("goal_position")
+        if goal_pos:
+            current_pos = context.position
+            dy = goal_pos[1] - current_pos[1]
+
+            # If there's significant height difference and a stair subtask, handle stairs first
+            if abs(dy) > 0.8:
+                current_subtask = context.get_current_subtask()
+                if current_subtask:
+                    desc = current_subtask.description.lower()
+                    has_stair_instruction = any(kw in desc for kw in
+                        ["stairs", "staircase", "steps", "up", "down", "下楼", "上楼", "楼梯"])
+
+                    if has_stair_instruction:
+                        stair_dir = "down" if dy < 0 else "up"
+                        self.logger.info(f"[DECISION] Height diff {dy:.1f}m, using stair navigation ({stair_dir})")
+
+                        # Check if moving in wrong direction
+                        current_direction = self._detect_stair_direction(context)
+                        if current_direction:
+                            if stair_dir == "down" and current_direction == "going_up":
+                                self.logger.warning("[DECISION] Wrong direction! Should go DOWN but going UP")
+                                return Action.turn_right(), 0.7, "寻找下楼路径", False
+                            elif stair_dir == "up" and current_direction == "going_down":
+                                self.logger.warning("[DECISION] Wrong direction! Should go UP but going DOWN")
+                                return Action.turn_right(), 0.7, "寻找上楼路径", False
+
+                        # Use stair navigation
+                        stair_result = self._navigate_stairs(context, stair_dir)
+                        if stair_result:
+                            return stair_result
+
+        # PRIORITY 0: Check for goal proximity - navigate directly to goal
+        goal_pos = context.metadata.get("goal_position")
+        if goal_pos:
+            current_pos = context.position
+            dist_to_goal = math.sqrt(
+                (goal_pos[0] - current_pos[0])**2 +
+                (goal_pos[1] - current_pos[1])**2 +
+                (goal_pos[2] - current_pos[2])**2
+            )
+            success_distance = context.metadata.get("success_distance", 3.0)
+
+            # Check if all subtasks are completed
+            all_subtasks_done = True
+            if context.subtasks:
+                all_subtasks_done = all(s.status == "completed" for s in context.subtasks)
+
+            # Only prioritize goal navigation if:
+            # 1. Very close to goal (< 4m), OR
+            # 2. All subtasks completed and within 8m
+            if dist_to_goal < 4.0 or (all_subtasks_done and dist_to_goal < 8.0):
+                self.logger.info(f"[GOAL NAV] Close to goal: {dist_to_goal:.1f}m, subtasks done: {all_subtasks_done}, navigating directly")
+                goal_nav_result = self._navigate_towards_goal(context)
+                if goal_nav_result:
+                    action, confidence, reason, complete = goal_nav_result
+                    return action, confidence, reason, complete
+
         # SAFETY FIRST: Check for obstacles before LLM decision
         # Obstacle avoidance is safety-critical and should not rely on LLM
         depth_obstacle = self._check_depth_obstacle(context)
@@ -418,8 +495,16 @@ class DecisionAgent(BaseAgent):
             )
 
             if response:
+                # Log raw LLM response for debugging
+                self.logger.info(f"[LLM_DECISION] Raw response: {response[:200]}")
+
                 # Parse response
                 action, confidence, reasoning = self._parse_llm_response(response)
+
+                # Log parsed results
+                self.logger.info(f"[LLM_DECISION] Parsed action: {action.action_type.name if action else 'None'}")
+                self.logger.info(f"[LLM_DECISION] Reasoning: {reasoning[:100]}")
+
                 if action:
                     # Update conversation history
                     self._conversation_history.append({
@@ -444,7 +529,7 @@ class DecisionAgent(BaseAgent):
         context: NavContext,
         agent_outputs: Dict[str, Any]
     ) -> str:
-        """Build prompt for decision LLM."""
+        """Build prompt for decision LLM with spatial context for vertical navigation reasoning."""
         instruction = context.instruction
         perception = agent_outputs.get("perception", {})
         trajectory = agent_outputs.get("trajectory", {})
@@ -459,15 +544,49 @@ class DecisionAgent(BaseAgent):
         landmarks = perception.get("landmarks", [])
         scene_desc = perception.get("scene_description", "")
 
+        # Get navigation hint from perception (stair detection, etc.)
+        nav_hint = context.metadata.get("nav_hint", "")
+
         # Get trajectory info
         heading = trajectory.get("heading", "未知")
         distance = trajectory.get("distance_traveled", 0)
         corrections = trajectory.get("corrections", [])
 
-        # Format objects
-        obj_str = ", ".join([f"{o.get('name')}({o.get('distance', 0):.1f}m)" for o in objects]) if objects else "无"
+        # === NEW: Spatial position information ===
+        current_pos = context.position  # (x, y, z)
+        goal_pos = context.metadata.get("goal_position")
 
-        # Format landmarks
+        # Calculate spatial relationships
+        if goal_pos:
+            dx = goal_pos[0] - current_pos[0]
+            dy = goal_pos[1] - current_pos[1]  # Height difference (positive = goal is above)
+            dz = goal_pos[2] - current_pos[2]
+            horiz_dist = math.sqrt(dx*dx + dz*dz)  # Horizontal distance
+            vert_dist = dy  # Vertical distance (positive=goal above, negative=goal below)
+        else:
+            horiz_dist = 0
+            vert_dist = 0
+            goal_pos = current_pos
+
+        # Height change trend analysis
+        y_trend = ""
+        y_direction = "稳定"
+        if len(context.trajectory) >= 5:
+            recent_y = [p[1] for p in context.trajectory[-5:]]
+            y_change = recent_y[-1] - recent_y[0]
+            if abs(y_change) > 0.3:
+                y_direction = "上升" if y_change > 0 else "下降"
+                y_trend = f"最近高度{y_direction}{abs(y_change):.1f}米"
+
+        # Determine floor relationship
+        floor_relation = "同层"
+        if vert_dist < -0.5:
+            floor_relation = "目标在下层"
+        elif vert_dist > 0.5:
+            floor_relation = "目标在上层"
+
+        # Format objects and landmarks
+        obj_str = ", ".join([f"{o.get('name')}({o.get('distance', 0):.1f}m)" for o in objects]) if objects else "无"
         lm_str = ", ".join([f"{lm.get('name')}({lm.get('distance', 0):.1f}m)" for lm in landmarks[:3]]) if landmarks else "无"
 
         # Format corrections
@@ -493,18 +612,47 @@ class DecisionAgent(BaseAgent):
         elif need_right and not need_left:
             direction_hint = "指令需要右转"
 
-        prompt = f"""根据指令选择动作。
+        # === NEW: Enhanced prompt template ===
+        prompt = f"""你是室内导航机器人。根据空间信息选择最佳动作。
 
-指令: {instruction[:80]}
-子任务: {subtask_desc[:50]}
-方向提示: {direction_hint if direction_hint else "根据指令判断"}
-房间: {room_type}
-物体: {obj_str[:60]}
-最近动作: {action_hist}
+## 导航指令
+{instruction[:100]}
+
+## 当前子任务
+{subtask_desc[:60] if subtask_desc else "无"}
+
+## 空间状态 (关键!)
+- 当前高度: {current_pos[1]:.2f}米
+- 目标高度: {goal_pos[1]:.2f}米
+- 高度差: {vert_dist:+.2f}米
+- 楼层关系: {floor_relation}
+- 水平距离: {horiz_dist:.1f}米
+- 高度趋势: {y_trend if y_trend else "高度稳定"}
+
+## 视觉感知
+- 房间: {room_type}
+- 前方物体: {obj_str[:80] if obj_str else "无"}
+- 地标: {lm_str[:60] if lm_str else "无"}
+- 场景: {scene_desc[:50] if scene_desc else "无描述"}
+- 导航提示: {nav_hint[:40] if nav_hint else "无"}
+
+## 运动历史
+- 朝向: {heading}
+- 已走: {distance:.1f}米
+- 最近动作: {action_hist}
+- 路径问题: {corr_str[:50] if corr_str else "无"}
+
+## 决策推理要求
+1. 分析当前是否需要垂直导航（上下楼）
+2. 如果目标在不同楼层，必须先寻找楼梯/电梯
+3. "下楼"指令需要高度下降，不能直奔目标投影点
+4. 如果高度已在正确方向变化，继续当前路径
+5. 如果高度变化方向错误，需要转向探索
 
 可选动作: forward, turn_left, turn_right, stop
 
-输出格式:
+请先推理分析，再选择动作:
+推理: [分析当前应该做什么，特别是垂直导航需求]
 动作: [选择的动作]"""
 
         return prompt
@@ -575,9 +723,14 @@ class DecisionAgent(BaseAgent):
             action = Action.forward()
             confidence = 0.5
 
-        # Extract reasoning - clean up the text
+        # Extract reasoning - support both "推理:" (new) and "理由:" (old) formats
         reasoning = response
-        if "理由:" in response:
+        if "推理:" in response:
+            reasoning = response.split("推理:")[-1].strip()
+            # Clean to only keep the reasoning part
+            if "动作:" in reasoning:
+                reasoning = reasoning.split("动作:")[0].strip()
+        elif "理由:" in response:
             reasoning = response.split("理由:")[-1].strip()
         elif "理由" in response:
             reasoning = response.split("理由")[-1].strip()
@@ -611,8 +764,55 @@ class DecisionAgent(BaseAgent):
         # Check perception for goal detection
         perception = agent_outputs.get("perception", {})
         landmarks = perception.get("landmarks", [])
+        room_type = perception.get("room_type", "unknown")
 
         description = current_subtask.description.lower()
+
+        # NEW: Check for stairs/staircase completion
+        # Complete stairs subtask when we've moved to the target height level
+        if any(kw in description for kw in ["stairs", "staircase", "steps", "下楼", "上楼", "楼梯"]):
+            # Determine the required direction based on goal position
+            goal_pos = context.metadata.get("goal_position")
+            need_to_go_down = False
+            need_to_go_up = False
+
+            if goal_pos:
+                dy = goal_pos[1] - context.position[1]
+                need_to_go_down = dy < -0.5  # Goal is below
+                need_to_go_up = dy > 0.5  # Goal is above
+
+            # Check if we've moved to the target height level
+            if len(context.trajectory) >= 5:
+                # Use the START of the episode as reference, not recent 5 steps
+                start_y = context.trajectory[0][1]  # Episode start Y
+                current_y = context.position[1]
+                y_change = current_y - start_y  # Positive = went up, Negative = went down
+
+                # Only complete if we've moved in the CORRECT direction
+                # AND we're close to the target floor level
+                if goal_pos:
+                    target_y = goal_pos[1]
+                    y_to_target = abs(current_y - target_y)
+
+                    # Check if we're now at the target floor (within 1m of goal Y)
+                    if y_to_target < 1.0:
+                        if need_to_go_down and y_change < -0.5:
+                            self.logger.info(f"[SUBTASK] Stairs DOWN completed: moved {y_change:.1f}m, now at target floor")
+                            return True
+                        elif need_to_go_up and y_change > 0.5:
+                            self.logger.info(f"[SUBTASK] Stairs UP completed: moved {y_change:.1f}m, now at target floor")
+                            return True
+                        else:
+                            self.logger.debug(f"[SUBTASK] Stairs: Y change {y_change:.1f}m but wrong direction (need {'down' if need_to_go_down else 'up'})")
+
+            # Also complete if room type changed from stairs (but only if we've moved some height)
+            if room_type not in ["stairs", "unknown"]:
+                if len(context.trajectory) >= 3:
+                    start_y = context.trajectory[0][1]
+                    y_change = abs(context.position[1] - start_y)
+                    if y_change > 0.3:  # Must have moved some height
+                        self.logger.info(f"[SUBTASK] Stairs subtask completed: left stairs area to {room_type}")
+                        return True
 
         # Check if mentioned object is found and close - ONLY for goal-related subtasks
         # The subtask must explicitly mention stopping/waiting/near the object
@@ -625,17 +825,24 @@ class DecisionAgent(BaseAgent):
                         return True
 
         # Check if subtask has a direction command and we've turned
+        # Enhanced: require only one turn to complete direction subtasks
         if "turn left" in description or "左转" in description:
             if action.action_type == ActionType.TURN_LEFT:
+                self.logger.info("[SUBTASK] Turn left subtask completed")
                 return True
         if "turn right" in description or "右转" in description:
             if action.action_type == ActionType.TURN_RIGHT:
+                self.logger.info("[SUBTASK] Turn right subtask completed")
                 return True
 
         # Check if subtask is about walking and we've moved forward
-        walk_keywords = ["walk", "go", "move", "forward", "down", "up", "pass", "through"]
+        # EXCLUDE stair-related subtasks - they have their own completion logic above
+        is_stair_subtask = any(kw in description for kw in ["stairs", "staircase", "steps", "下楼", "上楼", "楼梯"])
+        walk_keywords = ["walk", "go", "move", "forward", "pass", "through"]
         has_walk_keyword = any(kw in description for kw in walk_keywords)
-        if has_walk_keyword:
+
+        # Only apply simple walk completion for non-stair subtasks
+        if has_walk_keyword and not is_stair_subtask:
             # If we've moved forward at least 8 times for this subtask, consider it done
             if action.action_type == ActionType.MOVE_FORWARD:
                 forward_count = sum(1 for a in context.action_history[-12:] if a.action_type == ActionType.MOVE_FORWARD)
@@ -689,13 +896,65 @@ class DecisionAgent(BaseAgent):
         subtask_desc = current_subtask.description.lower() if current_subtask else ""
 
         # Decision priority:
+        # 0. If close to goal, navigate towards it (highest priority for success)
         # 1. If depth shows obstacle, avoid it
         # 2. If stuck, try to escape
-        # 3. If landmark found, navigate towards it
-        # 4. Follow subtask instruction
-        # 5. Follow main instruction keywords
-        # 6. Check action history to avoid repetition
-        # 7. Default forward
+        # 3. Follow subtask direction instructions (turn left/right)
+        # 4. If landmark found, navigate towards it
+        # 5. If object found, navigate towards it
+        # 6. Navigate towards goal position
+        # 7. Follow main instruction keywords
+        # 8. Check action history to avoid repetition
+        # 9. Default forward
+
+        # 0. PRIORITY: Check for vertical navigation needs (stairs) FIRST
+        goal_pos = context.metadata.get("goal_position")
+        if goal_pos:
+            current_pos = context.position
+            dy = goal_pos[1] - current_pos[1]
+
+            # If there's significant height difference and a stair subtask, handle stairs first
+            if abs(dy) > 0.8:
+                current_subtask = context.get_current_subtask()
+                if current_subtask:
+                    desc = current_subtask.description.lower()
+                    has_stair_instruction = any(kw in desc for kw in
+                        ["stairs", "staircase", "steps", "up", "down", "下楼", "上楼", "楼梯"])
+
+                    if has_stair_instruction:
+                        stair_dir = "down" if dy < 0 else "up"
+                        self.logger.info(f"[DECISION] Height diff {dy:.1f}m, using stair navigation ({stair_dir})")
+
+                        # Check if moving in wrong direction
+                        current_direction = self._detect_stair_direction(context)
+                        if current_direction:
+                            if stair_dir == "down" and current_direction == "going_up":
+                                self.logger.warning("[DECISION] Wrong direction! Should go DOWN but going UP")
+                                return Action.turn_right(), 0.7, "寻找下楼路径", False
+                            elif stair_dir == "up" and current_direction == "going_down":
+                                self.logger.warning("[DECISION] Wrong direction! Should go UP but going DOWN")
+                                return Action.turn_right(), 0.7, "寻找上楼路径", False
+
+                        # Use stair navigation
+                        stair_result = self._navigate_stairs(context, stair_dir)
+                        if stair_result:
+                            return stair_result
+
+            # 0.5. Check if close to goal - navigate directly (only if no vertical navigation needed)
+            dist_to_goal = math.sqrt(
+                (goal_pos[0] - current_pos[0])**2 +
+                (goal_pos[1] - current_pos[1])**2 +
+                (goal_pos[2] - current_pos[2])**2
+            )
+            success_distance = context.metadata.get("success_distance", 3.0)
+
+            # Lowered threshold from 8.0 to 4.0 to not override stair subtasks
+            if dist_to_goal < 4.0:
+                self.logger.info(f"[GOAL NAV] Close to goal: {dist_to_goal:.1f}m, navigating directly")
+                goal_nav_result = self._navigate_towards_goal(context)
+                if goal_nav_result:
+                    action, confidence, reason, complete = goal_nav_result
+                    return action, confidence, reason, complete
 
         # 1. Depth-based obstacle avoidance
         if depth_obstacle and depth_obstacle.get("has_obstacle"):
@@ -839,6 +1098,7 @@ class DecisionAgent(BaseAgent):
         """
         goal_pos = context.metadata.get("goal_position")
         if not goal_pos:
+            self.logger.info("[GOAL NAV] No goal_position in context")
             return None
 
         current_pos = context.position
@@ -846,19 +1106,43 @@ class DecisionAgent(BaseAgent):
 
         # Calculate direction to goal
         dx = goal_pos[0] - current_pos[0]
+        dy = goal_pos[1] - current_pos[1]  # Y-axis (height) difference
         dz = goal_pos[2] - current_pos[2]
         distance = math.sqrt(dx*dx + dz*dz)
+        distance_3d = math.sqrt(dx*dx + dy*dy + dz*dz)  # Full 3D distance
 
         success_distance = context.metadata.get("success_distance", 3.0)
 
+        self.logger.info(f"[GOAL NAV] Distance to goal: {distance:.1f}m (3D: {distance_3d:.1f}m), current rotation: {math.degrees(current_rotation):.0f}°")
+
+        # Check vertical direction (Y-axis) - CRITICAL FIX
+        if abs(dy) > 0.8:
+            self.logger.info(f"[GOAL NAV] Height difference detected: {dy:.1f}m (goal is {'above' if dy > 0 else 'below'})")
+
+            # Check if current subtask involves stairs
+            current_subtask = context.get_current_subtask()
+            if current_subtask:
+                desc = current_subtask.description.lower()
+                has_stair_instruction = any(kw in desc for kw in ["stairs", "staircase", "steps", "up", "down", "下楼", "上楼", "楼梯"])
+
+                if has_stair_instruction:
+                    # KEY FIX: Return None to defer to stair subtask handling
+                    self.logger.info(f"[GOAL NAV] Deferring to stair subtask: {desc[:40]}")
+                    return None
+
+            self.logger.warning(f"[GOAL NAV] Height diff {dy:.1f}m but no stair instruction!")
+
         # If very close to goal, stop
         if distance < success_distance:
+            self.logger.info(f"[GOAL NAV] SUCCESS! Within {success_distance}m of goal")
             return Action.stop(), 0.9, f"到达目标位置 (距离: {distance:.1f}m)", True
 
         # Calculate angle to goal
         # Goal is at angle theta from current position
         # We need to turn to face the goal
-        goal_angle = math.atan2(-dx, dz)  # Habitat uses Z-forward, X-right
+        # Habitat coordinate system: when yaw=0, agent faces +Z direction
+        # atan2(-dx, dz) gives the angle from +Z axis (correct for Habitat)
+        goal_angle = math.atan2(-dx, dz)
 
         # Current rotation is the direction we're facing
         # We need to find the difference between our current direction and the goal direction
@@ -873,10 +1157,10 @@ class DecisionAgent(BaseAgent):
         # Convert to degrees for threshold checking
         angle_diff_deg = math.degrees(angle_diff)
 
-        self.logger.debug(f"[GOAL NAV] Distance: {distance:.1f}m, Angle diff: {angle_diff_deg:.1f}°")
+        self.logger.info(f"[GOAL NAV] Distance: {distance:.1f}m, Goal angle: {math.degrees(goal_angle):.0f}°, Current rotation: {math.degrees(current_rotation):.0f}°, Angle diff: {angle_diff_deg:.1f}°")
 
-        # If not aligned with goal, turn
-        if abs(angle_diff_deg) > 30:  # More than 30 degrees off
+        # If not aligned with goal, turn (lowered threshold to 15° for more precise navigation)
+        if abs(angle_diff_deg) > 15:
             if angle_diff_deg > 0:
                 return Action.turn_left(), 0.75, f"转向目标 (左转 {angle_diff_deg:.0f}°)", False
             else:
@@ -884,6 +1168,63 @@ class DecisionAgent(BaseAgent):
 
         # Aligned with goal, move forward
         return Action.forward(), 0.8, f"向目标前进 (距离: {distance:.1f}m)", False
+
+    def _detect_stair_direction(self, context: NavContext) -> Optional[str]:
+        """Detect if agent is currently moving up or down stairs based on trajectory."""
+        if len(context.trajectory) < 5:
+            return None
+
+        # Get recent Y positions
+        recent_y = [p[1] for p in context.trajectory[-5:]]
+        y_diff = recent_y[-1] - recent_y[0]
+
+        if abs(y_diff) > 0.2:
+            return "going_up" if y_diff > 0 else "going_down"
+        return None
+
+    def _should_go_vertical(self, context: NavContext) -> Optional[str]:
+        """Determine if agent should go up or down based on goal position."""
+        goal_pos = context.metadata.get("goal_position")
+        if not goal_pos:
+            return None
+
+        dy = goal_pos[1] - context.position[1]
+        if abs(dy) > 0.5:
+            return "up" if dy > 0 else "down"
+        return None
+
+    def _navigate_stairs(self, context: NavContext, direction: str) -> Optional[tuple]:
+        """Handle stair navigation when height change is needed.
+
+        Args:
+            context: Navigation context
+            direction: "up" or "down"
+
+        Returns:
+            (action, confidence, reason, subtask_complete) or None
+        """
+        if len(context.trajectory) >= 5:
+            recent_y = [p[1] for p in context.trajectory[-5:]]
+            y_trend = recent_y[-1] - recent_y[0]
+
+            # Check if moving in the correct direction
+            if direction == "down" and y_trend < -0.1:
+                self.logger.info(f"[STAIRS] Going down correctly, Y trend: {y_trend:.2f}m")
+                return Action.forward(), 0.8, "正在下楼", False
+            elif direction == "up" and y_trend > 0.1:
+                self.logger.info(f"[STAIRS] Going up correctly, Y trend: {y_trend:.2f}m")
+                return Action.forward(), 0.8, "正在上楼", False
+
+            # Wrong direction detected
+            if direction == "down" and y_trend > 0.1:
+                self.logger.warning(f"[STAIRS] Going UP but should go DOWN! Y trend: {y_trend:.2f}m")
+                return Action.turn_right(), 0.7, "寻找下楼路径", False
+            elif direction == "up" and y_trend < -0.1:
+                self.logger.warning(f"[STAIRS] Going DOWN but should go UP! Y trend: {y_trend:.2f}m")
+                return Action.turn_right(), 0.7, "寻找上楼路径", False
+
+        # Default: explore to find stairs
+        return Action.forward(), 0.6, f"探索楼梯路径({direction})", False
 
     def _check_depth_obstacle(self, context: NavContext) -> Dict[str, Any]:
         """Check for obstacles using depth image."""
@@ -1060,13 +1401,6 @@ class DecisionAgent(BaseAgent):
 
         # Return True if stuck for threshold steps
         return self._stuck_counter >= self._stuck_threshold
-
-    def reset_stuck_counter(self) -> None:
-        """Reset stuck detection counter for new episode."""
-        self._last_position = None
-        self._stuck_counter = 0
-        self._turn_counter = 0
-        self._last_debate_step = -999
 
     def _conduct_debate(
         self,
@@ -1468,3 +1802,376 @@ class DecisionAgent(BaseAgent):
         action = self._create_action(best_action)
 
         return action, confidence, reasoning
+
+    def _handle_light_stuck(
+        self,
+        context: NavContext,
+        agent_outputs: Dict[str, Any]
+    ) -> tuple:
+        """Handle light stuck situation using depth-informed escape.
+
+        Uses depth information to determine the best turn direction,
+        avoiding random turns that lead back to obstacles.
+
+        Args:
+            context: Navigation context
+            agent_outputs: Outputs from other agents
+
+        Returns:
+            tuple: (action, confidence, reasoning)
+        """
+        # Check depth for obstacle information
+        depth_obstacle = self._check_depth_obstacle(context)
+
+        # Check action history for turn patterns
+        recent_turns = {"left": 0, "right": 0}
+        if context.action_history:
+            for a in context.action_history[-5:]:
+                if a.action_type == ActionType.TURN_LEFT:
+                    recent_turns["left"] += 1
+                elif a.action_type == ActionType.TURN_RIGHT:
+                    recent_turns["right"] += 1
+
+        # Determine turn direction based on depth and history
+        if depth_obstacle.get("has_obstacle"):
+            # Obstacle ahead - use suggested turn
+            suggested = depth_obstacle.get("suggested_turn", "right")
+
+            # But also consider recent turn history
+            if suggested == "left" and recent_turns["left"] > recent_turns["right"] + 1:
+                # Already turned left a lot, try right if also viable
+                if depth_obstacle.get("left_mean", 0) > 0.5:
+                    suggested = "right"
+            elif suggested == "right" and recent_turns["right"] > recent_turns["left"] + 1:
+                if depth_obstacle.get("right_mean", 0) > 0.5:
+                    suggested = "left"
+
+            if suggested == "left":
+                action = Action.turn_left()
+            else:
+                action = Action.turn_right()
+
+            confidence = 0.75
+            reasoning = f"前方障碍物({depth_obstacle.get('min_distance', 0):.1f}m)，{suggested}转脱困"
+
+        else:
+            # No immediate obstacle but stuck - check turn counter
+            if self._turn_counter < self._max_turns_before_forward:
+                self._turn_counter += 1
+
+                # Try the side with less recent turns
+                if recent_turns["left"] < recent_turns["right"]:
+                    action = Action.turn_left()
+                    reasoning = f"探索新方向(左转)，历史左转较少"
+                elif recent_turns["right"] < recent_turns["left"]:
+                    action = Action.turn_right()
+                    reasoning = f"探索新方向(右转)，历史右转较少"
+                else:
+                    # Equal - use depth to decide
+                    if depth_obstacle.get("suggested_turn") == "left":
+                        action = Action.turn_left()
+                    else:
+                        action = Action.turn_right()
+                    reasoning = f"探索新方向，基于深度信息"
+            else:
+                # After max turns, try forward
+                self._turn_counter = 0
+                action = Action.forward()
+                reasoning = "转向后尝试前进"
+
+            confidence = 0.7
+
+        # Record escape attempt
+        self._escape_attempts.append(action.action_type.name)
+
+        return action, confidence, reasoning
+
+    def _handle_severe_stuck(
+        self,
+        context: NavContext,
+        agent_outputs: Dict[str, Any]
+    ) -> tuple:
+        """Handle severe stuck situation with multi-round debate.
+
+        Triggers a multi-round debate between all agents to find
+        the best escape strategy.
+
+        Args:
+            context: Navigation context
+            agent_outputs: Outputs from other agents
+
+        Returns:
+            tuple: (action, confidence, reasoning, subtask_completed)
+        """
+        self.logger.info(f"[SEVERE STUCK] Starting multi-round debate at step {context.step_count}")
+
+        # Record this stuck region
+        context.record_stuck_region(context.position)
+
+        # Conduct multi-round debate
+        action, confidence, reasoning = self._multi_agent_stuck_debate(context, agent_outputs)
+
+        # Update last debate step
+        self._last_debate_step = context.step_count
+
+        # Check subtask completion
+        subtask_completed = self._check_subtask_completion(context, action, agent_outputs)
+
+        return action, confidence, reasoning, subtask_completed
+
+    def _multi_agent_stuck_debate(
+        self,
+        context: NavContext,
+        agent_outputs: Dict[str, Any],
+        rounds: int = 3
+    ) -> tuple:
+        """Conduct multi-round debate between agents for stuck escape.
+
+        Collects opinions from all agents across multiple rounds,
+        updating weights based on opinion consistency.
+
+        Args:
+            context: Navigation context
+            agent_outputs: Outputs from other agents
+            rounds: Number of debate rounds
+
+        Returns:
+            tuple: (action, confidence, reasoning)
+        """
+        opinions = {
+            "perception": None,
+            "trajectory": None,
+            "evaluation": None,
+            "instruction": None,
+        }
+
+        # Get observation history from context
+        rgb_history = context.rgb_history if hasattr(context, 'rgb_history') else []
+        depth_history = context.depth_history if hasattr(context, 'depth_history') else []
+
+        # Multi-round debate
+        for round_num in range(rounds):
+            self.logger.info(f"[DEBATE ROUND {round_num + 1}/{rounds}]")
+
+            # 1. Perception Agent opinion - based on RGB+Depth history
+            perception_opinion = self._get_perception_stuck_opinion(
+                context, agent_outputs, rgb_history, depth_history
+            )
+            opinions["perception"] = perception_opinion
+
+            # 2. Trajectory Agent opinion - based on trajectory history
+            trajectory_opinion = self._get_trajectory_stuck_opinion(
+                context, agent_outputs
+            )
+            opinions["trajectory"] = trajectory_opinion
+
+            # 3. Evaluation Agent opinion - based on decision history
+            evaluation_opinion = self._get_evaluation_stuck_opinion(
+                context, agent_outputs
+            )
+            opinions["evaluation"] = evaluation_opinion
+
+            # 4. Instruction Agent opinion - based on current subtask
+            instruction_opinion = self._get_instruction_opinion(context, agent_outputs)
+            opinions["instruction"] = instruction_opinion
+
+            # Log opinions
+            for agent_name, opinion in opinions.items():
+                if opinion:
+                    self.logger.info(
+                        f"  [{agent_name}] {opinion.get('action', 'unknown')} "
+                        f"(conf: {opinion.get('priority', 0.5):.2f}): "
+                        f"{opinion.get('reason', '')[:40]}"
+                    )
+
+            # Update weights based on opinion consistency
+            if round_num < rounds - 1:
+                self._update_opinion_weights(opinions, round_num)
+
+        # Synthesize final decision
+        return self._synthesize_stuck_decision(opinions, context)
+
+    def _get_perception_stuck_opinion(
+        self,
+        context: NavContext,
+        agent_outputs: Dict[str, Any],
+        rgb_history: List,
+        depth_history: List
+    ) -> Dict[str, Any]:
+        """Get stuck escape opinion from perception perspective."""
+        # Try to use PerceptionAgent's stuck escape method if available
+        try:
+            from agents.perception_agent import PerceptionAgent
+            if self._perception_agent is None:
+                self._perception_agent = PerceptionAgent(self.config)
+                self._perception_agent.initialize()
+
+            if hasattr(self._perception_agent, 'get_stuck_escape_opinion'):
+                return self._perception_agent.get_stuck_escape_opinion(
+                    rgb_history, depth_history, context
+                )
+        except Exception as e:
+            self.logger.debug(f"PerceptionAgent stuck opinion failed: {e}")
+
+        # Fallback to basic perception-based opinion
+        return self._get_perception_opinion(context, agent_outputs)
+
+    def _get_trajectory_stuck_opinion(
+        self,
+        context: NavContext,
+        agent_outputs: Dict[str, Any]
+    ) -> Dict[str, Any]:
+        """Get stuck escape opinion from trajectory perspective."""
+        # Try to use TrajectoryAgent's stuck escape method
+        try:
+            from agents.trajectory_agent import TrajectoryAgent
+            if self._trajectory_agent is None:
+                self._trajectory_agent = TrajectoryAgent(self.config)
+                self._trajectory_agent.initialize()
+
+            if hasattr(self._trajectory_agent, 'get_stuck_escape_opinion'):
+                stuck_regions = context.stuck_regions if hasattr(context, 'stuck_regions') else []
+                return self._trajectory_agent.get_stuck_escape_opinion(
+                    context.trajectory, stuck_regions, context.rotation
+                )
+        except Exception as e:
+            self.logger.debug(f"TrajectoryAgent stuck opinion failed: {e}")
+
+        # Fallback to basic trajectory-based opinion
+        return self._get_trajectory_opinion(context, agent_outputs)
+
+    def _get_evaluation_stuck_opinion(
+        self,
+        context: NavContext,
+        agent_outputs: Dict[str, Any]
+    ) -> Dict[str, Any]:
+        """Get stuck escape opinion from evaluation perspective."""
+        # Try to use EvaluationAgent's stuck escape method
+        try:
+            from agents.evaluation_agent import EvaluationAgent
+            if self._evaluation_agent is None:
+                self._evaluation_agent = EvaluationAgent(self.config)
+                self._evaluation_agent.initialize()
+
+            if hasattr(self._evaluation_agent, 'get_stuck_escape_opinion'):
+                eval_history = self._evaluation_agent._evaluation_history if self._evaluation_agent else []
+                return self._evaluation_agent.get_stuck_escape_opinion(
+                    context.decision_history, eval_history, context
+                )
+        except Exception as e:
+            self.logger.debug(f"EvaluationAgent stuck opinion failed: {e}")
+
+        # Fallback to basic decision-based opinion
+        return self._get_decision_opinion(context, agent_outputs)
+
+    def _update_opinion_weights(
+        self,
+        opinions: Dict[str, Dict],
+        round_num: int
+    ) -> None:
+        """Update opinion weights based on consistency across rounds.
+
+        Agents with consistent opinions get higher weights.
+
+        Args:
+            opinions: Current opinions from all agents
+            round_num: Current round number
+        """
+        # Count action preferences
+        action_counts = {}
+        for agent, opinion in opinions.items():
+            if opinion:
+                action = opinion.get("action", "forward")
+                if action not in action_counts:
+                    action_counts[action] = []
+                action_counts[action].append(agent)
+
+        # Find consensus actions (agreed by multiple agents)
+        for action, agents in action_counts.items():
+            if len(agents) >= 2:
+                # Increase weight for agreeing agents
+                for agent in agents:
+                    current_weight = self._opinion_weights.get(agent, 1.0)
+                    self._opinion_weights[agent] = min(current_weight + 0.1, 1.5)
+
+        self.logger.debug(f"[DEBATE] Updated weights: {self._opinion_weights}")
+
+    def _synthesize_stuck_decision(
+        self,
+        opinions: Dict[str, Dict],
+        context: NavContext
+    ) -> tuple:
+        """Synthesize opinions from all agents into final stuck escape decision.
+
+        Uses weighted voting to determine the best escape action.
+
+        Args:
+            opinions: Opinions from all agents
+            context: Navigation context
+
+        Returns:
+            tuple: (action, confidence, reasoning)
+        """
+        # Weighted vote for each action
+        action_scores = {
+            "forward": 0.0,
+            "turn_left": 0.0,
+            "turn_right": 0.0,
+            "stop": 0.0,
+        }
+
+        # Aggregate weighted scores
+        for agent_name, opinion in opinions.items():
+            if opinion is None:
+                continue
+
+            action = opinion.get("action", "forward")
+            priority = opinion.get("priority", 0.5)
+            weight = self._opinion_weights.get(agent_name, 1.0)
+
+            if action in action_scores:
+                action_scores[action] += priority * weight
+
+        # Log final scores
+        self.logger.info(f"[DEBATE SYNTHESIS] Final action scores: {action_scores}")
+
+        # Find best action
+        best_action = max(action_scores, key=action_scores.get)
+        total_score = sum(action_scores.values())
+        confidence = min(action_scores[best_action] / max(total_score, 1.0) * 1.5, 0.95)
+
+        # Get reasoning from highest priority opinion
+        reasoning = f"综合各agent意见({self._stuck_counter}步卡住)"
+        best_opinion = None
+        for agent_name, opinion in opinions.items():
+            if opinion and opinion.get("action") == best_action:
+                if best_opinion is None or opinion.get("priority", 0) > best_opinion.get("priority", 0):
+                    best_opinion = opinion
+
+        if best_opinion:
+            reasoning = best_opinion.get("reason", reasoning)
+
+        # Create action
+        action = self._create_action(best_action)
+
+        # Record this as a potential escape action
+        if action.action_type in [ActionType.TURN_LEFT, ActionType.TURN_RIGHT]:
+            self._escape_attempts.append(best_action)
+
+        return action, confidence, reasoning
+
+    def reset_stuck_counter(self) -> None:
+        """Reset stuck detection counter for new episode."""
+        self._last_position = None
+        self._stuck_counter = 0
+        self._turn_counter = 0
+        self._last_debate_step = -999
+        self._escape_attempts.clear()
+        # Reset opinion weights to defaults
+        self._opinion_weights = {
+            "perception": 1.2,
+            "trajectory": 0.9,
+            "evaluation": 0.8,
+            "instruction": 1.0,
+            "decision": 0.7,
+        }

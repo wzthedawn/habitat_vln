@@ -12,6 +12,11 @@ build/
 
 # Logs
 *.log
+logs/
+
+# Output and results
+output/
+results/
 
 # Data and models (large files)
 data/

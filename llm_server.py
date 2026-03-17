@@ -15,11 +15,13 @@ Architecture:
 
 Communication:
     - HTTP POST /generate: Generate text using specified model
+    - HTTP POST /generate_vision: Generate text from image + text (VLM)
     - HTTP GET /health: Health check and loaded models
 """
 
 import argparse
 import asyncio
+import base64
 import json
 import logging
 import os
@@ -27,6 +29,7 @@ import sys
 import time
 from typing import Dict, Optional, Any, List
 from contextlib import asynccontextmanager
+from io import BytesIO
 
 # Configure logging
 logging.basicConfig(
@@ -40,18 +43,32 @@ models: Dict[str, Any] = {}
 tokenizers: Dict[str, Any] = {}
 model_configs: Dict[str, Dict] = {}
 
+# VLM-specific storage
+vlm_processors: Dict[str, Any] = {}  # VLM image processors
+
 # Conversation contexts for multi-turn dialogues
 conversation_contexts: Dict[str, List[Dict[str, str]]] = {}
 
 
 def get_model_configs() -> Dict[str, Dict]:
-    """Get model configurations."""
+    """Get model configurations.
+
+    Model allocation (方案二):
+    - qwen-4b-perception: Visual perception and scene description (4B for better visual understanding)
+    - qwen-2b-trajectory: Trajectory summarization (2B sufficient for simple text tasks)
+    - qwen-4b: Navigation decision making (4B for reasoning)
+    - qwen-4b-evaluation: Decision evaluation (4B for assessment)
+    - qwen2-vl-2b: Vision-Language Model for object detection and scene analysis
+
+    Total VRAM: ~16GB + Habitat ~2GB = ~18GB (safe for 24GB GPU)
+    """
     return {
-        "qwen-2b-perception": {
-            "model_name": "/root/.cache/modelscope/hub/models/Qwen/Qwen3___5-2B",
+        "qwen-4b-perception": {
+            "model_name": "/root/.cache/modelscope/hub/models/Qwen/Qwen3___5-4B",
             "max_new_tokens": 256,
             "default_temperature": 0.3,
-            "description": "Visual perception and scene description",
+            "description": "Visual perception and scene description (VLM)",
+            "is_vlm": True,  # Qwen3.5-4B is a multimodal VLM
         },
         "qwen-2b-trajectory": {
             "model_name": "/root/.cache/modelscope/hub/models/Qwen/Qwen3___5-2B",
@@ -65,11 +82,19 @@ def get_model_configs() -> Dict[str, Dict]:
             "default_temperature": 0.1,
             "description": "Navigation decision making",
         },
-        "qwen-9b": {
-            "model_name": "/root/.cache/modelscope/hub/models/Qwen/Qwen3___5-9B",
-            "max_new_tokens": 400,
-            "default_temperature": 0.3,
+        "qwen-4b-evaluation": {
+            "model_name": "/root/.cache/modelscope/hub/models/Qwen/Qwen3___5-4B",
+            "max_new_tokens": 150,
+            "default_temperature": 0.2,
             "description": "Decision evaluation and feedback",
+        },
+        "qwen2-vl-2b": {
+            "model_name": "/root/.cache/modelscope/hub/models/Qwen/Qwen2-VL-2B-Instruct",
+            "max_new_tokens": 256,
+            "default_temperature": 0.3,
+            "description": "Vision-Language Model for object detection and scene analysis (optional)",
+            "is_vlm": True,
+            "optional": True,  # VLM is optional, won't fail if not available
         },
     }
 
@@ -154,6 +179,126 @@ def load_model(model_key: str, use_int8: bool = True) -> bool:
         return False
 
 
+def load_vlm_model(model_key: str, use_int8: bool = True) -> bool:
+    """Load a Vision-Language Model.
+
+    Supports Qwen2-VL, Qwen2.5-VL, Qwen3-VL, and Qwen3.5-VL models.
+
+    Args:
+        model_key: Model identifier (e.g., qwen2-vl-2b, qwen-4b-perception)
+        use_int8: Whether to use INT8 quantization
+
+    Returns:
+        True if loaded successfully
+    """
+    global models, tokenizers, vlm_processors, model_configs
+
+    if model_key in models:
+        return True
+
+    config = model_configs.get(model_key)
+    if not config:
+        logger.error(f"Unknown model key: {model_key}")
+        return False
+
+    if not config.get("is_vlm", False):
+        logger.error(f"Model {model_key} is not configured as a VLM")
+        return False
+
+    model_path = config["model_name"]
+
+    # Check if model path exists
+    if not os.path.exists(model_path):
+        logger.warning(f"VLM model path does not exist: {model_path}")
+        logger.warning("VLM model not available, perception will use text-only fallback")
+        return False
+
+    try:
+        import torch
+        from transformers import AutoProcessor, BitsAndBytesConfig
+        from transformers import Qwen2VLForConditionalGeneration, Qwen3_5ForConditionalGeneration
+
+        logger.info(f"Loading VLM {model_key} from {model_path}...")
+
+        # Load processor (includes tokenizer and image processor)
+        processor = AutoProcessor.from_pretrained(
+            model_path,
+            trust_remote_code=True
+        )
+
+        # Configure quantization
+        if use_int8:
+            quantization_config = BitsAndBytesConfig(
+                load_in_8bit=True,
+                llm_int8_threshold=6.0,
+            )
+        else:
+            quantization_config = None
+
+        # Select model class based on model key
+        model = None
+        try:
+            if "qwen2-vl" in model_key.lower():
+                # Qwen2-VL-2B uses dedicated class
+                model = Qwen2VLForConditionalGeneration.from_pretrained(
+                    model_path,
+                    quantization_config=quantization_config,
+                    device_map="auto",
+                    trust_remote_code=True,
+                    torch_dtype=torch.float16,
+                )
+            else:
+                # Qwen3.5-4B uses Qwen3_5ForConditionalGeneration
+                # This properly handles both text and image inputs
+                model = Qwen3_5ForConditionalGeneration.from_pretrained(
+                    model_path,
+                    quantization_config=quantization_config,
+                    device_map="auto",
+                    trust_remote_code=True,
+                    torch_dtype=torch.float16,
+                )
+        except Exception as e:
+            logger.warning(f"Failed to load VLM model: {e}")
+            # Fallback: try without quantization
+            try:
+                if "qwen2-vl" in model_key.lower():
+                    model = Qwen2VLForConditionalGeneration.from_pretrained(
+                        model_path,
+                        device_map="auto",
+                        trust_remote_code=True,
+                        torch_dtype=torch.float16,
+                    )
+                else:
+                    model = Qwen3_5ForConditionalGeneration.from_pretrained(
+                        model_path,
+                        device_map="auto",
+                        trust_remote_code=True,
+                        torch_dtype=torch.float16,
+                    )
+            except Exception as e2:
+                logger.error(f"Failed to load VLM model: {e2}")
+                return False
+
+        model.eval()
+
+        models[model_key] = model
+        tokenizers[model_key] = processor.tokenizer
+        vlm_processors[model_key] = processor
+
+        logger.info(f"VLM {model_key} loaded successfully")
+        return True
+
+    except ImportError as e:
+        logger.error(f"Missing VLM dependencies: {e}")
+        logger.error("Install with: pip install transformers>=4.45.0 qwen-vl-utils")
+        return False
+    except Exception as e:
+        logger.error(f"Failed to load VLM {model_key}: {e}")
+        import traceback
+        traceback.print_exc()
+        return False
+
+
 def load_all_models(use_int8: bool = True) -> bool:
     """Load all configured models.
 
@@ -161,7 +306,7 @@ def load_all_models(use_int8: bool = True) -> bool:
         use_int8: Whether to use INT8 quantization
 
     Returns:
-        True if all models loaded successfully
+        True if all required models loaded successfully
     """
     global model_configs
 
@@ -177,9 +322,22 @@ def load_all_models(use_int8: bool = True) -> bool:
 
     success = True
     for model_key in model_configs:
-        if not load_model(model_key, use_int8):
-            logger.warning(f"Failed to load {model_key}")
-            success = False
+        config = model_configs[model_key]
+        is_optional = config.get("optional", False)
+        is_vlm = config.get("is_vlm", False)
+
+        # Try to load the model
+        if is_vlm:
+            loaded = load_vlm_model(model_key, use_int8)
+        else:
+            loaded = load_model(model_key, use_int8)
+
+        if not loaded:
+            if is_optional:
+                logger.warning(f"Optional model {model_key} not available - continuing without it")
+            else:
+                logger.warning(f"Failed to load required model {model_key}")
+                success = False
 
     logger.info("=" * 60)
     logger.info(f"Models loaded: {list(models.keys())}")
@@ -291,6 +449,134 @@ def generate_text(
 
     except Exception as e:
         logger.error(f"Generation failed for {model_key}: {e}")
+        import traceback
+        traceback.print_exc()
+        return {
+            "error": str(e),
+            "model": model_key,
+        }
+
+
+def generate_vision(
+    model_key: str,
+    prompt: str,
+    image_base64: str,
+    max_new_tokens: Optional[int] = None,
+    temperature: Optional[float] = None,
+) -> Dict[str, Any]:
+    """Generate text from image and prompt using VLM.
+
+    Supports both Qwen2-VL and Qwen3.5-VL models.
+
+    Args:
+        model_key: Model identifier (e.g., qwen2-vl-2b, qwen-4b-perception)
+        prompt: Input prompt
+        image_base64: Base64 encoded image
+        max_new_tokens: Maximum tokens to generate
+        temperature: Sampling temperature
+
+    Returns:
+        Dictionary with response and metadata
+    """
+    start_time = time.time()
+
+    # Check if VLM model is available
+    if model_key not in models:
+        # Try to load VLM model
+        if not load_vlm_model(model_key):
+            return {
+                "error": f"VLM model {model_key} not available",
+                "available_models": list(models.keys()),
+            }
+
+    model = models[model_key]
+    processor = vlm_processors.get(model_key)
+    config = model_configs[model_key]
+
+    if processor is None:
+        return {
+            "error": f"VLM processor not found for {model_key}",
+            "model": model_key,
+        }
+
+    # Get generation parameters
+    max_tokens = max_new_tokens or config["max_new_tokens"]
+    temp = temperature if temperature is not None else config["default_temperature"]
+
+    try:
+        import torch
+        from PIL import Image
+
+        # Decode base64 image
+        image_data = base64.b64decode(image_base64)
+        image = Image.open(BytesIO(image_data))
+
+        # Convert to RGB if necessary
+        if image.mode != 'RGB':
+            image = image.convert('RGB')
+
+        # Prepare messages for VLM
+        # Format compatible with both Qwen2-VL and Qwen3.5-VL
+        messages = [
+            {
+                "role": "user",
+                "content": [
+                    {"type": "image", "image": image},
+                    {"type": "text", "text": prompt},
+                ],
+            }
+        ]
+
+        # Apply chat template
+        text_prompt = processor.apply_chat_template(
+            messages, tokenize=False, add_generation_prompt=True
+        )
+
+        # Process inputs - use processor's __call__ method
+        # This handles both image and text processing
+        inputs = processor(
+            text=[text_prompt],
+            images=[image],
+            return_tensors="pt",
+            padding=True,
+        )
+        # Move all inputs to device (including VLM-specific keys like pixel_values)
+        inputs = {k: v.to(model.device) for k, v in inputs.items()}
+
+        # Generate
+        with torch.no_grad():
+            outputs = model.generate(
+                **inputs,
+                max_new_tokens=max_tokens,
+                temperature=temp,
+                do_sample=temp > 0,
+                top_p=0.9,
+                top_k=50,
+            )
+
+        # Decode
+        generated_ids = outputs[0][inputs["input_ids"].shape[1]:]
+        generated_text = processor.decode(
+            generated_ids,
+            skip_special_tokens=True,
+            clean_up_tokenization_spaces=True
+        )
+
+        latency = (time.time() - start_time) * 1000
+        tokens_generated = len(generated_ids)
+
+        logger.info(f"[VLM] {model_key}: generated {tokens_generated} tokens in {latency:.0f}ms")
+        logger.info(f"[VLM] Response: {generated_text.strip()[:500]}")
+
+        return {
+            "response": generated_text.strip(),
+            "model": model_key,
+            "tokens_generated": tokens_generated,
+            "latency_ms": latency,
+        }
+
+    except Exception as e:
+        logger.error(f"Vision generation failed for {model_key}: {e}")
         import traceback
         traceback.print_exc()
         return {
@@ -413,6 +699,44 @@ def create_app() -> "FastAPI":
             tokens_generated=result.get("tokens_generated", 0),
             latency_ms=result.get("latency_ms", 0),
             conversation_id=result.get("conversation_id"),
+            error=result.get("error"),
+        )
+
+    class GenerateVisionRequest(BaseModel):
+        """Request model for vision-language generation."""
+        model: str = Field(default="qwen-4b-perception", description="VLM model identifier")
+        prompt: str = Field(..., description="Input prompt for generation")
+        image_base64: str = Field(..., description="Base64 encoded image")
+        max_new_tokens: Optional[int] = Field(None, description="Maximum tokens to generate")
+        temperature: Optional[float] = Field(None, description="Sampling temperature (0.0-2.0)")
+
+    class GenerateVisionResponse(BaseModel):
+        """Response model for vision-language generation."""
+        response: str
+        model: str
+        tokens_generated: int
+        latency_ms: float
+        error: Optional[str] = None
+
+    @app.post("/generate_vision", response_model=GenerateVisionResponse)
+    async def generate_vision_endpoint(request: GenerateVisionRequest):
+        """Generate text from image and prompt using VLM."""
+        result = generate_vision(
+            model_key=request.model,
+            prompt=request.prompt,
+            image_base64=request.image_base64,
+            max_new_tokens=request.max_new_tokens,
+            temperature=request.temperature,
+        )
+
+        if "error" in result and "response" not in result:
+            raise HTTPException(status_code=500, detail=result["error"])
+
+        return GenerateVisionResponse(
+            response=result.get("response", ""),
+            model=result.get("model", request.model),
+            tokens_generated=result.get("tokens_generated", 0),
+            latency_ms=result.get("latency_ms", 0),
             error=result.get("error"),
         )
 

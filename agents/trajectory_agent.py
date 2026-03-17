@@ -27,6 +27,7 @@ class TrajectoryAgent(BaseAgent):
     2. Build simple map of visited locations
     3. Generate LLM-enhanced trajectory summaries
     4. Detect if current location was visited before
+    5. Track stuck regions for escape planning
     """
 
     # Direction names for cardinal directions
@@ -59,6 +60,10 @@ class TrajectoryAgent(BaseAgent):
         # State tracking
         self._goal_position = None
         self._waypoints = []
+
+        # NEW: Stuck region tracking
+        self._stuck_regions: List[Dict] = []
+        self._stuck_paths: List[List[Tuple]] = []
 
         # Model reference
         self._model_manager = None
@@ -156,6 +161,15 @@ class TrajectoryAgent(BaseAgent):
             # Calculate distance traveled
             distance_traveled = self._calculate_distance(trajectory)
 
+            # === NEW: Calculate height change ===
+            y_change = 0.0
+            y_direction = "稳定"
+            if len(trajectory) >= 5:
+                y_values = [p[1] for p in trajectory[-10:]] if len(trajectory) >= 10 else [p[1] for p in trajectory]
+                y_change = y_values[-1] - y_values[0]
+                if abs(y_change) > 0.3:
+                    y_direction = "上升" if y_change > 0 else "下降"
+
             # Update context
             context.metadata["trajectory"] = {
                 "progress": progress,
@@ -164,6 +178,9 @@ class TrajectoryAgent(BaseAgent):
                 "visited": visited,
                 "heading": heading,
                 "distance_traveled": distance_traveled,
+                # NEW: Height change info
+                "y_change": y_change,
+                "y_direction": y_direction,
             }
 
             return AgentOutput.success_output(
@@ -410,7 +427,7 @@ class TrajectoryAgent(BaseAgent):
                 return llm_summary
 
         # Fallback to template-based summary
-        return self._generate_template_summary(position, rotation, trajectory)
+        return self._generate_template_summary(position, rotation, trajectory, context)
 
     def _generate_llm_trajectory_summary(
         self,
@@ -419,7 +436,7 @@ class TrajectoryAgent(BaseAgent):
         trajectory: List[Tuple],
         context: NavContext = None,
     ) -> str:
-        """Generate LLM-enhanced trajectory summary."""
+        """Generate LLM-enhanced trajectory summary with height awareness."""
         if not self._model_manager:
             return ""
 
@@ -430,15 +447,45 @@ class TrajectoryAgent(BaseAgent):
             is_stuck = self._check_stuck(trajectory) if len(trajectory) >= 5 else False
             backtrack_score = self._check_backtracking(trajectory) if len(trajectory) >= 3 else 1.0
 
-            # Build prompt
-            prompt = f"""导航状态:
-- 已走: {distance:.1f}米
-- 朝向: {heading}
-- 探索: {visited_cells}个区域
-- 状态: {"卡住" if is_stuck else "正常"}
+            # === NEW: Height change analysis ===
+            y_trajectory = ""
+            y_direction = "稳定"
+            y_change_value = 0.0
 
-要求: 用1句话(不超过30字)总结进度。
-直接输出，不要解释。"""
+            if len(trajectory) >= 5:
+                y_values = [p[1] for p in trajectory[-10:]] if len(trajectory) >= 10 else [p[1] for p in trajectory]
+                y_start = y_values[0]
+                y_end = y_values[-1]
+                y_change_value = y_end - y_start
+
+                if abs(y_change_value) > 0.3:
+                    y_direction = "上升" if y_change_value > 0 else "下降"
+                    y_trajectory = f"高度{y_direction}{abs(y_change_value):.1f}米"
+
+            # === NEW: Enhanced prompt template ===
+            # Calculate goal distance if available
+            goal_distance = 0.0
+            if context and hasattr(context, 'metadata'):
+                goal_pos = context.metadata.get("goal_position")
+                if goal_pos:
+                    goal_distance = math.sqrt(
+                        (goal_pos[0] - position[0])**2 +
+                        (goal_pos[2] - position[2])**2
+                    )
+
+            # Convert rotation to heading degrees (0-360)
+            heading_degrees = int(math.degrees(rotation)) % 360
+
+            prompt = f"""直接输出JSON，不要思考或解释:
+
+{{
+  "当前位置": [{position[0]:.2f}, {position[1]:.2f}, {position[2]:.2f}],
+  "当前朝向": {heading_degrees},
+  "已走距离": {distance:.1f},
+  "距离目标": {goal_distance:.1f}
+}}
+
+只输出上面JSON，无其他内容。"""
 
             # Get episode_id for conversation context isolation
             episode_id = context.metadata.get("episode_id", 0) if context else 0
@@ -448,53 +495,157 @@ class TrajectoryAgent(BaseAgent):
             response = self._model_manager.generate(
                 "qwen-2b-trajectory",
                 prompt,
-                max_new_tokens=30,  # Reduced from 100 for faster inference
-                temperature=0.2,
+                max_new_tokens=80,  # Enough for JSON output
+                temperature=0.1,  # Lower temperature for more consistent JSON
                 conversation_id=conversation_id,
                 keep_context=True,
             )
 
             if response:
-                # Update conversation history
-                self._conversation_history.append({
-                    "role": "assistant",
-                    "content": response
-                })
-                # Keep only recent history
-                if len(self._conversation_history) > 10:
-                    self._conversation_history = self._conversation_history[-10:]
+                # Clean the response to remove thinking artifacts
+                cleaned_response = self._clean_llm_output(response)
 
-                return response
+                # Parse JSON response
+                parsed = self._parse_trajectory_json(cleaned_response)
+                if parsed:
+                    # Log in the specified format
+                    self.logger.info(
+                        f"[TrajectoryAgent] 当前位置: {parsed['当前位置']}, "
+                        f"当前朝向: {parsed['当前朝向']}, "
+                        f"已走距离: {parsed['已走距离']}"
+                    )
+                    # Return formatted string for display
+                    return self._format_trajectory_output(parsed)
+
+                # Fallback to cleaned response if JSON parsing failed
+                # Return empty string to trigger template-based summary
+                self.logger.debug(f"[TrajectoryAgent] JSON parsing failed, using template")
+                return ""
 
         except Exception as e:
             self.logger.warning(f"LLM trajectory summary failed: {e}")
 
         return ""
 
+    def _parse_trajectory_json(self, response: str) -> Optional[Dict[str, Any]]:
+        """Parse trajectory JSON from LLM response.
+
+        Args:
+            response: Raw LLM response text
+
+        Returns:
+            Parsed dictionary or None if parsing failed
+        """
+        import json
+        import re
+
+        # Try to find JSON in response - handle various formats
+        # Pattern 1: Full JSON with Chinese keys
+        json_patterns = [
+            r'\{[^{}]*"当前位置"[^{}]*\}',  # Single level JSON
+            r'\{(?:[^{}]|\{[^{}]*\})*\}',   # Nested JSON up to 2 levels
+        ]
+
+        for pattern in json_patterns:
+            matches = re.findall(pattern, response, re.DOTALL)
+            for json_str in matches:
+                # Check if this match contains our expected keys
+                if '"当前位置"' in json_str:
+                    try:
+                        data = json.loads(json_str)
+                        return {
+                            "当前位置": data.get("当前位置", [0.0, 0.0, 0.0]),
+                            "当前朝向": int(data.get("当前朝向", 0)) % 360,
+                            "已走距离": float(data.get("已走距离", 0.0)),
+                            "距离目标": float(data.get("距离目标", 0.0)),
+                        }
+                    except (json.JSONDecodeError, ValueError, TypeError) as e:
+                        self.logger.debug(f"Failed to parse trajectory JSON: {e}")
+                        continue
+
+        return None
+
+    def _format_trajectory_output(self, data: Dict[str, Any]) -> str:
+        """Format trajectory data into readable string.
+
+        Args:
+            data: Parsed trajectory data dictionary
+
+        Returns:
+            Formatted string for display
+        """
+        pos = data["当前位置"]
+        return (
+            f"当前位置: [{pos[0]:.2f}, {pos[1]:.2f}, {pos[2]:.2f}], "
+            f"当前朝向: {data['当前朝向']}度, "
+            f"已走距离: {data['已走距离']:.1f}米, "
+            f"距离目标: {data['距离目标']:.1f}米"
+        )
+
+    def _clean_llm_output(self, response: str) -> str:
+        """Clean LLM output by removing thinking process and artifacts."""
+        import re
+
+        cleaned = response.strip()
+
+        # Remove thinking process markers (Qwen3.5 style)
+        thinking_patterns = [
+            r'\d+\.\s*\*\*[^*]+\*\*:',  # "1. **Analyze...:"
+            r'\d+\.\s*\*[^*]+\*:',       # "1. *Analyze...:"
+            r'<think>.*?</think>',       # <think>...</think>
+            r'```.*?```',                # code blocks
+        ]
+
+        for pattern in thinking_patterns:
+            cleaned = re.sub(pattern, '', cleaned, flags=re.DOTALL)
+
+        # Remove leading numbers like "2. " at the start
+        cleaned = re.sub(r'^\d+\.\s*', '', cleaned.strip())
+
+        # Remove multiple spaces
+        cleaned = re.sub(r'\s+', ' ', cleaned)
+
+        return cleaned.strip()
+
     def _generate_template_summary(
         self,
         position: Tuple[float, float, float],
         rotation: float,
         trajectory: List[Tuple],
+        context: NavContext = None,
     ) -> str:
-        """Generate template-based trajectory summary (fallback)."""
+        """Generate template-based trajectory summary (fallback) in JSON format."""
+        import json
+
         distance = self._calculate_distance(trajectory)
-        heading = self._get_heading_name(rotation)
-        visited_cells = len(self._visited_cells)
+        heading_degrees = int(math.degrees(rotation)) % 360
 
-        if len(trajectory) <= 1:
-            return "刚开始导航"
+        # Calculate goal distance if available
+        goal_distance = 0.0
+        if context and hasattr(context, 'metadata'):
+            goal_pos = context.metadata.get("goal_position")
+            if goal_pos:
+                goal_distance = math.sqrt(
+                    (goal_pos[0] - position[0])**2 +
+                    (goal_pos[2] - position[2])**2
+                )
 
-        # Check if stuck
-        if self._check_stuck(trajectory):
-            return f"已在原地停留，已探索{visited_cells}个区域"
+        # Build structured output
+        output_data = {
+            "当前位置": [round(position[0], 2), round(position[1], 2), round(position[2], 2)],
+            "当前朝向": heading_degrees,
+            "已走距离": round(distance, 1),
+            "距离目标": round(goal_distance, 1)
+        }
 
-        # Check if backtracking
-        backtrack_score = self._check_backtracking(trajectory)
-        if backtrack_score < 0.5:
-            return f"已行走{distance:.1f}米，可能偏离目标，朝向{heading}"
+        # Log in the specified format
+        self.logger.info(
+            f"[TrajectoryAgent] 当前位置: {output_data['当前位置']}, "
+            f"当前朝向: {output_data['当前朝向']}, "
+            f"已走距离: {output_data['已走距离']}"
+        )
 
-        return f"已行走{distance:.1f}米，当前朝向{heading}，已探索{visited_cells}个区域"
+        return json.dumps(output_data, ensure_ascii=False)
 
     def reset_map(self) -> None:
         """Reset the visited cells map."""
@@ -502,4 +653,174 @@ class TrajectoryAgent(BaseAgent):
         self._waypoints.clear()
         self._goal_position = None
         self._conversation_history.clear()
-        self._conversation_history.clear()
+        self._stuck_regions.clear()
+        self._stuck_paths.clear()
+
+    def record_stuck_region(
+        self,
+        position: Tuple[float, float, float],
+        radius: float = 1.0,
+        escape_actions: List[str] = None,
+        failed_attempts: List[str] = None
+    ) -> None:
+        """Record a stuck region for future reference.
+
+        Args:
+            position: Position where stuck occurred
+            radius: Radius of stuck region
+            escape_actions: Actions that successfully escaped
+            failed_attempts: Actions that failed to escape
+        """
+        stuck_record = {
+            "position": position,
+            "radius": radius,
+            "entry_step": len(self._visited_cells),
+            "exit_step": None,
+            "escape_actions": escape_actions or [],
+            "failed_attempts": failed_attempts or [],
+        }
+        self._stuck_regions.append(stuck_record)
+        self.logger.info(f"[Stuck Region] Recorded at position {position}")
+
+    def is_in_stuck_region(self, position: Tuple[float, float, float]) -> bool:
+        """Check if position is within any known stuck region.
+
+        Args:
+            position: Position to check
+
+        Returns:
+            True if position is within a stuck region
+        """
+        for region in self._stuck_regions:
+            dx = position[0] - region["position"][0]
+            dz = position[2] - region["position"][2]
+            dist = math.sqrt(dx*dx + dz*dz)
+            if dist < region["radius"]:
+                return True
+        return False
+
+    def get_stuck_escape_opinion(
+        self,
+        trajectory: List[Tuple],
+        stuck_regions: List[Dict],
+        current_rotation: float = 0.0
+    ) -> Dict[str, Any]:
+        """Provide stuck escape opinion based on trajectory history.
+
+        Analyzes the trajectory to find unexplored directions and
+        escape routes from stuck regions.
+
+        Args:
+            trajectory: List of positions in the trajectory
+            stuck_regions: List of known stuck regions
+            current_rotation: Current rotation angle in radians
+
+        Returns:
+            Dict with escape direction, confidence, and reasoning
+        """
+        opinion = {
+            "direction": "right",
+            "confidence": 0.5,
+            "reason": "默认建议",
+            "stop_condition": "",
+            "agent_source": "trajectory",
+        }
+
+        if len(trajectory) < 3:
+            opinion["reason"] = "轨迹数据不足"
+            return opinion
+
+        # Analyze recent trajectory for movement patterns
+        recent = trajectory[-10:] if len(trajectory) >= 10 else trajectory
+
+        # Calculate movement directions
+        directions = []
+        for i in range(1, len(recent)):
+            prev = recent[i - 1]
+            curr = recent[i]
+            dx = curr[0] - prev[0]
+            dz = curr[2] - prev[2]
+            dist = math.sqrt(dx*dx + dz*dz)
+            if dist > 0.05:
+                angle = math.atan2(-dx, dz)  # Habitat coordinate system
+                directions.append(angle)
+
+        if not directions:
+            opinion["reason"] = "无有效移动记录"
+            return opinion
+
+        # Find explored directions
+        explored_angles = set()
+        for angle in directions:
+            # Quantize to 45-degree sectors
+            sector = int(math.degrees(angle) // 45) * 45
+            explored_angles.add(sector)
+
+        # All possible directions (8 sectors)
+        all_sectors = {-180, -135, -90, -45, 0, 45, 90, 135, 180}
+        unexplored = all_sectors - explored_angles
+
+        # Current facing direction
+        current_sector = int(math.degrees(current_rotation) // 45) * 45
+
+        # Find best unexplored direction relative to current facing
+        if unexplored:
+            # Find closest unexplored sector to current direction
+            min_diff = 360
+            best_sector = current_sector
+            for sector in unexplored:
+                diff = abs(sector - current_sector)
+                if diff > 180:
+                    diff = 360 - diff
+                if diff < min_diff:
+                    min_diff = diff
+                    best_sector = sector
+
+            # Determine turn direction
+            angle_diff = best_sector - current_sector
+            if angle_diff > 180:
+                angle_diff -= 360
+            elif angle_diff < -180:
+                angle_diff += 360
+
+            if angle_diff > 22:
+                opinion["direction"] = "left"
+                opinion["confidence"] = 0.7
+                opinion["reason"] = f"未探索方向在左侧({angle_diff}°)"
+            elif angle_diff < -22:
+                opinion["direction"] = "right"
+                opinion["confidence"] = 0.7
+                opinion["reason"] = f"未探索方向在右侧({-angle_diff}°)"
+            else:
+                opinion["direction"] = "forward"
+                opinion["confidence"] = 0.75
+                opinion["reason"] = "前方为未探索方向"
+
+        else:
+            # All directions explored - check for blocked paths
+            opinion["reason"] = "所有方向已探索"
+
+            # Check if in known stuck region
+            if stuck_regions:
+                current_pos = trajectory[-1] if trajectory else (0, 0, 0)
+                for region in stuck_regions:
+                    dx = current_pos[0] - region["position"][0]
+                    dz = current_pos[2] - region["position"][2]
+                    dist = math.sqrt(dx*dx + dz*dz)
+
+                    if dist < region["radius"] * 1.5:
+                        # In or near a stuck region - use escape actions if available
+                        if region.get("escape_actions"):
+                            last_escape = region["escape_actions"][-1]
+                            opinion["direction"] = last_escape
+                            opinion["confidence"] = 0.8
+                            opinion["reason"] = "使用已知逃离路径"
+                        break
+
+        opinion["stop_condition"] = "移动1米或进入新区域"
+
+        return opinion
+
+    def get_stuck_regions_summary(self) -> List[Dict]:
+        """Get summary of all stuck regions."""
+        return self._stuck_regions.copy()

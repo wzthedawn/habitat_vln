@@ -47,6 +47,7 @@ sys.path.insert(0, str(Path(__file__).parent))
 from utils.logger import setup_logger
 from utils.token_tracker import get_token_tracker
 from utils.timeout_fallback import TimeoutError, timeout, StepTimeout, DEFAULT_TIMEOUTS
+from utils.episode_output import EpisodeOutputManager
 
 # Strategy imports
 from strategies.cot import CoTStrategy
@@ -137,6 +138,9 @@ class MultiAgentVLNEvaluator:
         # Image settings
         self.image_width = config.get("image_width", 640)
         self.image_height = config.get("image_height", 480)
+
+        # Episode output manager
+        self.output_manager = EpisodeOutputManager(config.get("output_dir", "output"))
 
         self.logger.info(f"多智能体VLN评估器初始化")
 
@@ -416,6 +420,17 @@ class MultiAgentVLNEvaluator:
             trajectory = [[float(x) for x in start_pos]]
             min_distance = self._distance(start_pos, episode.goal_position)
 
+            # Calculate initial rotation (yaw angle) from start_rotation quaternion
+            initial_yaw = 0.0
+            if episode.start_rotation:
+                q = episode.start_rotation
+                if len(q) == 4:
+                    # Habitat uses [x, y, z, w] quaternion format
+                    x, y, z, w = q[0], q[1], q[2], q[3]
+                    siny_cosp = 2 * (w * y + x * z)
+                    cosy_cosp = 1 - 2 * (y * y + z * z)
+                    initial_yaw = math.atan2(siny_cosp, cosy_cosp)
+
             # 3. 创建导航上下文
             from core.context import NavContextBuilder, VisualFeatures
             visual_features = VisualFeatures()
@@ -423,6 +438,7 @@ class MultiAgentVLNEvaluator:
             context = NavContextBuilder() \
                 .with_instruction(episode.instruction) \
                 .with_position(tuple(start_pos)) \
+                .with_rotation(initial_yaw) \
                 .with_visual_features(visual_features) \
                 .with_metadata({
                     "episode_id": episode.episode_id,
@@ -430,6 +446,15 @@ class MultiAgentVLNEvaluator:
                     "success_distance": self.config.get("success_distance", 3.0),
                 }) \
                 .build()
+
+            # 3.5 初始化episode输出
+            self.output_manager.start_episode(
+                episode_id=episode.episode_id,
+                scene_id=episode.scene_id,
+                instruction=episode.instruction,
+                goal_position=episode.goal_position,
+                start_position=list(start_pos),
+            )
 
             # 4. 处理指令 - InstructionAgent
             if self.instruction_agent:
@@ -454,6 +479,13 @@ class MultiAgentVLNEvaluator:
             # 7. 重置DecisionAgent的stuck检测计数器
             if self.decision_agent:
                 self.decision_agent.reset_stuck_counter()
+
+            # 8. 清空context的历史数据
+            context.rgb_history.clear()
+            context.depth_history.clear()
+            context.stuck_regions.clear()
+            context.is_stuck = False
+            context.stuck_counter = 0
 
             max_steps = self.config.get("max_steps", 100)
             success_distance = self.config.get("success_distance", 3.0)
@@ -482,14 +514,21 @@ class MultiAgentVLNEvaluator:
                 context.metadata['rgb_image'] = rgb_image
                 context.metadata['depth_image'] = depth_image
 
-                # 并行执行PerceptionAgent和TrajectoryAgent (降低频率: 每5步/每10步)
+                # 保存观察历史用于stuck分析
+                context.add_observation(rgb_image, depth_image)
+
+                # 保存RGB和Depth图像到输出目录
+                self.output_manager.save_rgb_image(rgb_image, steps)
+                self.output_manager.save_depth_image(depth_image, steps)
+
+                # 并行执行PerceptionAgent和TrajectoryAgent (降低频率: 每5步/每3步)
                 perception_future = None
                 trajectory_future = None
 
                 if self.perception_agent and steps % 5 == 0:
                     perception_future = executor.submit(self.perception_agent.process, context)
 
-                if self.trajectory_agent and steps % 10 == 0:
+                if self.trajectory_agent and steps % 3 == 0:  # Changed from 10 to 3 for better stuck detection
                     trajectory_future = executor.submit(self.trajectory_agent.process, context)
 
                 # 收集并行执行结果
@@ -589,8 +628,42 @@ class MultiAgentVLNEvaluator:
                 context.position = tuple(pos)
                 context.add_trajectory_point(tuple(pos))
 
+                # Update rotation from simulator (convert quaternion to yaw angle)
+                # Habitat uses quaternions for rotation, we need yaw (rotation around Y axis)
+                if hasattr(state, 'rotation') and state.rotation is not None:
+                    # Quaternion to euler yaw angle
+                    # Habitat uses numpy-quaternion which has components: w, x, y, z
+                    try:
+                        import quaternion
+                        q = state.rotation
+                        # Get quaternion components as numpy array [w, x, y, z]
+                        q_arr = quaternion.as_float_array(q)  # Returns [w, x, y, z]
+                        w, x, y, z = q_arr[0], q_arr[1], q_arr[2], q_arr[3]
+                        # Calculate yaw (rotation around Y axis)
+                        siny_cosp = 2 * (w * y + x * z)
+                        cosy_cosp = 1 - 2 * (y * y + z * z)
+                        yaw = math.atan2(siny_cosp, cosy_cosp)
+                        context.rotation = yaw
+                    except Exception as e:
+                        self.logger.warning(f"Failed to extract rotation: {e}")
+
                 dist = self._distance(pos, episode.goal_position)
                 min_distance = min(min_distance, dist)
+
+                # 记录步骤输出
+                self.output_manager.add_step_output(
+                    step=steps,
+                    action=action_name,
+                    position=tuple(pos),
+                    rotation=context.rotation,
+                    distance_to_goal=dist,
+                    perception_output=context.metadata.get("perception_output"),
+                    trajectory_output=context.metadata.get("trajectory_output"),
+                    decision_output=context.metadata.get("decision_output"),
+                    evaluation_output=context.metadata.get("evaluation_output"),
+                    strategy_output=context.metadata.get("strategy_output"),
+                    current_subtask={"id": current_subtask.id, "description": current_subtask.description, "level": current_subtask.level} if current_subtask else None,
+                )
 
                 if dist <= success_distance:
                     success = True
@@ -607,6 +680,26 @@ class MultiAgentVLNEvaluator:
                 executor.shutdown(wait=False)
             except NameError:
                 pass  # executor wasn't created yet
+
+            # 保存episode输出
+            try:
+                # 获取最终位置
+                final_pos = pos if 'pos' in locals() else (trajectory[-1] if trajectory else start_pos)
+                self.output_manager.finish_episode(
+                    success=success,
+                    final_distance=self._distance(final_pos, episode.goal_position),
+                    min_distance=min_distance,
+                    steps=steps,
+                    trajectory=trajectory,
+                    task_level=task_level,
+                    subtasks=context.metadata.get("instruction_output", {}).get("subtasks", []),
+                    goal_position=episode.goal_position,
+                    reference_path=episode.reference_path,
+                )
+                # 尝试创建视频摘要
+                self.output_manager.create_summary_video(fps=5)
+            except Exception as e:
+                self.logger.error(f"保存episode输出失败: {e}")
 
         return {
             "trajectory": trajectory,
@@ -695,6 +788,7 @@ class MultiAgentVLNEvaluator:
             sim_cfg = habitat_sim.SimulatorConfiguration()
             sim_cfg.scene_id = scene_path
             sim_cfg.enable_physics = False
+            sim_cfg.gpu_device_id = 0
 
             cfg = habitat_sim.Configuration(sim_cfg, [agent_cfg])
             sim = habitat_sim.Simulator(cfg)
@@ -994,6 +1088,10 @@ def main():
     parser.add_argument("--use-strategy-mode", action="store_true", default=False,
                         help="使用策略模式进行决策 (CoT/Reflection/Debate)")
 
+    # Output arguments
+    parser.add_argument("--output-dir", type=str, default="output",
+                        help="输出目录，保存每个episode的视觉图像、轨迹图和agent输出")
+
     args = parser.parse_args()
 
     config = {
@@ -1008,6 +1106,7 @@ def main():
         "llm_server": args.llm_server,
         "remote_timeout": args.remote_timeout,
         "use_strategy_mode": args.use_strategy_mode,
+        "output_dir": args.output_dir,
     }
 
     print("=" * 70)
@@ -1019,6 +1118,7 @@ def main():
     print(f"最大步数: {args.max_steps}")
     print(f"成功距离: {args.success_distance}m")
     print(f"输出文件: {args.output}")
+    print(f"输出目录: {args.output_dir}")
     print(f"设备: {args.device}")
     print(f"INT8量化: {args.use_int8}")
     print(f"远程LLM: {'启用' if args.use_remote_llm else '禁用'}")
