@@ -1,5 +1,6 @@
 """Base strategy class for VLN system."""
 
+import logging
 from abc import ABC, abstractmethod
 from dataclasses import dataclass, field
 from typing import Dict, Any, List, Optional
@@ -46,7 +47,11 @@ class BaseStrategy(ABC):
     Abstract base class for all strategies.
 
     Strategies define how agents collaborate to produce navigation decisions.
+    All strategies use LLM-based reasoning for intelligent decision making.
     """
+
+    # Default LLM model for strategies
+    DEFAULT_LLM_MODEL = "qwen-4b-decision"
 
     def __init__(self, config: Dict[str, Any] = None):
         """
@@ -57,6 +62,8 @@ class BaseStrategy(ABC):
         """
         self.config = config or {}
         self._initialized = False
+        self._model_manager = None
+        self.logger = logging.getLogger(self.__class__.__name__)
 
     @property
     @abstractmethod
@@ -91,8 +98,63 @@ class BaseStrategy(ABC):
         pass
 
     def initialize(self) -> None:
-        """Initialize strategy resources."""
+        """Initialize strategy resources including LLM."""
+        if not self._initialized:
+            self._init_llm()
         self._initialized = True
+
+    def _init_llm(self) -> None:
+        """Initialize LLM model manager."""
+        if self._model_manager is None:
+            try:
+                from models.model_manager import get_model_manager
+                self._model_manager = get_model_manager(self.config)
+                self.logger.info(f"[{self.name}] LLM initialized with model: {self.DEFAULT_LLM_MODEL}")
+            except Exception as e:
+                self.logger.error(f"[{self.name}] Failed to initialize LLM: {e}")
+                raise RuntimeError(f"LLM initialization failed: {e}")
+
+    def _call_llm(
+        self,
+        prompt: str,
+        model_key: str = None,
+        max_tokens: int = 200,
+        temperature: float = 0.3
+    ) -> str:
+        """
+        Call LLM to generate text.
+
+        Args:
+            prompt: Input prompt for the LLM
+            model_key: Model to use (default: qwen-4b-decision)
+            max_tokens: Maximum tokens to generate
+            temperature: Sampling temperature
+
+        Returns:
+            Generated text response
+
+        Raises:
+            RuntimeError: If LLM call fails
+        """
+        self.initialize()
+
+        if self._model_manager is None:
+            raise RuntimeError("LLM not initialized")
+
+        model = model_key or self.DEFAULT_LLM_MODEL
+
+        try:
+            response = self._model_manager.generate(
+                model,
+                prompt,
+                max_new_tokens=max_tokens,
+                temperature=temperature
+            )
+            self.logger.debug(f"[{self.name}] LLM response: {response[:100]}...")
+            return response
+        except Exception as e:
+            self.logger.error(f"[{self.name}] LLM call failed: {e}")
+            raise RuntimeError(f"LLM call failed: {e}")
 
     def get_agent_by_role(
         self, agents: List[BaseAgent], role: str

@@ -201,7 +201,7 @@ class TrajectoryAgent(BaseAgent):
             )
 
         except Exception as e:
-            self.logger.error(f"Trajectory planning error: {e}")
+            self.logger.error(f"[Trajectory] 错误: {e}")
             return AgentOutput.failure_output([str(e)], "Trajectory planning failed")
 
     def _update_map(self, position: Tuple[float, float, float]) -> None:
@@ -510,16 +510,16 @@ class TrajectoryAgent(BaseAgent):
                 if parsed:
                     # Log in the specified format
                     self.logger.info(
-                        f"[TrajectoryAgent] 当前位置: {parsed['当前位置']}, "
-                        f"当前朝向: {parsed['当前朝向']}, "
-                        f"已走距离: {parsed['已走距离']}"
+                        f"[Trajectory] 位置: {parsed['当前位置']}, "
+                        f"朝向: {parsed['当前朝向']}°, "
+                        f"已走: {parsed['已走距离']:.1f}m"
                     )
                     # Return formatted string for display
                     return self._format_trajectory_output(parsed)
 
                 # Fallback to cleaned response if JSON parsing failed
                 # Return empty string to trigger template-based summary
-                self.logger.debug(f"[TrajectoryAgent] JSON parsing failed, using template")
+                self.logger.debug(f"[Trajectory] JSON解析失败，使用模板")
                 return ""
 
         except Exception as e:
@@ -640,9 +640,9 @@ class TrajectoryAgent(BaseAgent):
 
         # Log in the specified format
         self.logger.info(
-            f"[TrajectoryAgent] 当前位置: {output_data['当前位置']}, "
-            f"当前朝向: {output_data['当前朝向']}, "
-            f"已走距离: {output_data['已走距离']}"
+            f"[Trajectory] 位置: {output_data['当前位置']}, "
+            f"朝向: {output_data['当前朝向']}°, "
+            f"已走: {output_data['已走距离']:.1f}m"
         )
 
         return json.dumps(output_data, ensure_ascii=False)
@@ -680,7 +680,7 @@ class TrajectoryAgent(BaseAgent):
             "failed_attempts": failed_attempts or [],
         }
         self._stuck_regions.append(stuck_record)
-        self.logger.info(f"[Stuck Region] Recorded at position {position}")
+        self.logger.info(f"[Trajectory] 记录卡住区域: {position}")
 
     def is_in_stuck_region(self, position: Tuple[float, float, float]) -> bool:
         """Check if position is within any known stuck region.
@@ -824,3 +824,414 @@ class TrajectoryAgent(BaseAgent):
     def get_stuck_regions_summary(self) -> List[Dict]:
         """Get summary of all stuck regions."""
         return self._stuck_regions.copy()
+
+    def mark_stuck_region(
+        self,
+        position: Tuple[float, float, float],
+        escape_success: bool,
+        escape_direction: Optional[str] = None
+    ) -> None:
+        """Mark a stuck region with escape result for future reference.
+
+        Phase 5: Part of escape verification closed loop.
+
+        Args:
+            position: Position where stuck occurred
+            escape_success: Whether escape was successful
+            escape_direction: Direction that successfully escaped (if any)
+        """
+        # Check if this region already exists
+        for region in self._stuck_regions:
+            dx = position[0] - region["position"][0]
+            dz = position[2] - region["position"][2]
+            dist = math.sqrt(dx * dx + dz * dz)
+
+            if dist < region["radius"]:
+                # Update existing record
+                region["escape_attempts"] = region.get("escape_attempts", 0) + 1
+                if escape_success:
+                    region["escape_success"] = True
+                    region["successful_direction"] = escape_direction
+                    if escape_direction and escape_direction not in region.get("escape_actions", []):
+                        region.setdefault("escape_actions", []).append(escape_direction)
+                self.logger.info(f"[Trajectory] 更新卡住区域: {position}, 成功={escape_success}")
+                return
+
+        # Create new stuck region record
+        import time
+        new_region = {
+            "position": position,
+            "radius": 1.0,
+            "escape_attempts": 1,
+            "escape_success": escape_success,
+            "successful_direction": escape_direction if escape_success else None,
+            "escape_actions": [escape_direction] if escape_success and escape_direction else [],
+            "timestamp": time.time(),
+        }
+        self._stuck_regions.append(new_region)
+        self.logger.info(f"[Trajectory] 新卡住区域: {position}")
+
+    def get_stuck_region_info(self, position: Tuple[float, float, float]) -> Optional[Dict[str, Any]]:
+        """Get information about a stuck region at a position.
+
+        Args:
+            position: Position to check
+
+        Returns:
+            Stuck region info if found, None otherwise
+        """
+        for region in self._stuck_regions:
+            dx = position[0] - region["position"][0]
+            dz = position[2] - region["position"][2]
+            dist = math.sqrt(dx * dx + dz * dz)
+
+            if dist < region["radius"]:
+                return {
+                    "is_stuck_region": True,
+                    "escape_attempts": region.get("escape_attempts", 0),
+                    "escape_success": region.get("escape_success", False),
+                    "successful_direction": region.get("successful_direction"),
+                }
+        return None
+
+    def build_debate_opinion(
+        self,
+        context: "NavContext",
+        stuck_regions: List[Dict] = None
+    ) -> "DebateOpinion":
+        """Build a DebateOpinion for the debate strategy using LLM.
+
+        Args:
+            context: Navigation context
+            stuck_regions: Known stuck regions
+
+        Returns:
+            DebateOpinion with trajectory-based constraints
+        """
+        from core.debate_types import DebateOpinion, ActionConstraint
+
+        trajectory = context.trajectory if context.trajectory else []
+        stuck_regions = stuck_regions or []
+
+        # Analyze recent action history
+        turn_left_count = 0
+        turn_right_count = 0
+        forward_failures = 0
+
+        if context.action_history:
+            recent = context.action_history[-10:]
+            turn_left_count = sum(1 for a in recent if a.action_type.name == "TURN_LEFT")
+            turn_right_count = sum(1 for a in recent if a.action_type.name == "TURN_RIGHT")
+
+        # Use LLM for trajectory-based opinion
+        if self._model_manager:
+            return self._build_trajectory_opinion_with_llm(
+                context, turn_left_count, turn_right_count, stuck_regions
+            )
+        else:
+            return self._build_trajectory_opinion_fallback(
+                context, turn_left_count, turn_right_count, stuck_regions
+            )
+
+    def _build_trajectory_opinion_with_llm(
+        self,
+        context: "NavContext",
+        turn_left_count: int,
+        turn_right_count: int,
+        stuck_regions: List[Dict]
+    ) -> "DebateOpinion":
+        """Build trajectory opinion using LLM with enhanced spatial awareness."""
+        from core.debate_types import DebateOpinion, ActionConstraint
+        import math
+
+        # Analyze trajectory data
+        trajectory = context.trajectory if context.trajectory else []
+        recent_actions = [a.action_type.name for a in context.action_history[-10:]] if context.action_history else []
+
+        # Calculate path metrics
+        total_distance = 0.0
+        if len(trajectory) >= 2:
+            for i in range(1, len(trajectory)):
+                dx = trajectory[i][0] - trajectory[i-1][0]
+                dz = trajectory[i][2] - trajectory[i-1][2]
+                total_distance += math.sqrt(dx*dx + dz*dz)
+
+        # Calculate efficiency
+        efficiency = 1.0
+        if len(trajectory) >= 2:
+            start = trajectory[0]
+            end = trajectory[-1]
+            direct = math.sqrt((end[0]-start[0])**2 + (end[2]-start[2])**2)
+            if total_distance > 0:
+                efficiency = min(direct / total_distance, 1.0)
+
+        # Height analysis
+        y_trend = "稳定"
+        y_change = 0.0
+        if len(trajectory) >= 3:
+            recent_y = [p[1] for p in trajectory[-5:]]
+            y_change = recent_y[-1] - recent_y[0]
+            if abs(y_change) > 0.2:
+                y_trend = f"{'上升' if y_change > 0 else '下降'}{abs(y_change):.1f}米"
+
+        # Goal direction analysis
+        goal_pos = context.metadata.get("goal_position")
+        current_pos = context.position if context.position else (0, 0, 0)
+
+        goal_direction = "未知"
+        goal_distance = 0.0
+        goal_angle = 0.0
+        floor_relation = "同层"
+
+        if goal_pos:
+            dx = goal_pos[0] - current_pos[0]
+            dz = goal_pos[2] - current_pos[2]
+            goal_distance = math.sqrt(dx*dx + dz*dz)
+
+            # Angle to goal
+            goal_angle = math.degrees(math.atan2(dx, -dz))
+            if goal_angle < 0:
+                goal_angle += 360
+
+            # Direction name
+            if goal_angle < 45 or goal_angle >= 315:
+                goal_direction = "正前方"
+            elif 45 <= goal_angle < 135:
+                goal_direction = "右侧"
+            elif 135 <= goal_angle < 225:
+                goal_direction = "后方"
+            else:
+                goal_direction = "左侧"
+
+            # Floor relation
+            vert_dist = goal_pos[1] - current_pos[1]
+            if vert_dist < -0.5:
+                floor_relation = "目标在下层"
+            elif vert_dist > 0.5:
+                floor_relation = "目标在上层"
+
+        # Detect looping pattern
+        is_looping = False
+        loop_pattern = "无"
+        if len(recent_actions) >= 6:
+            # Check for alternating left-right pattern
+            pattern_str = "".join(["L" if "LEFT" in a else "R" if "RIGHT" in a else "F" for a in recent_actions[-6:]])
+            if "LRLR" in pattern_str or "RLRL" in pattern_str:
+                is_looping = True
+                loop_pattern = "左右摇摆"
+            elif recent_actions.count("TURN_LEFT") >= 4:
+                is_looping = True
+                loop_pattern = "连续左转"
+            elif recent_actions.count("TURN_RIGHT") >= 4:
+                is_looping = True
+                loop_pattern = "连续右转"
+
+        # Build enhanced prompt
+        prompt = f"""你是轨迹规划专家。基于导航轨迹分析最佳动作。
+
+## 轨迹状态
+- 总步数: {context.step_count}
+- 已走距离: {total_distance:.1f}米
+- 路径效率: {efficiency:.2f}
+
+## 空间关系
+- 目标方向: {goal_direction}
+- 目标角度: {goal_angle:.0f}度
+- 目标距离: {goal_distance:.1f}米
+- 楼层关系: {floor_relation}
+
+## 高度分析
+- 当前高度: {current_pos[1]:.2f}米
+- 高度变化: {y_trend}
+- 总高度差: {y_change:+.2f}米
+
+## 动作历史分析
+- 最近10动作: {recent_actions if recent_actions else "无"}
+- 左转次数: {turn_left_count}
+- 右转次数: {turn_right_count}
+- 循环模式: {loop_pattern}
+- 是否原地打转: {"是" if is_looping else "否"}
+
+## 卡住检测
+- 卡住步数: {context.stuck_counter if hasattr(context, 'stuck_counter') else 0}
+- 已知卡住区域: {len(stuck_regions)}个
+
+## 决策推理要求
+1. 如果原地打转(左右摇摆)，必须选择新方向
+2. 如果目标在不同楼层，应寻找楼梯
+3. 如果效率低于0.3，说明路径曲折，应重新规划
+
+## 输出格式(JSON)
+{{
+  "primary_action": "forward/turn_left/turn_right/stop",
+  "confidence": 0.0-1.0,
+  "reasoning": "推荐理由",
+  "path_quality": {{
+    "efficiency": {efficiency:.2f},
+    "stuck_risk": {min(context.stuck_counter if hasattr(context, 'stuck_counter') else 0, 10)}/10,
+    "recommendation": "继续当前方向/转向探索/寻找楼梯"
+  }},
+  "constraints": {{
+    "hard": [{{"action": "应避免的动作", "blocked": true, "reason": "原因"}}],
+    "soft": [{{"action": "优先动作", "weight": 0.5, "reason": "原因"}}]
+  }}
+}}
+
+只输出JSON。"""
+        try:
+            response = self._model_manager.generate(
+                "qwen-2b-trajectory",
+                prompt,
+                max_new_tokens=200,
+                temperature=0.1,
+            )
+            return self._parse_trajectory_opinion_response(response, turn_left_count, turn_right_count, efficiency, is_looping)
+        except Exception as e:
+            self.logger.error(f"LLM trajectory opinion failed: {e}")
+            return self._build_trajectory_opinion_fallback(
+                context, turn_left_count, turn_right_count, stuck_regions
+            )
+
+    def _parse_trajectory_opinion_response(
+        self,
+        response: str,
+        turn_left_count: int,
+        turn_right_count: int,
+        efficiency: float = 1.0,
+        is_looping: bool = False
+    ) -> "DebateOpinion":
+        """Parse LLM response into DebateOpinion."""
+        import json
+        import re
+        from core.debate_types import DebateOpinion, ActionConstraint
+
+        primary_action = "turn_right"
+        confidence = 0.6
+        reasoning = ""
+        constraints = {"hard": [], "soft": []}
+        path_quality = {}
+
+        try:
+            json_match = re.search(r'\{(?:[^{}]|\{[^{}]*\})*\}', response)
+            if json_match:
+                data = json.loads(json_match.group())
+
+                primary_action = data.get("primary_action", "turn_right")
+                confidence = float(data.get("confidence", 0.6))
+                reasoning = data.get("reasoning", "")
+                path_quality = data.get("path_quality", {})
+
+                # Parse hard constraints
+                hard = data.get("constraints", {}).get("hard", [])
+                for c in hard:
+                    constraints["hard"].append(ActionConstraint(
+                        action=c.get("action", "turn_right"),
+                        blocked=c.get("blocked", True),
+                        reason=c.get("reason", ""),
+                    ))
+
+                # Parse soft constraints
+                soft = data.get("constraints", {}).get("soft", [])
+                for c in soft:
+                    constraints["soft"].append(ActionConstraint(
+                        action=c.get("action", "turn_right"),
+                        weight_multiplier=c.get("weight", 1.0),
+                        reason=c.get("reason", ""),
+                    ))
+
+        except (json.JSONDecodeError, ValueError):
+            pass
+
+        # Fallback logic based on trajectory analysis
+        if not reasoning:
+            if is_looping:
+                reasoning = "检测到原地打转，建议选择新方向"
+            elif efficiency < 0.3:
+                reasoning = "路径效率低，建议重新规划"
+            else:
+                reasoning = "轨迹分析建议"
+
+        return DebateOpinion(
+            agent="trajectory",
+            primary_action=primary_action,
+            confidence=confidence,
+            evidence={
+                "recent_turns": {"left": turn_left_count, "right": turn_right_count},
+                "efficiency": efficiency,
+                "is_looping": is_looping,
+                "path_quality": path_quality,
+            },
+            reasoning=reasoning,
+            constraints=constraints,
+        )
+
+    def _build_trajectory_opinion_fallback(
+        self,
+        context: "NavContext",
+        turn_left_count: int,
+        turn_right_count: int,
+        stuck_regions: List[Dict]
+    ) -> "DebateOpinion":
+        """Fallback rule-based trajectory opinion."""
+        from core.debate_types import DebateOpinion, ActionConstraint
+
+        trajectory = context.trajectory if context.trajectory else []
+        forward_failures = 0
+        if hasattr(context, 'stuck_counter'):
+            forward_failures = context.stuck_counter
+
+        # Determine primary action
+        primary_action = "turn_right"
+        confidence = 0.6
+
+        if turn_right_count > turn_left_count + 2:
+            primary_action = "turn_left"
+            reasoning = f"已多次右转({turn_right_count})，建议左转"
+        elif turn_left_count > turn_right_count + 2:
+            primary_action = "turn_right"
+            reasoning = f"已多次左转({turn_left_count})，建议右转"
+        else:
+            reasoning = "探索新方向"
+
+        # Build constraints
+        constraints = {"hard": [], "soft": []}
+
+        # Penalize overused directions
+        if turn_right_count > 3:
+            constraints["soft"].append(ActionConstraint(
+                action="turn_right",
+                weight_multiplier=0.5,
+                reason=f"already_tried_{turn_right_count}_times",
+            ))
+        if turn_left_count > 3:
+            constraints["soft"].append(ActionConstraint(
+                action="turn_left",
+                weight_multiplier=0.5,
+                reason=f"already_tried_{turn_left_count}_times",
+            ))
+
+        # Check for known stuck regions
+        if trajectory:
+            current_pos = trajectory[-1]
+            stuck_info = self.get_stuck_region_info(current_pos)
+            if stuck_info and stuck_info.get("successful_direction"):
+                success_dir = stuck_info["successful_direction"]
+                constraints["soft"].append(ActionConstraint(
+                    action=success_dir,
+                    weight_multiplier=1.3,
+                    reason="known_escape_direction",
+                ))
+
+        return DebateOpinion(
+            agent="trajectory",
+            primary_action=primary_action,
+            confidence=confidence,
+            evidence={
+                "recent_turns": {"left": turn_left_count, "right": turn_right_count},
+                "consecutive_forward_failures": forward_failures,
+                "visited_cells": len(self._visited_cells) if hasattr(self, '_visited_cells') else len(trajectory),
+                "stuck_regions": len(self._stuck_regions) if hasattr(self, '_stuck_regions') else len(stuck_regions),
+            },
+            reasoning=reasoning,
+            constraints=constraints,
+        )

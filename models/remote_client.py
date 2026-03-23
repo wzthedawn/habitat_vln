@@ -444,6 +444,137 @@ class RemoteLLMClient:
             error=last_error or "Unknown error",
         )
 
+    def generate_vision_dual(
+        self,
+        rgb_image: Any,
+        depth_image: Any,
+        prompt: str,
+        model: str = "qwen-4b-perception",
+        max_new_tokens: Optional[int] = None,
+        temperature: Optional[float] = None,
+    ) -> GenerateVisionResult:
+        """Generate text from RGB + Depth images using VLM (sync).
+
+        Depth image will be converted to pseudocolor (JET colormap) for
+        better visualization by the VLM.
+
+        Args:
+            rgb_image: PIL Image or numpy array for RGB
+            depth_image: numpy array for depth (in meters)
+            prompt: Input prompt
+            model: VLM model identifier
+            max_new_tokens: Maximum tokens to generate
+            temperature: Sampling temperature
+
+        Returns:
+            GenerateVisionResult with response and metadata
+        """
+        if not REQUESTS_AVAILABLE:
+            raise ImportError("requests is not installed. Install with: pip install requests")
+
+        # Convert RGB image to base64
+        rgb_base64 = self._image_to_base64(rgb_image)
+
+        # Convert depth image to pseudocolor and then base64
+        depth_colored = self._depth_to_colormap(depth_image)
+        depth_base64 = self._image_to_base64(depth_colored)
+
+        payload = {
+            "model": model,
+            "prompt": prompt,
+            "image_base64": rgb_base64,
+            "depth_base64": depth_base64,
+        }
+
+        if max_new_tokens is not None:
+            payload["max_new_tokens"] = max_new_tokens
+        if temperature is not None:
+            payload["temperature"] = temperature
+
+        last_error = None
+
+        for attempt in range(self.max_retries):
+            try:
+                response = requests.post(
+                    f"{self.server_url}/generate_vision",
+                    json=payload,
+                    timeout=self.timeout
+                )
+
+                if response.status_code == 200:
+                    data = response.json()
+                    return GenerateVisionResult(
+                        response=data.get("response", ""),
+                        model=data.get("model", model),
+                        tokens_generated=data.get("tokens_generated", 0),
+                        latency_ms=data.get("latency_ms", 0),
+                        error=data.get("error"),
+                    )
+                else:
+                    last_error = f"HTTP {response.status_code}: {response.text}"
+                    if response.status_code < 500:
+                        break
+
+            except requests.Timeout:
+                last_error = f"Request timed out after {self.timeout}s"
+                self.logger.warning(f"Timeout (attempt {attempt + 1}/{self.max_retries})")
+            except requests.RequestException as e:
+                last_error = f"Connection error: {e}"
+                self.logger.warning(f"Connection error (attempt {attempt + 1}/{self.max_retries}): {e}")
+
+            if attempt < self.max_retries - 1:
+                time.sleep(self.retry_delay)
+
+        return GenerateVisionResult(
+            response="",
+            model=model,
+            tokens_generated=0,
+            latency_ms=0,
+            error=last_error or "Unknown error",
+        )
+
+    def _depth_to_colormap(self, depth_image: Any, max_depth: float = 10.0) -> "np.ndarray":
+        """Convert depth image to JET colormap for visualization.
+
+        Args:
+            depth_image: Depth array in meters
+            max_depth: Maximum depth for normalization
+
+        Returns:
+            RGB image with JET colormap applied
+        """
+        import numpy as np
+        from PIL import Image as PILImage
+
+        # Handle None or invalid input
+        if depth_image is None:
+            # Return a blank image
+            return np.zeros((224, 224, 3), dtype=np.uint8)
+
+        # Ensure numpy array
+        if not hasattr(depth_image, 'shape'):
+            depth_image = np.array(depth_image)
+
+        # Normalize depth to 0-255
+        valid_mask = depth_image > 0
+        normalized = np.zeros_like(depth_image, dtype=np.float32)
+        if valid_mask.any():
+            normalized[valid_mask] = np.clip(depth_image[valid_mask] / max_depth, 0, 1)
+        normalized_uint8 = (normalized * 255).astype(np.uint8)
+
+        # Apply JET colormap (blue = far, red = near)
+        # OpenCV COLORMAP_JET: 0 (far/blue) -> 255 (near/red)
+        try:
+            import cv2
+            colored = cv2.applyColorMap(normalized_uint8, cv2.COLORMAP_JET)
+            # Convert BGR to RGB
+            colored = cv2.cvtColor(colored, cv2.COLOR_BGR2RGB)
+        except ImportError:
+            # Fallback: simple grayscale to RGB
+            colored = np.stack([normalized_uint8] * 3, axis=-1)
+
+        return colored
+
     def _image_to_base64(self, image: Any) -> str:
         """Convert image to base64 string.
 

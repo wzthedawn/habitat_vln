@@ -140,7 +140,7 @@ class MultiAgentVLNEvaluator:
         self.image_height = config.get("image_height", 480)
 
         # Episode output manager
-        self.output_manager = EpisodeOutputManager(config.get("output_dir", "output"))
+        self.output_manager = EpisodeOutputManager(config.get("output_dir", "results"))
 
         self.logger.info(f"多智能体VLN评估器初始化")
 
@@ -228,7 +228,7 @@ class MultiAgentVLNEvaluator:
                 model_config["remote_server_url"] = self.config.get(
                     "llm_server", "http://localhost:8000"
                 )
-                model_config["remote_timeout"] = self.config.get("remote_timeout", 60.0)
+                model_config["remote_timeout"] = self.config.get("remote_timeout", 120.0)  # Increased for instruction decomposition
                 self.logger.info(f"使用远程LLM服务: {model_config['remote_server_url']}")
 
             self.model_manager = get_model_manager(model_config)
@@ -246,6 +246,9 @@ class MultiAgentVLNEvaluator:
             # Pass remote LLM config to agents
             "use_remote": self.config.get("use_remote_llm", False),
             "remote_server_url": self.config.get("llm_server", "http://localhost:8000"),
+            # Pass model_manager for LLM-based decomposition
+            "model_manager": self.model_manager if hasattr(self, 'model_manager') else None,
+            "use_llm_decompose": self.config.get("use_llm_decompose", True),
         }
 
         try:
@@ -273,17 +276,36 @@ class MultiAgentVLNEvaluator:
         except Exception as e:
             self.logger.error(f"Agent初始化失败: {e}")
 
-    def run_evaluation(self, num_episodes: int = None) -> Dict[str, Any]:
-        """运行VLN评估"""
-        num_to_run = min(num_episodes or len(self.episodes), len(self.episodes))
+    def run_evaluation(self, num_episodes: int = None, start_episode_id: int = None) -> Dict[str, Any]:
+        """运行VLN评估
+
+        Args:
+            num_episodes: 运行的episode数量
+            start_episode_id: 起始episode ID (None则从第一个开始)
+        """
+        # 找到起始位置
+        if start_episode_id is not None:
+            start_idx = None
+            for i, ep in enumerate(self.episodes):
+                if ep.episode_id == start_episode_id:
+                    start_idx = i
+                    break
+            if start_idx is None:
+                self.logger.warning(f"Episode {start_episode_id} 未找到，从第一个开始")
+                start_idx = 0
+        else:
+            start_idx = 0
+
+        episodes_to_run = self.episodes[start_idx:]
+        num_to_run = min(num_episodes or len(episodes_to_run), len(episodes_to_run))
 
         self.logger.info("=" * 60)
-        self.logger.info(f"开始评估 - {num_to_run} episodes")
+        self.logger.info(f"开始评估 - {num_to_run} episodes (从 Episode {episodes_to_run[0].episode_id if episodes_to_run else 'N/A'} 开始)")
         self.logger.info("=" * 60)
 
         start_time = time.time()
 
-        for i, episode in enumerate(self.episodes[:num_to_run]):
+        for i, episode in enumerate(episodes_to_run[:num_to_run]):
             ep_start = time.time()
 
             self.logger.info(f"\n[{i+1}/{num_to_run}] Episode {episode.episode_id}")
@@ -433,7 +455,18 @@ class MultiAgentVLNEvaluator:
 
             # 3. 创建导航上下文
             from core.context import NavContextBuilder, VisualFeatures
+            from utils.status_reporter import init_reporter
             visual_features = VisualFeatures()
+
+            # 初始化实时状态报告器
+            reporter = init_reporter(self.config.get("output_dir", "results"))
+            reporter.start_episode(
+                episode_id=episode.episode_id,
+                instruction=episode.instruction,
+                max_steps=self.config.get("max_steps", 100),
+                start_y=start_pos[1]
+            )
+            reporter.update_position(start_pos[0], start_pos[1], start_pos[2])
 
             context = NavContextBuilder() \
                 .with_instruction(episode.instruction) \
@@ -458,15 +491,24 @@ class MultiAgentVLNEvaluator:
 
             # 4. 处理指令 - InstructionAgent
             if self.instruction_agent:
+                reporter.update_phase("InstructionAgent分解指令中...")
+                reporter.update_agent("instruction", "thinking")
                 instruction_output = self.instruction_agent.process(context)
                 context.metadata["instruction_output"] = instruction_output.data
                 task_level = instruction_output.data.get("task_level", "中等")
                 subtask_count = len(instruction_output.data.get("subtasks", []))
                 subtasks = instruction_output.data.get("subtasks", [])
+                reporter.update_agent("instruction", "done", subtasks=subtask_count)
+                reporter.log(f"任务等级: {task_level}, 子任务数: {subtask_count}")
                 self.logger.info(f"  任务等级: {task_level}, 子任务数: {subtask_count}")
                 # Log each subtask with its individual level
                 for st in subtasks:
                     self.logger.info(f"    子任务{st['id']}: [{st['level']}] {st['description'][:50]}...")
+
+                # Start the first subtask (records initial state)
+                if context.subtasks:
+                    context.start_subtask()
+                    self.logger.info(f"  开始子任务0: {context.subtasks[0].description[:50]}...")
 
             # 5. 重置TrajectoryAgent的地图
             if self.trajectory_agent:
@@ -480,7 +522,13 @@ class MultiAgentVLNEvaluator:
             if self.decision_agent:
                 self.decision_agent.reset_stuck_counter()
 
-            # 8. 清空context的历史数据
+            # 8. 重置DebateStrategy的performance tracker (episode级)
+            # Note: This resets episode stats, not cross-episode history
+            from strategies.debate import DebateStrategy
+            temp_strategy = DebateStrategy(self.config)
+            temp_strategy.reset_episode()
+
+            # 9. 清空context的历史数据
             context.rgb_history.clear()
             context.depth_history.clear()
             context.stuck_regions.clear()
@@ -491,8 +539,20 @@ class MultiAgentVLNEvaluator:
             success_distance = self.config.get("success_distance", 3.0)
             task_level = "中等"  # Default
 
+            # 序列模式相关变量
+            current_sequence = None
+            last_sequence_subtask_id = None
+            sequence_step_count = 0  # 当前序列已执行步数
+
+            self.logger.info("[SEQUENCE MODE] 启用动作序列模式")
+
             # ThreadPoolExecutor for parallel execution
             executor = ThreadPoolExecutor(max_workers=2)
+
+            # 导入策略
+            from strategies.cot import CoTStrategy
+            from strategies.reflection import ReflectionStrategy
+            from strategies.debate import DebateStrategy
 
             # 7. 导航主循环
             while steps < max_steps:
@@ -502,6 +562,11 @@ class MultiAgentVLNEvaluator:
                 # Log current subtask info
                 current_subtask = context.get_current_subtask()
                 if current_subtask:
+                    reporter.update_subtask(
+                        current_subtask.id,
+                        current_subtask.description,
+                        current_subtask.completion_condition
+                    )
                     self.logger.info(f"当前子任务 [{current_subtask.level}]: {current_subtask.description[:50]}...")
                 self.logger.info(f"{'='*60}")
 
@@ -521,93 +586,204 @@ class MultiAgentVLNEvaluator:
                 self.output_manager.save_rgb_image(rgb_image, steps)
                 self.output_manager.save_depth_image(depth_image, steps)
 
-                # 并行执行PerceptionAgent和TrajectoryAgent (降低频率: 每5步/每3步)
-                perception_future = None
-                trajectory_future = None
-
-                if self.perception_agent and steps % 5 == 0:
-                    perception_future = executor.submit(self.perception_agent.process, context)
-
-                if self.trajectory_agent and steps % 3 == 0:  # Changed from 10 to 3 for better stuck detection
-                    trajectory_future = executor.submit(self.trajectory_agent.process, context)
-
-                # 收集并行执行结果
-                if perception_future is not None:
-                    try:
-                        perception_output = perception_future.result(timeout=60)
-                        context.metadata["perception_output"] = perception_output.data
-                        self.logger.info(f"[PerceptionAgent] 房间: {perception_output.data.get('room_type', 'unknown')}")
-                        self.logger.info(f"[PerceptionAgent] 物体: {[o['name'] for o in perception_output.data.get('objects', [])[:5]]}")
-                        self.logger.info(f"[PerceptionAgent] 场景: {perception_output.data.get('scene_description', '')[:100]}")
-                    except Exception as e:
-                        self.logger.warning(f"[PerceptionAgent] 执行失败: {e}")
-
-                if trajectory_future is not None:
-                    try:
-                        trajectory_output = trajectory_future.result(timeout=60)
-                        context.metadata["trajectory_output"] = trajectory_output.data
-                        self.logger.info(f"[TrajectoryAgent] 已走距离: {trajectory_output.data.get('distance_traveled', 0):.1f}米")
-                        self.logger.info(f"[TrajectoryAgent] 进度: {trajectory_output.data.get('progress_percentage', 0):.1f}%")
-                        self.logger.info(f"[TrajectoryAgent] 摘要: {trajectory_output.data.get('trajectory_summary', '')[:100]}")
-                    except Exception as e:
-                        self.logger.warning(f"[TrajectoryAgent] 执行失败: {e}")
-
-                # DecisionAgent决策 (每步都调用)
-                action_name = "forward"
-
-                # Get task level from current subtask (not global task level)
+                # Get task level from current subtask
                 current_subtask = context.get_current_subtask()
                 task_level = current_subtask.level if current_subtask else "中等"
-                use_strategy_mode = self.config.get("use_strategy_mode", False)
 
-                if use_strategy_mode and task_level in ["中等", "困难"]:
-                    # 使用策略模式进行决策 (Reflection或Debate)
-                    strategy = self._select_strategy(task_level)
-                    agents_list = [a for a in [self.perception_agent, self.trajectory_agent,
-                                                 self.decision_agent] if a is not None]
+                # ============================================================
+                # 序列模式: 子任务开始时调用策略，生成动作序列后执行
+                # ============================================================
+                from core.action import ActionSequence
+
+                # 检查是否需要生成新序列
+                need_new_sequence = False
+
+                if current_sequence is None:
+                    need_new_sequence = True
+                    reason = "无序列"
+                elif current_sequence.is_complete():
+                    need_new_sequence = True
+                    reason = "序列完成"
+                elif current_subtask and hasattr(current_subtask, 'id'):
+                    if current_subtask.id != last_sequence_subtask_id:
+                        need_new_sequence = True
+                        reason = "子任务切换"
+
+                # 只在需要新序列时调用策略和Agent
+                if need_new_sequence:
+                    self.logger.info(f"[SEQUENCE] 生成新序列: {reason}, 难度: {task_level}")
+
+                    # 调用 PerceptionAgent
+                    perception_output = None
+                    if self.perception_agent:
+                        try:
+                            reporter.update_phase("PerceptionAgent感知环境...")
+                            reporter.update_agent("perception", "thinking")
+                            perception_result = self.perception_agent.process(context)
+                            perception_output = perception_result.data
+                            context.metadata["perception_output"] = perception_output
+                            reporter.update_agent("perception", "done", output=f"房间:{perception_output.get('room_type','?')}")
+                            reporter.log(f"Perception: 房间={perception_output.get('room_type','?')}, 物体={len(perception_output.get('objects',[]))}个")
+                            self.logger.info(f"[PerceptionAgent] 房间: {perception_output.get('room_type', 'unknown')}")
+                            self.logger.info(f"[PerceptionAgent] 物体: {[o.get('name', o.get('物体', '未知')) for o in perception_output.get('objects', [])[:5]]}")
+                        except Exception as e:
+                            reporter.update_agent("perception", "error", output=str(e))
+                            self.logger.warning(f"[PerceptionAgent] 执行失败: {e}")
+                            perception_output = {}
+
+                    # 调用 TrajectoryAgent
+                    trajectory_output = None
+                    if self.trajectory_agent:
+                        try:
+                            reporter.update_phase("TrajectoryAgent分析轨迹...")
+                            reporter.update_agent("trajectory", "thinking")
+                            trajectory_result = self.trajectory_agent.process(context)
+                            trajectory_output = trajectory_result.data
+                            context.metadata["trajectory_output"] = trajectory_output
+                            reporter.update_agent("trajectory", "done")
+                            reporter.log(f"Trajectory: 已走{trajectory_output.get('distance_traveled', 0):.1f}m")
+                            self.logger.info(f"[TrajectoryAgent] 已走距离: {trajectory_output.get('distance_traveled', 0):.1f}米")
+                        except Exception as e:
+                            reporter.update_agent("trajectory", "error", output=str(e))
+                            self.logger.warning(f"[TrajectoryAgent] 执行失败: {e}")
+                            trajectory_output = {}
+
+                    # 调用 InstructionAgent (获取子任务语义分析)
+                    instruction_output = None
+                    if self.instruction_agent:
+                        try:
+                            instruction_result = self.instruction_agent.process(context)
+                            instruction_output = instruction_result.data
+                            context.metadata["instruction_output"] = instruction_output
+                        except Exception as e:
+                            self.logger.warning(f"[InstructionAgent] 执行失败: {e}")
+                            instruction_output = {}
+
+                    # 策略配置（传递远程LLM设置）
+                    strategy_config = {
+                        "use_remote": self.config.get("use_remote_llm", False),
+                        "remote_server_url": self.config.get("llm_server", "http://localhost:8000"),
+                    }
+
+                    # 根据子任务难度选择策略
+                    if task_level == "简单":
+                        strategy = CoTStrategy(config=strategy_config)
+                    elif task_level == "中等":
+                        strategy = ReflectionStrategy(config=strategy_config)
+                    else:  # 困难
+                        strategy = DebateStrategy(config=strategy_config)
+
+                    self.logger.info(f"[SEQUENCE] 使用策略: {strategy.name}")
+                    reporter.update_phase(f"{strategy.name}策略执行中...")
+                    reporter.log(f"策略: {strategy.name}")
+
+                    # 执行策略
+                    agents_list = [self.perception_agent, self.trajectory_agent,
+                                   self.instruction_agent, self.evaluation_agent]
                     strategy_result = strategy.execute(context, agents_list)
 
-                    if strategy_result.success and strategy_result.action:
-                        action_name = strategy_result.action.to_habitat_action()
-                        self.logger.info(f"[Strategy:{strategy.name}] 动作: {action_name}")
-                        self.logger.info(f"[Strategy:{strategy.name}] 置信度: {strategy_result.confidence:.2f}")
-                        self.logger.info(f"[Strategy:{strategy.name}] 推理: {strategy_result.reasoning[:150]}")
+                    reporter.log(f"策略推理: {strategy_result.reasoning[:80] if strategy_result.reasoning else '无'}")
+                    self.logger.info(f"[{strategy.name}] 推理: {strategy_result.reasoning[:100] if strategy_result.reasoning else '无'}")
 
-                        context.metadata["strategy_output"] = {
-                            "strategy": strategy.name,
-                            "action": action_name,
-                            "confidence": strategy_result.confidence,
-                            "reasoning": strategy_result.reasoning,
+                    # 生成动作序列
+                    reporter.update_phase("DecisionAgent生成动作序列...")
+                    reporter.update_agent("decision", "thinking")
+                    current_sequence = self.decision_agent.generate_action_sequence(
+                        context, strategy_result, current_subtask
+                    )
+                    reporter.update_agent("decision", "done", sequence_progress="0%")
+                    reporter.log(f"生成序列: {len(current_sequence.actions)}步, 完成={current_sequence.subtask_completed}")
+                    last_sequence_subtask_id = current_subtask.id if current_subtask else None
+                    sequence_step_count = 0
+
+                # 检查是否需要中断序列
+                if current_sequence:
+                    should_abort, abort_reason = self.decision_agent.check_sequence_abort(
+                        context, current_sequence, depth_image
+                    )
+
+                    if should_abort:
+                        self.logger.info(f"[SEQUENCE] 中断序列: {abort_reason}")
+                        current_sequence = None
+
+                        # 重置stuck counter
+                        self.decision_agent._stuck_counter = 0
+
+                        # stuck时使用Debate策略重新规划
+                        self.logger.info("[SEQUENCE] Stuck触发Debate重新规划...")
+                        strategy_config = {
+                            "use_remote": self.config.get("use_remote_llm", False),
+                            "remote_server_url": self.config.get("llm_server", "http://localhost:8000"),
                         }
-                    else:
-                        # 策略失败，回退到直接DecisionAgent调用
-                        if self.decision_agent:
-                            decision_output = self.decision_agent.process(context)
-                            action_name = decision_output.data.get("action", "forward")
-                            self.logger.info(f"[DecisionAgent] 策略回退，动作: {action_name}")
-                else:
-                    # 直接调用DecisionAgent (简单任务或策略模式未启用)
-                    if self.decision_agent:
-                        decision_output = self.decision_agent.process(context)
-                        action_name = decision_output.data.get("action", "forward")
-                        context.metadata["decision_output"] = decision_output.data
-                        self.logger.info(f"[DecisionAgent] 动作: {action_name}")
-                        self.logger.info(f"[DecisionAgent] 推理: {decision_output.data.get('reasoning', '')[:150]}")
+                        strategy = DebateStrategy(config=strategy_config)
+                        agents_list = [self.perception_agent, self.trajectory_agent,
+                                       self.instruction_agent, self.evaluation_agent]
+                        strategy_result = strategy.execute(context, agents_list)
 
-                # EvaluationAgent评估
-                if self.evaluation_agent:
-                    should_eval = self._should_call_evaluation(task_level, steps)
-                    if should_eval:
-                        eval_output = self.evaluation_agent.process(context)
-                        context.metadata["evaluation_output"] = eval_output.data
-                        eval_score = eval_output.data.get("score", 0.5)
-                        evaluation_scores.append(eval_score)
-                        self.logger.info(f"[EvaluationAgent] 评分: {eval_score:.2f}")
-                        if eval_output.data.get("replan_needed", False):
-                            self.logger.info(f"  评估触发重新规划 at step {steps}")
-                            if self.instruction_agent:
-                                new_instruction = self.instruction_agent.process(context)
-                                context.metadata["instruction_output"] = new_instruction.data
+                        # 生成新的10步序列
+                        current_sequence = self.decision_agent.generate_action_sequence(
+                            context, strategy_result, current_subtask
+                        )
+                        self.logger.info(f"[SEQUENCE] Debate后生成新序列: {current_sequence.reasoning[:50] if current_sequence else 'N/A'}")
+
+                # 从序列获取下一个动作
+                action_name = "move_forward"  # 默认动作
+                if current_sequence:
+                    from core.action import ActionType
+                    next_action_type = current_sequence.get_next_action()
+
+                    # 序列执行完毕，检查子任务是否完成
+                    if next_action_type is None:
+                        if current_sequence.subtask_completed:
+                            reporter.update_phase("子任务完成!")
+                            reporter.log(f"子任务完成: {current_sequence.subtask_description[:40]}")
+                            self.logger.info(f"[SEQUENCE] LLM判断子任务完成: {current_sequence.subtask_description[:40]}")
+                            if context.advance_subtask():
+                                current_subtask = context.get_current_subtask()
+                                if current_subtask:
+                                    reporter.update_subtask(
+                                        current_subtask.id,
+                                        current_subtask.description,
+                                        current_subtask.completion_condition
+                                    )
+                                self.logger.info(f"[SEQUENCE] 进入下一子任务: {current_subtask.description[:40] if current_subtask else 'N/A'}")
+                            else:
+                                reporter.log("所有子任务已完成!")
+                                self.logger.info("[SEQUENCE] 所有子任务已完成，准备停止")
+                                action_name = "stop"
+                        else:
+                            reporter.log("序列完成但子任务未完成，重新规划")
+                            self.logger.info(f"[SEQUENCE] 序列完成但子任务未完成，重新规划")
+                        current_sequence = None
+                        last_sequence_subtask_id = None
+                        continue  # 跳到下一轮循环重新生成序列
+
+                    if next_action_type:
+                        action_map = {
+                            ActionType.MOVE_FORWARD: "move_forward",
+                            ActionType.TURN_LEFT: "turn_left",
+                            ActionType.TURN_RIGHT: "turn_right",
+                            ActionType.STOP: "stop",
+                            ActionType.LOOK_UP: "look_up",
+                            ActionType.LOOK_DOWN: "look_down",
+                        }
+                        action_name = action_map.get(next_action_type, "move_forward")
+                        sequence_step_count += 1
+
+                        reporter.update_step(steps + 1)
+                        reporter.update_phase(f"执行: {action_name}")
+                        reporter.log_action(action_name)
+                        reporter.update_agent("decision", "done", sequence_progress=f"{current_sequence.get_progress():.0%}")
+
+                        self.logger.info(f"[SEQUENCE] 执行动作: {action_name} "
+                                       f"(进度: {current_sequence.get_progress():.0%}, "
+                                       f"剩余: {current_sequence.get_remaining_steps()}步)")
+
+                        context.metadata["sequence_output"] = {
+                            "subtask": current_sequence.subtask_description[:50],
+                            "progress": current_sequence.get_progress(),
+                            "action": action_name,
+                        }
 
                 # 执行动作
                 if action_name == "stop":
@@ -624,6 +800,9 @@ class MultiAgentVLNEvaluator:
                 pos = [float(x) for x in state.position]
                 trajectory.append(pos)
                 steps += 1
+
+                reporter.update_position(pos[0], pos[1], pos[2])
+                reporter.update_step(steps)
 
                 context.position = tuple(pos)
                 context.add_trajectory_point(tuple(pos))
@@ -851,12 +1030,16 @@ class MultiAgentVLNEvaluator:
         Returns:
             对应的策略实例
         """
+        strategy_config = {
+            "use_remote": self.config.get("use_remote_llm", False),
+            "remote_server_url": self.config.get("llm_server", "http://localhost:8000"),
+        }
         if task_level == "简单":
-            return CoTStrategy()
+            return CoTStrategy(config=strategy_config)
         elif task_level == "中等":
-            return ReflectionStrategy()
+            return ReflectionStrategy(config=strategy_config)
         else:  # 困难
-            return DebateStrategy()
+            return DebateStrategy(config=strategy_config)
 
     def _run_simulated_episode(self, episode: R2REpisode) -> Dict[str, Any]:
         """模拟模式运行episode"""
@@ -1069,9 +1252,11 @@ def main():
     parser.add_argument("--mp3d-path", type=str, default="data/mp3d_dataset/mp3d")
     parser.add_argument("--r2r-path", type=str, default="/root/habitat-lab/data/datasets/vln/mp3d/r2r/v1/val_seen/val_seen.json")
     parser.add_argument("--episodes", type=int, default=5, help="评估episode数量")
+    parser.add_argument("--start-episode", type=int, default=None, help="起始episode ID (默认从第一个开始)")
     parser.add_argument("--max-steps", type=int, default=50, help="每个episode最大步数")
     parser.add_argument("--success-distance", type=float, default=3.0, help="成功距离阈值(米)")
-    parser.add_argument("--output", type=str, default="results_multi_agent.json")
+    parser.add_argument("--output", type=str, default=None,
+                        help="输出JSON文件名 (默认: results_时间戳.json)")
     parser.add_argument("--log-level", type=str, default="INFO")
     parser.add_argument("--device", type=str, default="cuda")
     parser.add_argument("--use-int8", action="store_true", default=True, help="使用INT8量化")
@@ -1081,18 +1266,39 @@ def main():
                         help="使用远程LLM服务 (Python 3.10环境)")
     parser.add_argument("--llm-server", type=str, default="http://localhost:8000",
                         help="远程LLM服务器地址")
-    parser.add_argument("--remote-timeout", type=float, default=60.0,
+    parser.add_argument("--remote-timeout", type=float, default=120.0,
                         help="远程LLM请求超时时间(秒)")
 
     # Strategy mode arguments
     parser.add_argument("--use-strategy-mode", action="store_true", default=False,
                         help="使用策略模式进行决策 (CoT/Reflection/Debate)")
 
+    # Sequence mode arguments (子任务级别规划)
+    parser.add_argument("--use-sequence-mode", action="store_true", default=False,
+                        help="使用动作序列模式 (子任务级别规划，大幅减少LLM调用)")
+
     # Output arguments
-    parser.add_argument("--output-dir", type=str, default="output",
+    parser.add_argument("--output-dir", type=str, default="results",
                         help="输出目录，保存每个episode的视觉图像、轨迹图和agent输出")
 
     args = parser.parse_args()
+
+    # Create timestamped session directory under results/
+    session_timestamp = datetime.now().strftime("%Y-%m%d-%H%M")
+    if args.output_dir == "results":
+        # Default: create timestamped session directory
+        args.output_dir = f"results/episode-{session_timestamp}"
+
+    # Ensure the session directory exists
+    os.makedirs(args.output_dir, exist_ok=True)
+
+    # Generate output filename in session directory
+    if args.output is None:
+        args.output = os.path.join(args.output_dir, "results.json")
+    else:
+        # If output path is relative, put it in session directory
+        if not os.path.isabs(args.output):
+            args.output = os.path.join(args.output_dir, args.output)
 
     config = {
         "mp3d_path": args.mp3d_path,
@@ -1106,6 +1312,7 @@ def main():
         "llm_server": args.llm_server,
         "remote_timeout": args.remote_timeout,
         "use_strategy_mode": args.use_strategy_mode,
+        "use_sequence_mode": args.use_sequence_mode,
         "output_dir": args.output_dir,
     }
 
@@ -1114,6 +1321,7 @@ def main():
     print("=" * 70)
     print(f"MP3D路径: {args.mp3d_path}")
     print(f"R2R数据: {args.r2r_path}")
+    print(f"起始Episode: {args.start_episode if args.start_episode else '从头开始'}")
     print(f"Episode数量: {args.episodes}")
     print(f"最大步数: {args.max_steps}")
     print(f"成功距离: {args.success_distance}m")
@@ -1130,7 +1338,7 @@ def main():
     evaluator = MultiAgentVLNEvaluator(config, log_level=args.log_level)
     evaluator.initialize()
 
-    results = evaluator.run_evaluation(num_episodes=args.episodes)
+    results = evaluator.run_evaluation(num_episodes=args.episodes, start_episode_id=args.start_episode)
 
     # 输出结果
     print("\n" + "=" * 70)

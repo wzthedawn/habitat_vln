@@ -53,33 +53,37 @@ conversation_contexts: Dict[str, List[Dict[str, str]]] = {}
 def get_model_configs() -> Dict[str, Dict]:
     """Get model configurations.
 
-    Model allocation (方案二):
-    - qwen-4b-perception: Visual perception and scene description (4B for better visual understanding)
-    - qwen-2b-trajectory: Trajectory summarization (2B sufficient for simple text tasks)
-    - qwen-4b: Navigation decision making (4B for reasoning)
-    - qwen-4b-evaluation: Decision evaluation (4B for assessment)
-    - qwen2-vl-2b: Vision-Language Model for object detection and scene analysis
+    Model allocation (updated):
+    - qwen-4b-perception: Visual perception and scene description
+    - qwen-4b-instruction: Instruction decomposition with semantic analysis
+    - qwen-4b-decision: Navigation decision making
+    - qwen-4b-evaluation: Decision evaluation and feedback
+    - qwen-2b-trajectory: Trajectory summarization (2B for efficiency)
 
-    Total VRAM: ~16GB + Habitat ~2GB = ~18GB (safe for 24GB GPU)
+    Note: All 4B models share the same physical weights but have independent configurations.
+    Each agent uses a unique model key for isolated conversation contexts.
+
+    Total VRAM: ~6GB (2B) + ~8GB (4B) = ~14GB + Habitat ~2GB = ~16GB (safe for 24GB GPU)
     """
     return {
+        # === 4B Models (shared weights, independent configs) ===
         "qwen-4b-perception": {
             "model_name": "/root/.cache/modelscope/hub/models/Qwen/Qwen3___5-4B",
-            "max_new_tokens": 256,
+            "max_new_tokens": 400,
             "default_temperature": 0.3,
-            "description": "Visual perception and scene description (VLM)",
+            "description": "Visual perception and scene description",
             "is_vlm": True,  # Qwen3.5-4B is a multimodal VLM
         },
-        "qwen-2b-trajectory": {
-            "model_name": "/root/.cache/modelscope/hub/models/Qwen/Qwen3___5-2B",
-            "max_new_tokens": 200,
-            "default_temperature": 0.2,
-            "description": "Trajectory summarization and navigation progress",
-        },
-        "qwen-4b": {
+        "qwen-4b-instruction": {
             "model_name": "/root/.cache/modelscope/hub/models/Qwen/Qwen3___5-4B",
-            "max_new_tokens": 150,
-            "default_temperature": 0.1,
+            "max_new_tokens": 300,
+            "default_temperature": 0.1,  # Lower temperature for stable JSON output
+            "description": "Instruction decomposition with semantic analysis",
+        },
+        "qwen-4b-decision": {
+            "model_name": "/root/.cache/modelscope/hub/models/Qwen/Qwen3___5-4B",
+            "max_new_tokens": 250,
+            "default_temperature": 0.2,
             "description": "Navigation decision making",
         },
         "qwen-4b-evaluation": {
@@ -88,6 +92,14 @@ def get_model_configs() -> Dict[str, Dict]:
             "default_temperature": 0.2,
             "description": "Decision evaluation and feedback",
         },
+        # === 2B Model ===
+        "qwen-2b-trajectory": {
+            "model_name": "/root/.cache/modelscope/hub/models/Qwen/Qwen3___5-2B",
+            "max_new_tokens": 200,
+            "default_temperature": 0.2,
+            "description": "Trajectory summarization and navigation progress",
+        },
+        # === Optional VLM ===
         "qwen2-vl-2b": {
             "model_name": "/root/.cache/modelscope/hub/models/Qwen/Qwen2-VL-2B-Instruct",
             "max_new_tokens": 256,
@@ -101,6 +113,9 @@ def get_model_configs() -> Dict[str, Dict]:
 
 def load_model(model_key: str, use_int8: bool = True) -> bool:
     """Load a single model.
+
+    Models with the same model_path are shared to save VRAM.
+    For example: qwen-4b-decision and qwen-4b-evaluation share the same Qwen3.5-4B model.
 
     Args:
         model_key: Model identifier
@@ -125,6 +140,14 @@ def load_model(model_key: str, use_int8: bool = True) -> bool:
     if not os.path.exists(model_path):
         logger.error(f"Model path does not exist: {model_path}")
         return False
+
+    # Check if a model with the same path is already loaded (model sharing)
+    for existing_key, existing_path in [(k, v["model_name"]) for k, v in model_configs.items()]:
+        if existing_key in models and existing_path == model_path and existing_key != model_key:
+            logger.info(f"Sharing model {existing_key} -> {model_key} (same path: {model_path})")
+            models[model_key] = models[existing_key]
+            tokenizers[model_key] = tokenizers[existing_key]
+            return True
 
     try:
         import torch
@@ -151,6 +174,7 @@ def load_model(model_key: str, use_int8: bool = True) -> bool:
                 device_map="auto",
                 trust_remote_code=True,
                 torch_dtype=torch.float16,
+                attn_implementation="sdpa",  # Scaled Dot Product Attention
             )
         else:
             model = AutoModelForCausalLM.from_pretrained(
@@ -158,6 +182,7 @@ def load_model(model_key: str, use_int8: bool = True) -> bool:
                 device_map="auto",
                 trust_remote_code=True,
                 torch_dtype=torch.float16,
+                attn_implementation="sdpa",  # Scaled Dot Product Attention
             )
 
         model.eval()
@@ -250,12 +275,14 @@ def load_vlm_model(model_key: str, use_int8: bool = True) -> bool:
             else:
                 # Qwen3.5-4B uses Qwen3_5ForConditionalGeneration
                 # This properly handles both text and image inputs
+                # Use flash_attention_2 for faster inference
                 model = Qwen3_5ForConditionalGeneration.from_pretrained(
                     model_path,
                     quantization_config=quantization_config,
                     device_map="auto",
                     trust_remote_code=True,
                     torch_dtype=torch.float16,
+                    attn_implementation="sdpa",  # Scaled Dot Product Attention
                 )
         except Exception as e:
             logger.warning(f"Failed to load VLM model: {e}")
@@ -274,6 +301,7 @@ def load_vlm_model(model_key: str, use_int8: bool = True) -> bool:
                         device_map="auto",
                         trust_remote_code=True,
                         torch_dtype=torch.float16,
+                        attn_implementation="sdpa",  # Scaled Dot Product Attention
                     )
             except Exception as e2:
                 logger.error(f"Failed to load VLM model: {e2}")
@@ -386,14 +414,37 @@ def generate_text(
     try:
         import torch
 
+        # Handle Qwen3.5 thinking mode - use chat template with enable_thinking=False
+        use_chat_template = False
+        if hasattr(model, 'config') and hasattr(model.config, 'model_type'):
+            if 'qwen3' in str(model.config.model_type).lower():
+                use_chat_template = True
+
         # Handle conversation context
-        full_prompt = prompt
+        context = []
         if conversation_id and keep_context:
             if conversation_id not in conversation_contexts:
                 conversation_contexts[conversation_id] = []
-
-            # Build context from history (keep last 5 exchanges)
             context = conversation_contexts[conversation_id][-5:]
+
+        # Build prompt using chat template for Qwen3.5
+        if use_chat_template and hasattr(tokenizer, 'apply_chat_template'):
+            # Build messages with context for multi-turn
+            messages = []
+            if context:
+                for c in context:
+                    messages.append({"role": "user", "content": c['human']})
+                    messages.append({"role": "assistant", "content": c['assistant']})
+            messages.append({"role": "user", "content": prompt})
+
+            full_prompt = tokenizer.apply_chat_template(
+                messages,
+                tokenize=False,
+                add_generation_prompt=True,
+                enable_thinking=False  # Disable thinking mode
+            )
+        else:
+            # Fallback to direct prompt
             if context:
                 context_str = "\n".join([
                     f"Human: {c['human']}\nAssistant: {c['assistant']}"
@@ -463,17 +514,20 @@ def generate_vision(
     image_base64: str,
     max_new_tokens: Optional[int] = None,
     temperature: Optional[float] = None,
+    depth_base64: Optional[str] = None,
 ) -> Dict[str, Any]:
     """Generate text from image and prompt using VLM.
 
     Supports both Qwen2-VL and Qwen3.5-VL models.
+    Optionally supports dual image input (RGB + Depth).
 
     Args:
         model_key: Model identifier (e.g., qwen2-vl-2b, qwen-4b-perception)
         prompt: Input prompt
-        image_base64: Base64 encoded image
+        image_base64: Base64 encoded RGB image
         max_new_tokens: Maximum tokens to generate
         temperature: Sampling temperature
+        depth_base64: Optional base64 encoded depth image (colored)
 
     Returns:
         Dictionary with response and metadata
@@ -507,7 +561,7 @@ def generate_vision(
         import torch
         from PIL import Image
 
-        # Decode base64 image
+        # Decode base64 RGB image
         image_data = base64.b64decode(image_base64)
         image = Image.open(BytesIO(image_data))
 
@@ -517,26 +571,41 @@ def generate_vision(
 
         # Prepare messages for VLM
         # Format compatible with both Qwen2-VL and Qwen3.5-VL
+        content = [
+            {"type": "image", "image": image},
+        ]
+
+        # Add depth image if provided
+        if depth_base64:
+            depth_data = base64.b64decode(depth_base64)
+            depth_image = Image.open(BytesIO(depth_data))
+            if depth_image.mode != 'RGB':
+                depth_image = depth_image.convert('RGB')
+            content.append({"type": "image", "image": depth_image})
+
+        content.append({"type": "text", "text": prompt})
+
         messages = [
             {
                 "role": "user",
-                "content": [
-                    {"type": "image", "image": image},
-                    {"type": "text", "text": prompt},
-                ],
+                "content": content,
             }
         ]
 
-        # Apply chat template
+        # Apply chat template with thinking disabled
         text_prompt = processor.apply_chat_template(
-            messages, tokenize=False, add_generation_prompt=True
+            messages, tokenize=False, add_generation_prompt=True,
+            enable_thinking=False  # Disable thinking mode for VLM
         )
 
-        # Process inputs - use processor's __call__ method
-        # This handles both image and text processing
+        # Process inputs - collect all images
+        images = [image]
+        if depth_base64:
+            images.append(depth_image)
+
         inputs = processor(
             text=[text_prompt],
-            images=[image],
+            images=images,
             return_tensors="pt",
             padding=True,
         )
@@ -706,9 +775,10 @@ def create_app() -> "FastAPI":
         """Request model for vision-language generation."""
         model: str = Field(default="qwen-4b-perception", description="VLM model identifier")
         prompt: str = Field(..., description="Input prompt for generation")
-        image_base64: str = Field(..., description="Base64 encoded image")
+        image_base64: str = Field(..., description="Base64 encoded RGB image")
         max_new_tokens: Optional[int] = Field(None, description="Maximum tokens to generate")
         temperature: Optional[float] = Field(None, description="Sampling temperature (0.0-2.0)")
+        depth_base64: Optional[str] = Field(None, description="Base64 encoded depth image (colored)")
 
     class GenerateVisionResponse(BaseModel):
         """Response model for vision-language generation."""
@@ -720,13 +790,17 @@ def create_app() -> "FastAPI":
 
     @app.post("/generate_vision", response_model=GenerateVisionResponse)
     async def generate_vision_endpoint(request: GenerateVisionRequest):
-        """Generate text from image and prompt using VLM."""
+        """Generate text from image and prompt using VLM.
+
+        Supports single image (RGB) or dual image (RGB + Depth) input.
+        """
         result = generate_vision(
             model_key=request.model,
             prompt=request.prompt,
             image_base64=request.image_base64,
             max_new_tokens=request.max_new_tokens,
             temperature=request.temperature,
+            depth_base64=request.depth_base64,
         )
 
         if "error" in result and "response" not in result:

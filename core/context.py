@@ -4,8 +4,30 @@ from dataclasses import dataclass, field
 from typing import List, Optional, Tuple, Dict, Any
 from enum import Enum
 import numpy as np
+import time
+import json
 
 from .action import Action
+
+
+# Precondition types for subtask verification
+PRECONDITION_TYPES = {
+    "height_reached": "到达指定高度",        # {"type": "height_reached", "target_y": -3.0, "tolerance": 1.0}
+    "floor_changed": "楼层已变化",           # {"type": "floor_changed", "direction": "down"}
+    "object_visible": "目标物体可见",        # {"type": "object_visible", "object": "stairs"}
+    "position_reached": "到达指定位置",      # {"type": "position_reached", "near": "stairs_bottom"}
+    "rotation_completed": "转向完成",        # {"type": "rotation_completed", "direction": "right"}
+}
+
+# Completion condition types
+COMPLETION_TYPES = {
+    "y_change": "高度变化",                  # {"type": "y_change", "min_change": 2.0, "direction": "down"}
+    "rotation": "转向动作",                  # {"type": "rotation", "direction": "right", "min_degrees": 60}
+    "distance": "移动距离",                  # {"type": "distance", "min_meters": 3.0}
+    "object_near": "接近物体",               # {"type": "object_near", "object": "bench", "max_distance": 2.0}
+    "room_type": "房间类型",                 # {"type": "room_type", "expected": "hallway"}
+    "at_goal": "到达目标",                   # {"type": "at_goal", "max_distance": 3.0}
+}
 
 
 class TaskType(Enum):
@@ -50,8 +72,44 @@ class SubTask:
     dependencies: List[int] = field(default_factory=list)
     result: Optional[str] = None
 
+    # === New fields for semantic decomposition ===
+    # 前置条件 (precondition for execution)
+    precondition: Optional[Dict[str, Any]] = None
+    # 示例: {"type": "height_change", "direction": "down", "min_change": 1.0}
+
+    # 完成条件 (condition for completion verification)
+    completion_condition: Optional[Dict[str, Any]] = None
+    # 示例: {"type": "position", "check": "at_target_floor", "tolerance": 1.0}
+
+    # 空间约束 (spatial constraint for execution)
+    spatial_constraint: Optional[Dict[str, Any]] = None
+    # 示例: {"floor": "lower", "near": "stairs_bottom"}
+
+    # 执行上下文（运行时填充）
+    start_context: Optional[Dict[str, Any]] = None  # 开始时的状态
+    end_context: Optional[Dict[str, Any]] = None    # 完成时的状态
+
     def __str__(self) -> str:
-        return f"SubTask({self.id}: {self.description[:30]}... [{self.status}] [{self.level}])"
+        precondition_str = f", pre={self.precondition}" if self.precondition else ""
+        completion_str = f", comp={self.completion_condition}" if self.completion_condition else ""
+        return f"SubTask({self.id}: {self.description[:30]}... [{self.status}] [{self.level}]{precondition_str}{completion_str})"
+
+    def to_dict(self) -> Dict[str, Any]:
+        """Convert subtask to dictionary for serialization."""
+        return {
+            "id": self.id,
+            "description": self.description,
+            "status": self.status,
+            "level": self.level,
+            "required_agents": self.required_agents,
+            "dependencies": self.dependencies,
+            "result": self.result,
+            "precondition": self.precondition,
+            "completion_condition": self.completion_condition,
+            "spatial_constraint": self.spatial_constraint,
+            "start_context": self.start_context,
+            "end_context": self.end_context,
+        }
 
 
 @dataclass
@@ -210,6 +268,67 @@ class NavContext:
         recent = self.action_history[-last_n:]
         summary = [f"Step {i}: {a.action_type.name}" for i, a in enumerate(recent, 1)]
         return "\n".join(summary)
+
+    # === Subtask lifecycle methods ===
+
+    def start_subtask(self) -> None:
+        """Record current subtask start state."""
+        current = self.get_current_subtask()
+        if current:
+            current.start_context = {
+                "position": self.position,
+                "rotation": self.rotation,
+                "y": self.position[1],
+                "step": self.step_count,
+                "timestamp": time.time(),
+            }
+            current.status = "in_progress"
+
+    def complete_subtask(self) -> None:
+        """Record current subtask completion state."""
+        current = self.get_current_subtask()
+        if current:
+            current.end_context = {
+                "position": self.position,
+                "rotation": self.rotation,
+                "y": self.position[1],
+                "step": self.step_count,
+            }
+            current.status = "completed"
+
+            # Calculate state changes
+            if current.start_context:
+                current.result = json.dumps({
+                    "y_change": current.end_context["y"] - current.start_context["y"],
+                    "rotation_change": current.end_context["rotation"] - current.start_context["rotation"],
+                    "steps_taken": current.end_context["step"] - current.start_context["step"],
+                })
+
+    def get_subtask_y_change(self) -> float:
+        """Get current subtask's height change."""
+        current = self.get_current_subtask()
+        if current and current.start_context:
+            return self.position[1] - current.start_context["y"]
+        return 0.0
+
+    def get_subtask_rotation_change(self) -> float:
+        """Get current subtask's rotation change in radians."""
+        current = self.get_current_subtask()
+        if current and current.start_context:
+            return self.rotation - current.start_context["rotation"]
+        return 0.0
+
+    def get_subtask_distance_moved(self) -> float:
+        """Get current subtask's horizontal distance moved."""
+        current = self.get_current_subtask()
+        if current and current.start_context:
+            start_pos = current.start_context["position"]
+            import math
+            return math.sqrt(
+                (self.position[0] - start_pos[0])**2 +
+                (self.position[2] - start_pos[2])**2
+            )
+        return 0.0
 
 
 class NavContextBuilder:

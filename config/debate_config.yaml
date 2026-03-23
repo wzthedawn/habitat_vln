@@ -1,0 +1,61 @@
+# Debate Strategy Configuration
+# For VLN Multi-Agent System
+#
+# Updated 2026-03-19: Added rotation threshold and extended escape plan
+
+debate:
+  # Trigger thresholds
+  stuck_threshold: 6              # Number of stuck steps to trigger debate
+  debate_cooldown: 5              # Minimum steps between debates
+
+  # NEW: Rotation angle threshold for stuck detection
+  rotation_threshold: 45          # Rotation angle threshold (degrees)
+                                  # Agent not considered stuck if rotating >= this angle
+
+  # Historical weight modes
+  weight_mode: hybrid             # Options: persistent, episode, hybrid
+  persistent_weight: 0.7          # Weight for persistent history in hybrid mode
+
+  # Base weights for each agent
+  base_weights:
+    perception: 1.0
+    instruction: 1.0
+    trajectory: 1.0
+    decision: 1.0
+
+  # Hard constraint thresholds
+  hard_constraint_threshold:
+    obstacle_distance: 0.5        # Block forward if obstacle < 0.5m
+    consecutive_failures: 3       # Block direction after N consecutive failures
+
+  # Escape plan configuration - UPDATED
+  escape_plan:
+    max_steps: 15                 # Increased from 5 to 15 for extended sequences
+    success_distance: 1.0         # Success if moved > 1.0m
+
+  # Performance tracking
+  performance:
+    save_interval: 10             # Save every N episodes
+    file: "data/agent_performance.json"
+
+  # Multi-round debate
+  debate_rounds: 2                # Number of debate rounds
+  consensus_threshold: 0.7        # Agreement threshold to skip additional rounds
+
+# Agent-specific configurations
+agents:
+  perception:
+    confidence_threshold: 0.6
+    obstacle_detection_range: 2.0
+
+  instruction:
+    subtask_completion_threshold: 0.8
+
+  trajectory:
+    stuck_detection_window: 5
+    min_movement_threshold: 0.1
+
+  decision:
+    default_confidence: 0.7
+    forward_bias: 0.1             # Slight preference for forward movement
+    rotation_threshold_deg: 45    # Rotation threshold for stuck detection

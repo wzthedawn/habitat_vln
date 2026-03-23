@@ -90,7 +90,7 @@ class EpisodeOutput:
 class EpisodeOutputManager:
     """Manages episode outputs including images, trajectory plots, and agent outputs."""
 
-    def __init__(self, output_dir: str = "output"):
+    def __init__(self, output_dir: str = "results"):
         self.output_dir = Path(output_dir)
         self.logger = logging.getLogger("EpisodeOutputManager")
         self.current_episode: Optional[EpisodeOutput] = None
@@ -116,7 +116,7 @@ class EpisodeOutputManager:
             start_position=start_position,
         )
 
-        # Create episode directory
+        # Create episode directory (simple naming, session dir already has timestamp)
         episode_dir = self.output_dir / f"episode_{episode_id}"
         episode_dir.mkdir(parents=True, exist_ok=True)
 
@@ -126,6 +126,12 @@ class EpisodeOutputManager:
 
         self.logger.info(f"Started episode {episode_id}, output dir: {episode_dir}")
         return self.current_episode
+
+    def _get_episode_dir(self) -> Path:
+        """Get current episode directory."""
+        if self.current_episode is None:
+            return self.output_dir
+        return self.output_dir / f"episode_{self.current_episode.episode_id}"
 
     def save_rgb_image(
         self,
@@ -137,7 +143,7 @@ class EpisodeOutputManager:
             self.logger.warning("No active episode")
             return ""
 
-        episode_dir = self.output_dir / f"episode_{self.current_episode.episode_id}"
+        episode_dir = self._get_episode_dir()
         image_path = episode_dir / "images" / f"step_{step:04d}_rgb.png"
 
         try:
@@ -171,7 +177,7 @@ class EpisodeOutputManager:
             self.logger.warning("No active episode")
             return ""
 
-        episode_dir = self.output_dir / f"episode_{self.current_episode.episode_id}"
+        episode_dir = self._get_episode_dir()
         image_path = episode_dir / "images" / f"step_{step:04d}_depth.png"
 
         try:
@@ -247,7 +253,7 @@ class EpisodeOutputManager:
             self.logger.warning("No active episode")
             return ""
 
-        episode_dir = self.output_dir / f"episode_{self.current_episode.episode_id}"
+        episode_dir = self._get_episode_dir()
         plot_path = episode_dir / "trajectory" / "trajectory_plot.png"
 
         try:
@@ -307,7 +313,7 @@ class EpisodeOutputManager:
             self.logger.warning("No active episode")
             return ""
 
-        episode_dir = self.output_dir / f"episode_{self.current_episode.episode_id}"
+        episode_dir = self._get_episode_dir()
         output_path = episode_dir / "agent_outputs.json"
 
         output_data = self.current_episode.to_dict()
@@ -366,7 +372,7 @@ class EpisodeOutputManager:
             self.logger.warning("No active episode")
             return None
 
-        episode_dir = self.output_dir / f"episode_{self.current_episode.episode_id}"
+        episode_dir = self._get_episode_dir()
         images_dir = episode_dir / "images"
         video_path = episode_dir / "episode_video.mp4"
 
@@ -374,7 +380,7 @@ class EpisodeOutputManager:
             import cv2
 
             # Get all RGB images
-            rgb_files = sorted(images_dir.glob("step_*_rgb.png"))
+            rgb_files = sorted(images_dir.glob("step_*_rgb*.png"))
             if not rgb_files:
                 self.logger.warning("No RGB images found for video")
                 return None
@@ -404,6 +410,4 @@ class EpisodeOutputManager:
 
     def get_episode_dir(self) -> Path:
         """Get the current episode directory."""
-        if self.current_episode is None:
-            return self.output_dir
-        return self.output_dir / f"episode_{self.current_episode.episode_id}"
+        return self._get_episode_dir()

@@ -60,12 +60,6 @@ class ModelManager:
     # 方案二: 4B perception + 2B trajectory + 4B decision + 4B evaluation + VLM
     # Total VRAM: ~16GB + Habitat ~2GB = ~18GB (safe for 24GB GPU)
     MODEL_CONFIGS = {
-        "yolov5s": {
-            "type": "yolo",
-            "model_name": "yolov5su.pt",  # YOLOv5 small ultra - compatible with numpy 2.x
-            "vram_gb": 0.5,
-            "load_time": 1.0,
-        },
         "qwen-4b-perception": {
             "type": "llm",
             "model_name": "/root/.cache/modelscope/hub/models/Qwen/Qwen3___5-4B",
@@ -82,12 +76,36 @@ class ModelManager:
             "max_new_tokens": 200,
             "temperature": 0.2,
         },
+        "qwen-2b-instruction": {
+            "type": "llm",
+            "model_name": "/root/.cache/modelscope/hub/models/Qwen/Qwen3___5-2B",
+            "vram_gb": 2.1,  # Shares physical model with qwen-2b-trajectory
+            "load_time": 10.0,
+            "max_new_tokens": 500,
+            "temperature": 0.1,  # Lower temperature for stable JSON output
+        },
         "qwen-4b": {
             "type": "llm",
             "model_name": "/root/.cache/modelscope/hub/models/Qwen/Qwen3___5-4B",
             "vram_gb": 4.0,
             "load_time": 15.0,
             "max_new_tokens": 150,
+            "temperature": 0.1,
+        },
+        "qwen-4b-decision": {
+            "type": "llm",
+            "model_name": "/root/.cache/modelscope/hub/models/Qwen/Qwen3___5-4B",
+            "vram_gb": 4.0,  # Shares physical model with qwen-4b
+            "load_time": 15.0,
+            "max_new_tokens": 300,
+            "temperature": 0.1,
+        },
+        "qwen-4b-instruction": {
+            "type": "llm",
+            "model_name": "/root/.cache/modelscope/hub/models/Qwen/Qwen3___5-4B",
+            "vram_gb": 4.0,  # Shares physical model with qwen-4b
+            "load_time": 15.0,
+            "max_new_tokens": 500,
             "temperature": 0.1,
         },
         "qwen-4b-evaluation": {
@@ -130,8 +148,8 @@ class ModelManager:
         self.use_int8 = self.config.get("use_int8", True)
 
         # Remote LLM configuration (for dual-environment IPC)
-        self.use_remote = self.config.get("use_remote", False)
-        self.remote_server_url = self.config.get("remote_server_url", "http://localhost:8000")
+        self.use_remote = self.config.get("use_remote", self.config.get("use_remote_llm", False))
+        self.remote_server_url = self.config.get("remote_server_url", self.config.get("llm_server_url", "http://localhost:8000"))
         self._remote_client = None
         self._remote_healthy = False
 
@@ -204,13 +222,6 @@ class ModelManager:
                 self.logger.warning("[load_all_models] CUDA not available, falling back to CPU")
                 self.device = "cpu"
 
-            # Load YOLO
-            self.logger.info("[load_all_models] Loading YOLO...")
-            if not self._load_yolo():
-                self.logger.warning("[load_all_models] YOLO loading failed, using fallback")
-            else:
-                self.logger.info("[load_all_models] YOLO loaded successfully")
-
             # Load LLMs if requested
             if load_llms:
                 self.logger.info("[load_all_models] Loading LLMs...")
@@ -227,40 +238,15 @@ class ModelManager:
             traceback.print_exc()
             return False
 
-    def _load_yolo(self) -> bool:
-        """Load YOLOv5 model."""
-        model_key = "yolov5s"
-        self.logger.info(f"[_load_yolo] Attempting to load {model_key}...")
-
-        if model_key in self._models:
-            self.logger.info(f"[_load_yolo] {model_key} already loaded")
-            return True
-
-        try:
-            from ultralytics import YOLO
-
-            model_name = self.MODEL_CONFIGS[model_key]["model_name"]
-            self.logger.info(f"[_load_yolo] Loading {model_name} (YOLOv5 for numpy 2.x compatibility)...")
-
-            self._models[model_key] = YOLO(model_name)
-            self.logger.info(f"[_load_yolo] YOLOv5 loaded successfully, model type: {type(self._models[model_key])}")
-            return True
-
-        except ImportError as e:
-            self.logger.warning(f"[_load_yolo] ultralytics not installed, YOLO unavailable: {e}")
-            return False
-        except Exception as e:
-            self.logger.error(f"[_load_yolo] Failed to load YOLO: {e}")
-            import traceback
-            traceback.print_exc()
-            return False
-
     def load_llm(self, model_key: str) -> bool:
         """
         Load a Qwen LLM model with INT8 quantization.
 
+        Models with the same model_path are shared to save VRAM.
+        For example: qwen-2b-instruction and qwen-2b-trajectory share the same Qwen3.5-2B model.
+
         Args:
-            model_key: Model identifier (qwen-2b-perception, qwen-2b-trajectory, qwen-4b, qwen-9b)
+            model_key: Model identifier (qwen-2b-instruction, qwen-2b-trajectory, qwen-4b, etc.)
 
         Returns:
             True if loaded successfully
@@ -277,11 +263,20 @@ class ModelManager:
             self.logger.error(f"Model {model_key} is not an LLM")
             return False
 
+        model_path = config["model_name"]
+
+        # Check if a model with the same path is already loaded (model sharing)
+        for existing_key, existing_config in self.MODEL_CONFIGS.items():
+            if existing_key in self._models and existing_config["model_name"] == model_path and existing_key != model_key:
+                self.logger.info(f"[load_llm] Sharing model {existing_key} -> {model_key} (same path: {model_path})")
+                self._models[model_key] = self._models[existing_key]
+                self._tokenizers[model_key] = self._tokenizers[existing_key]
+                return True
+
         try:
             import torch
             from transformers import AutoModelForCausalLM, AutoTokenizer, BitsAndBytesConfig
 
-            model_path = config["model_name"]
             self.logger.info(f"Loading {model_key} from {model_path}...")
 
             # Check if path exists
@@ -352,8 +347,8 @@ class ModelManager:
 
         self.logger.info("Loading all LLM models...")
 
-        # 方案二: 4B perception + 2B trajectory + 4B decision + 4B evaluation
-        llm_keys = ["qwen-4b-perception", "qwen-2b-trajectory", "qwen-4b", "qwen-4b-evaluation"]
+        # 方案二: 4B perception + 2B trajectory + 4B decision + 4B instruction + 4B evaluation
+        llm_keys = ["qwen-4b-perception", "qwen-2b-trajectory", "qwen-4b-decision", "qwen-4b-instruction", "qwen-4b-evaluation"]
         success = True
 
         for key in llm_keys:
@@ -458,6 +453,62 @@ class ModelManager:
 
         except Exception as e:
             self.logger.error(f"VLM generation failed: {e}")
+            return self._get_vlm_fallback(prompt)
+
+    def generate_vision_dual(
+        self,
+        rgb_image: Any,
+        depth_image: Any,
+        prompt: str,
+        model_key: str = "qwen-4b-perception",
+        max_new_tokens: int = None,
+        temperature: float = None,
+    ) -> Dict[str, Any]:
+        """Generate text from RGB + Depth images using VLM.
+
+        Depth image is converted to JET colormap (red=near, blue=far)
+        for better visualization by the VLM.
+
+        Args:
+            rgb_image: PIL Image or numpy array for RGB
+            depth_image: numpy array for depth (in meters)
+            prompt: Input prompt for generation
+            model_key: VLM model identifier
+            max_new_tokens: Maximum tokens to generate
+            temperature: Sampling temperature
+
+        Returns:
+            Dictionary with 'response', 'objects', 'scene_description', 'nav_hint'
+        """
+        if not self.use_remote or not self._remote_client:
+            self.logger.warning("VLM requires remote server mode")
+            return self._get_vlm_fallback(prompt)
+
+        config = self.MODEL_CONFIGS.get(model_key, {})
+        if max_new_tokens is None:
+            max_new_tokens = config.get("max_new_tokens", 256)
+        if temperature is None:
+            temperature = config.get("temperature", 0.3)
+
+        try:
+            result = self._remote_client.generate_vision_dual(
+                rgb_image=rgb_image,
+                depth_image=depth_image,
+                prompt=prompt,
+                model=model_key,
+                max_new_tokens=max_new_tokens,
+                temperature=temperature,
+            )
+
+            if result.error:
+                self.logger.warning(f"VLM dual-vision generation error: {result.error}")
+                return self._get_vlm_fallback(prompt)
+
+            # Parse VLM response
+            return self._parse_vlm_response(result.response)
+
+        except Exception as e:
+            self.logger.error(f"VLM dual-vision generation failed: {e}")
             return self._get_vlm_fallback(prompt)
 
     def _parse_vlm_response(self, response: str) -> Dict[str, Any]:
@@ -661,130 +712,6 @@ class ModelManager:
             Model instance or None
         """
         return self._models.get(model_key)
-
-    def detect_objects(self, image: Any, confidence_threshold: float = 0.3) -> List[Dict[str, Any]]:
-        """
-        Detect objects using YOLO.
-
-        Args:
-            image: RGB image (numpy array or PIL Image)
-            confidence_threshold: Minimum confidence for detections
-
-        Returns:
-            List of detection dictionaries
-        """
-        # Ensure minimum threshold of 0.25 to avoid false positives in indoor scenes
-        # Indoor scenes often trigger outdoor objects (car, train, airplane) at low confidence
-        confidence_threshold = max(confidence_threshold, 0.25)
-
-        self.logger.info(f"[detect_objects] Called with image type: {type(image)}, threshold: {confidence_threshold}")
-
-        yolo = self.get_model("yolov5s")
-        self.logger.info(f"[detect_objects] YOLO model: {yolo is not None}")
-
-        if yolo is None:
-            self.logger.warning("[detect_objects] YOLO model not loaded - returning empty list")
-            return []
-
-        if image is None:
-            self.logger.warning("[detect_objects] YOLO input image is None - returning empty list")
-            return []
-
-        # Debug logging for input image (INFO level for visibility)
-        if isinstance(image, np.ndarray):
-            self.logger.info(f"[detect_objects] YOLO input: shape={image.shape}, dtype={image.dtype}, min={image.min()}, max={image.max()}")
-
-        try:
-            import tempfile
-            import os
-            from PIL import Image as PILImage
-
-            # Convert to PIL Image
-            if isinstance(image, np.ndarray):
-                # Ensure uint8 type
-                if image.dtype != np.uint8:
-                    if image.max() <= 1.0:
-                        image = (image * 255).astype(np.uint8)
-                    else:
-                        image = image.astype(np.uint8)
-                pil_image = PILImage.fromarray(image)
-            else:
-                pil_image = image
-
-            # Convert RGBA to RGB if necessary
-            if pil_image.mode == 'RGBA':
-                pil_image = pil_image.convert('RGB')
-            elif pil_image.mode != 'RGB':
-                pil_image = pil_image.convert('RGB')
-
-            # Save to temp file and reload (workaround for ultralytics bug)
-            with tempfile.NamedTemporaryFile(suffix='.jpg', delete=False) as tmp:
-                tmp_path = tmp.name
-                pil_image.save(tmp_path)
-
-            try:
-                # Run inference on file path with specified confidence threshold
-                results = yolo(tmp_path, conf=confidence_threshold, verbose=False)
-            finally:
-                # Clean up temp file
-                os.unlink(tmp_path)
-
-            detections = []
-            for result in results:
-                boxes = result.boxes
-                for box in boxes:
-                    confidence = float(box.conf[0])
-                    if confidence < confidence_threshold:
-                        continue
-
-                    class_id = int(box.cls[0])
-                    class_name = result.names[class_id]
-
-                    # Get bounding box
-                    x1, y1, x2, y2 = box.xyxy[0].tolist()
-
-                    detections.append({
-                        "name": class_name,
-                        "confidence": confidence,
-                        "bbox": [x1, y1, x2, y2],
-                        "class_id": class_id,
-                    })
-
-            # Log detection results (INFO level for visibility)
-            self.logger.info(f"YOLO detected {len(detections)} objects with conf >= {confidence_threshold}")
-            for det in detections[:5]:
-                self.logger.info(f"  - {det['name']}: {det['confidence']:.2f}")
-
-            # Save debug image if no objects detected
-            if len(detections) == 0:
-                self.logger.warning("[YOLO DEBUG] No objects detected! Saving debug image...")
-                try:
-                    import cv2
-                    debug_path = "/tmp/yolo_debug.jpg"
-                    if isinstance(image, np.ndarray):
-                        # Ensure proper format for saving
-                        if image.dtype != np.uint8:
-                            if image.max() <= 1.0:
-                                image = (image * 255).astype(np.uint8)
-                            else:
-                                image = image.astype(np.uint8)
-                        cv2.imwrite(debug_path, cv2.cvtColor(image, cv2.COLOR_RGB2BGR))
-                        self.logger.warning(f"[YOLO DEBUG] Image saved to {debug_path}")
-                except Exception as e:
-                    self.logger.warning(f"[YOLO DEBUG] Failed to save debug image: {e}")
-
-            return detections
-
-        except TypeError as e:
-            # Handle numpy/ultralytics compatibility issue gracefully
-            # Return empty detections but log only once
-            if not hasattr(self, '_yolo_error_logged'):
-                self.logger.warning(f"YOLO numpy compatibility issue - object detection disabled: {e}")
-                self._yolo_error_logged = True
-            return []
-        except Exception as e:
-            self.logger.error(f"Object detection failed: {e}")
-            return []
 
     def estimate_distance(
         self,

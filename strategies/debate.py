@@ -1,4 +1,10 @@
-"""Debate strategy implementation."""
+"""Debate strategy implementation.
+
+This strategy collects opinions from all agents, synthesizes them,
+and generates consensus for action sequence generation.
+
+Phase 2: EvaluationAgent as Judge with dynamic weight calculation.
+"""
 
 from typing import Dict, Any, List, Optional
 import logging
@@ -11,22 +17,38 @@ from agents.base_agent import BaseAgent
 
 class DebateStrategy(BaseStrategy):
     """
-    Debate strategy: Multi-agent debate for decision making.
+    Debate strategy for difficult tasks.
 
-    Pattern: Proposal → Arguments → Counter-arguments → Resolution
+    Collects opinions from all agents (Perception, Trajectory, Instruction, Evaluation),
+    synthesizes them through LLM-based debate, and generates consensus.
 
-    This strategy enables robust decision-making through structured
-    debate between different perspectives (agents).
+    Pattern: Collect Opinions → EvaluationAgent Judge → Provide to DecisionAgent
+
+    EvaluationAgent acts as the judge:
+    1. Evaluates quality of other agents' opinions
+    2. Detects conflicts between opinions
+    3. Uses dynamic weights from PerformanceTracker
+    4. Provides final arbitration
     """
 
     def __init__(self, config: Dict[str, Any] = None):
         super().__init__(config)
-        self.logger = logging.getLogger("DebateStrategy")
 
         # Configuration
-        self.max_rounds = self.config.get("max_rounds", 3)
-        self.consensus_threshold = self.config.get("consensus_threshold", 0.7)
-        self.require_unanimous = self.config.get("require_unanimous", False)
+        self.weight_perception = self.config.get("weight_perception", 1.2)
+        self.weight_instruction = self.config.get("weight_instruction", 1.0)
+        self.weight_trajectory = self.config.get("weight_trajectory", 0.8)
+        self.weight_evaluation = self.config.get("weight_evaluation", 1.0)
+
+        # Performance tracker for dynamic weights
+        self._performance_tracker = None
+
+    def _get_performance_tracker(self):
+        """Get or create PerformanceTracker."""
+        if self._performance_tracker is None:
+            from agents.evaluation_agent import get_performance_tracker
+            self._performance_tracker = get_performance_tracker(self.config)
+        return self._performance_tracker
 
     @property
     def name(self) -> str:
@@ -43,7 +65,7 @@ class DebateStrategy(BaseStrategy):
         prev_result: Optional[StrategyResult] = None,
     ) -> StrategyResult:
         """
-        Execute Debate strategy.
+        Execute Debate strategy - collect opinions and synthesize.
 
         Args:
             context: Navigation context
@@ -51,264 +73,370 @@ class DebateStrategy(BaseStrategy):
             prev_result: Optional previous strategy result
 
         Returns:
-            StrategyResult with debated action
+            StrategyResult with opinions and consensus
         """
         self.initialize()
 
         steps = []
+        tracker = self._get_performance_tracker()
 
         try:
-            # Initial proposals from all agents
-            proposals = self._gather_proposals(context, agents)
-            steps.append({
-                "type": "initial_proposals",
-                "proposals": [p["action"] for p in proposals],
-            })
+            # Step 1: Collect opinions from Perception, Trajectory, Instruction agents
+            opinions = {}
+            evaluation_agent = None
 
-            # Run debate rounds
-            for round_num in range(self.max_rounds):
-                debate_round = self._run_debate_round(
-                    context, agents, proposals, round_num
-                )
-                steps.append({
-                    "type": "debate_round",
-                    "round": round_num + 1,
-                    "arguments": debate_round["arguments"],
-                    "updated_proposals": debate_round["proposals"],
-                })
+            for agent in agents:
+                if agent is None:
+                    continue
 
-                proposals = debate_round["proposals"]
+                agent_name = agent.name if hasattr(agent, 'name') else str(type(agent))
 
-                # Check for consensus
-                if self._check_consensus(proposals):
-                    steps.append({
-                        "type": "consensus",
-                        "round": round_num + 1,
-                    })
-                    break
+                # Separate EvaluationAgent for judge role
+                if "evaluation" in agent_name:
+                    evaluation_agent = agent
+                    continue
 
-            # Final resolution
-            action, confidence, reasoning = self._resolve_debate(proposals, steps)
-            steps.append({
-                "type": "resolution",
-                "action": action.to_habitat_action(),
-                "confidence": confidence,
-                "reasoning": reasoning,
-            })
+                # Try to get debate opinion from agent
+                if hasattr(agent, 'build_debate_opinion'):
+                    try:
+                        opinion = agent.build_debate_opinion(context)
+                        opinions[agent_name] = opinion
+                        steps.append({"type": "opinion", "agent": agent_name, "data": opinion})
+                    except Exception as e:
+                        self.logger.warning(f"[Debate] Failed to get opinion from {agent_name}: {e}")
+                else:
+                    # Fallback: collect info from context
+                    info = self._collect_agent_info(context, agent_name)
+                    if info:
+                        opinions[agent_name] = info
+                        steps.append({"type": "info", "agent": agent_name, "data": info})
+
+            # Store opinions in context for EvaluationAgent
+            context.metadata["debate_opinions"] = opinions
+
+            # Step 2: EvaluationAgent as judge - evaluates and arbitrates
+            if evaluation_agent and opinions:
+                try:
+                    eval_opinion = evaluation_agent.build_debate_opinion(
+                        context,
+                        opinions=opinions,
+                        performance_tracker=tracker
+                    )
+                    opinions["evaluation_agent"] = eval_opinion
+                    steps.append({"type": "judge", "agent": "evaluation_agent", "data": eval_opinion})
+                    self.logger.info(f"[Debate] Evaluation judge: {eval_opinion.primary_action} (conf={eval_opinion.confidence:.2f})")
+                except Exception as e:
+                    self.logger.warning(f"[Debate] EvaluationAgent judge failed: {e}")
+
+            # Step 3: Synthesize opinions (now includes evaluation judgment)
+            consensus = self._synthesize_opinions(context, opinions)
+            steps.append({"type": "consensus", "data": consensus})
+
+            # Step 4: Record opinion outcomes for performance tracking
+            self._record_opinion_outcomes(context, opinions, consensus, tracker)
 
             return StrategyResult(
                 success=True,
-                action=action,
-                reasoning=reasoning,
+                action=None,  # No single action - will be used for sequence generation
+                reasoning=consensus.get("reasoning", ""),
                 steps=steps,
-                confidence=confidence,
+                confidence=consensus.get("confidence", 0.7),
+                metadata={
+                    "opinions": opinions,
+                    "consensus": consensus,
+                    "weights": tracker.get_summary() if tracker else {},
+                },
             )
 
         except Exception as e:
-            self.logger.error(f"Debate execution error: {e}")
+            self.logger.error(f"[Debate] Execution error: {e}")
             return StrategyResult(
                 success=False,
                 reasoning=f"Debate failed: {str(e)}",
                 steps=steps,
             )
 
-    def _gather_proposals(
-        self, context: NavContext, agents: List[BaseAgent]
-    ) -> List[Dict[str, Any]]:
-        """Gather initial action proposals from all agents."""
-        proposals = []
-
-        for agent in agents:
-            try:
-                output = agent.process(context)
-                if output.success:
-                    action_str = output.data.get("action", "forward")
-                    proposals.append({
-                        "agent": agent.name,
-                        "action": action_str,
-                        "confidence": output.confidence,
-                        "reasoning": output.reasoning,
-                    })
-            except Exception as e:
-                self.logger.warning(f"Agent {agent.name} failed to propose: {e}")
-
-        if not proposals:
-            # Default proposal if all agents fail
-            proposals.append({
-                "agent": "default",
-                "action": "forward",
+    def _collect_agent_info(self, context: NavContext, agent_name: str) -> Optional[Dict[str, Any]]:
+        """Collect info from context for agents without build_debate_opinion method."""
+        if "perception" in agent_name:
+            return {
+                "agent": "perception",
+                "primary_action": "unknown",
                 "confidence": 0.5,
-                "reasoning": "Default action due to no proposals",
-            })
+                "evidence": context.metadata.get("perception_output", {}),
+                "reasoning": "感知信息",
+            }
+        elif "trajectory" in agent_name:
+            return {
+                "agent": "trajectory",
+                "primary_action": "unknown",
+                "confidence": 0.5,
+                "evidence": context.metadata.get("trajectory_output", {}),
+                "reasoning": "轨迹信息",
+            }
+        elif "instruction" in agent_name:
+            return {
+                "agent": "instruction",
+                "primary_action": "unknown",
+                "confidence": 0.5,
+                "evidence": context.metadata.get("instruction_output", {}),
+                "reasoning": "指令信息",
+            }
+        elif "evaluation" in agent_name:
+            return {
+                "agent": "evaluation",
+                "primary_action": "unknown",
+                "confidence": 0.5,
+                "evidence": context.metadata.get("evaluation_output", {}),
+                "reasoning": "评估信息",
+            }
+        return None
 
-        return proposals
+    def _synthesize_opinions(self, context: NavContext, opinions: Dict[str, Any]) -> Dict[str, Any]:
+        """
+        Use LLM to synthesize opinions and generate consensus.
 
-    def _run_debate_round(
+        If evaluation_agent provided a judgment, it takes priority
+        as the judge's decision.
+
+        Returns:
+            Dict with consensus reasoning and confidence
+        """
+        # Check if evaluation agent provided a judgment
+        eval_opinion = opinions.get("evaluation_agent")
+        if eval_opinion:
+            # Extract judgment from evaluation
+            if hasattr(eval_opinion, 'primary_action'):
+                action = eval_opinion.primary_action
+                confidence = eval_opinion.confidence
+                reasoning = eval_opinion.reasoning
+                evidence = getattr(eval_opinion, 'evidence', {})
+            elif isinstance(eval_opinion, dict):
+                action = eval_opinion.get("primary_action", "")
+                confidence = eval_opinion.get("confidence", 0.5)
+                reasoning = eval_opinion.get("reasoning", "")
+                evidence = eval_opinion.get("evidence", {})
+            else:
+                action = ""
+                confidence = 0.5
+                reasoning = ""
+                evidence = {}
+
+            # If evaluation has high confidence, use it directly
+            if confidence >= 0.7 and action:
+                return {
+                    "analysis": f"裁判决策: {reasoning[:100]}",
+                    "conflicts": evidence.get("conflicts", []),
+                    "resolution": "使用评估Agent仲裁结果",
+                    "recommended_focus": action,
+                    "reasoning": reasoning[:100],
+                    "confidence": confidence,
+                    "from_judge": True,
+                }
+
+        # Fall back to LLM synthesis for lower confidence cases
+        prompt = self._build_synthesis_prompt(context, opinions)
+
+        # Call LLM
+        response = self._call_llm(
+            prompt,
+            max_tokens=500,
+            temperature=0.2
+        )
+
+        # Parse response
+        consensus = self._parse_synthesis_response(response)
+
+        return consensus
+
+    def _build_synthesis_prompt(
         self,
         context: NavContext,
-        agents: List[BaseAgent],
-        proposals: List[Dict],
-        round_num: int,
-    ) -> Dict[str, Any]:
-        """Run a single debate round."""
-        arguments = []
-
-        # Each agent can argue for their proposal
-        for proposal in proposals:
-            argument = self._generate_argument(
-                context, proposal, proposals, round_num
-            )
-            arguments.append({
-                "agent": proposal["agent"],
-                "argument": argument,
-                "action": proposal["action"],
-            })
-
-        # Update proposals based on arguments
-        updated_proposals = self._update_proposals(proposals, arguments)
-
-        return {
-            "arguments": arguments,
-            "proposals": updated_proposals,
-        }
-
-    def _generate_argument(
-        self,
-        context: NavContext,
-        proposal: Dict,
-        all_proposals: List[Dict],
-        round_num: int,
+        opinions: Dict[str, Any],
     ) -> str:
-        """Generate argument for a proposal."""
-        action = proposal["action"]
-        agent = proposal["agent"]
-        reasoning = proposal.get("reasoning", "")
+        """Build the synthesis prompt for LLM."""
+        current_subtask = context.get_current_subtask()
+        subtask_desc = current_subtask.description if current_subtask else "无"
 
-        # Base argument
-        argument = f"{agent} argues for '{action}' because: {reasoning}"
+        # Format opinions
+        opinions_str = ""
+        for agent_name, opinion in opinions.items():
+            # Handle DebateOpinion objects
+            if hasattr(opinion, 'primary_action'):
+                action = opinion.primary_action
+                confidence = opinion.confidence
+                reasoning = opinion.reasoning[:100] if opinion.reasoning else ""
+            # Handle dict opinions
+            elif isinstance(opinion, dict):
+                reasoning = opinion.get("reasoning", "")[:100]
+                action = opinion.get("primary_action", "unknown")
+                confidence = opinion.get("confidence", 0.5)
+            else:
+                continue
 
-        # Add context-aware argumentation
-        instruction_lower = context.instruction.lower()
+            opinions_str += f"\n### {agent_name}\n"
+            opinions_str += f"- 推荐动作: {action}\n"
+            opinions_str += f"- 置信度: {confidence:.2f}\n"
+            opinions_str += f"- 理由: {reasoning}\n"
 
-        if action == "turn_left" and "left" in instruction_lower:
-            argument += " This aligns with the instruction to turn left."
-        elif action == "turn_right" and "right" in instruction_lower:
-            argument += " This aligns with the instruction to turn right."
-        elif action == "forward":
-            argument += " Forward movement is safe and progresses toward goal."
-        elif action == "stop":
-            argument += " Current position may satisfy the goal condition."
+        prompt = f"""你是一个导航辩论综合专家。请分析各Agent的意见，综合得出最佳导航策略。
 
-        # Consider other proposals
-        opposing = [p for p in all_proposals if p["action"] != action]
-        if opposing and round_num > 0:
-            argument += f" However, {len(opposing)} agent(s) suggest alternatives."
+## 导航指令
+{context.instruction}
 
-        return argument
+## 当前子任务
+{subtask_desc}
 
-    def _update_proposals(
-        self, proposals: List[Dict], arguments: List[Dict]
-    ) -> List[Dict]:
-        """Update proposals based on arguments."""
-        updated = []
+## Agent意见
+{opinions_str}
 
-        for proposal in proposals:
-            # Find matching argument
-            arg = next(
-                (a for a in arguments if a["agent"] == proposal["agent"]),
-                None
+## 当前状态
+- 步数: {context.step_count}
+- 位置: ({context.position[0]:.1f}, {context.position[1]:.1f}, {context.position[2]:.1f})
+- 房间: {context.room_type}
+
+## 分析要求
+1. 分析各Agent意见的一致性和冲突点
+2. 权衡不同意见的重要性
+3. 解决冲突，给出综合建议
+4. 明确下一步导航重点
+
+## 输出格式
+请严格按照以下JSON格式输出:
+```json
+{{
+  "analysis": "各意见的综合分析...",
+  "conflicts": ["冲突点1", "冲突点2"],
+  "resolution": "冲突解决方案...",
+  "recommended_focus": "导航重点（20字以内）",
+  "reasoning": "综合理由（50字以内）",
+  "confidence": 0.0-1.0
+}}
+```
+
+直接输出JSON："""
+
+        return prompt
+
+    def _parse_synthesis_response(self, response: str) -> Dict[str, Any]:
+        """Parse LLM synthesis response."""
+        import json
+        import re
+
+        # Default result
+        result = {
+            "analysis": "",
+            "conflicts": [],
+            "resolution": "",
+            "recommended_focus": "继续导航",
+            "reasoning": "综合各Agent意见",
+            "confidence": 0.6,
+        }
+
+        try:
+            # Try to extract JSON from response
+            json_match = re.search(r'\{[\s\S]*\}', response)
+            if json_match:
+                json_str = json_match.group(0)
+                data = json.loads(json_str)
+
+                result["analysis"] = data.get("analysis", "")
+                result["conflicts"] = data.get("conflicts", [])
+                result["resolution"] = data.get("resolution", "")
+                result["recommended_focus"] = data.get("recommended_focus", "继续导航")
+                result["reasoning"] = data.get("reasoning", "")
+                result["confidence"] = float(data.get("confidence", 0.6))
+
+                # Clamp confidence
+                result["confidence"] = max(0.0, min(1.0, result["confidence"]))
+
+        except (json.JSONDecodeError, ValueError) as e:
+            self.logger.warning(f"[Debate] Failed to parse JSON response: {e}")
+            result["reasoning"] = response[:200]
+
+        return result
+
+    def _record_opinion_outcomes(
+        self,
+        context: NavContext,
+        opinions: Dict[str, Any],
+        consensus: Dict[str, Any],
+        tracker: 'PerformanceTracker'
+    ) -> None:
+        """
+        Record opinion outcomes for performance tracking.
+
+        This is called after consensus is reached to update
+        the performance tracker with whether each agent's opinion
+        was correct (aligned with final decision).
+
+        Args:
+            context: Navigation context
+            opinions: All agent opinions
+            consensus: Final consensus result
+            tracker: PerformanceTracker instance
+        """
+        if not tracker or not opinions:
+            return
+
+        # Get the recommended action from evaluation or consensus
+        eval_opinion = opinions.get("evaluation_agent", {})
+        if hasattr(eval_opinion, 'primary_action'):
+            final_action = eval_opinion.primary_action
+        elif isinstance(eval_opinion, dict):
+            final_action = eval_opinion.get("primary_action", "")
+        else:
+            final_action = ""
+
+        if not final_action:
+            final_action = consensus.get("recommended_focus", "")
+
+        # Normalize action name (use "forward" for consistency)
+        action_map = {
+            "move_forward": "forward",
+            "left": "turn_left",
+            "right": "turn_right",
+        }
+        final_action = action_map.get(final_action, final_action)
+
+        # Record each agent's opinion outcome
+        for agent_name, opinion in opinions.items():
+            if agent_name == "evaluation_agent":
+                continue  # Don't record judge's opinion
+
+            # Handle DebateOpinion objects
+            if hasattr(opinion, 'primary_action'):
+                predicted_action = opinion.primary_action
+                evidence = getattr(opinion, 'evidence', {})
+            elif isinstance(opinion, dict):
+                predicted_action = opinion.get("primary_action", "")
+                evidence = opinion.get("evidence", {})
+            else:
+                continue
+
+            predicted_action = action_map.get(predicted_action, predicted_action)
+
+            # Check if opinion aligned with final decision
+            was_correct = predicted_action == final_action
+
+            # Check if it was a critical contribution (e.g., obstacle detected)
+            was_critical = False
+            if isinstance(evidence, dict):
+                # Critical if detected obstacle or key landmark
+                if evidence.get("obstacle_ahead") or evidence.get("landmarks"):
+                    was_critical = True
+
+            # Record to tracker
+            tracker.record_opinion(
+                agent_name=agent_name,
+                was_correct=was_correct,
+                was_critical=was_critical
             )
 
-            updated_proposal = proposal.copy()
+        # Save tracker state periodically
+        tracker.save()
 
-            # Adjust confidence based on argument strength
-            if arg:
-                # Simple heuristic: if argument mentions alignment, boost confidence
-                if "aligns with" in arg["argument"]:
-                    updated_proposal["confidence"] = min(
-                        proposal["confidence"] + 0.1, 1.0
-                    )
-                elif "However" in arg["argument"]:
-                    updated_proposal["confidence"] = max(
-                        proposal["confidence"] - 0.1, 0.3
-                    )
-
-            updated.append(updated_proposal)
-
-        return updated
-
-    def _check_consensus(self, proposals: List[Dict]) -> bool:
-        """Check if proposals have reached consensus."""
-        if not proposals:
-            return False
-
-        # Count action votes
-        action_counts: Dict[str, float] = {}
-        for proposal in proposals:
-            action = proposal["action"]
-            conf = proposal["confidence"]
-            action_counts[action] = action_counts.get(action, 0) + conf
-
-        # Find most voted action
-        if action_counts:
-            max_votes = max(action_counts.values())
-            total_votes = sum(action_counts.values())
-
-            if self.require_unanimous:
-                return len(action_counts) == 1
-
-            return max_votes / total_votes >= self.consensus_threshold
-
-        return False
-
-    def _resolve_debate(
-        self, proposals: List[Dict], steps: List[Dict]
-    ) -> tuple:
-        """Resolve debate and select final action."""
-        if not proposals:
-            return Action.forward(), 0.5, "No proposals to resolve"
-
-        # Weight actions by confidence
-        action_weights: Dict[str, float] = {}
-        action_reasons: Dict[str, List[str]] = {}
-
-        for proposal in proposals:
-            action = proposal["action"]
-            weight = proposal["confidence"]
-
-            # Agent weight based on role importance
-            agent = proposal["agent"]
-            if "decision" in agent:
-                weight *= 1.5  # Decision agent has more weight
-            elif "perception" in agent:
-                weight *= 1.2
-
-            action_weights[action] = action_weights.get(action, 0) + weight
-
-            if action not in action_reasons:
-                action_reasons[action] = []
-            action_reasons[action].append(proposal.get("reasoning", ""))
-
-        # Select action with highest weight
-        best_action = max(action_weights.keys(), key=lambda a: action_weights[a])
-        confidence = action_weights[best_action] / sum(action_weights.values())
-        reasons = action_reasons.get(best_action, [])
-
-        # Create action and reasoning
-        action = self._action_from_string(best_action)
-        reasoning = f"Debate resolved: {best_action} (confidence: {confidence:.2f})"
-        if reasons:
-            reasoning += f". Key reason: {reasons[0]}"
-
-        return action, confidence, reasoning
-
-    def _action_from_string(self, action_str: str) -> Action:
-        """Convert action string to Action object."""
-        action_map = {
-            "stop": Action.stop(),
-            "move_forward": Action.forward(),
-            "forward": Action.forward(),
-            "turn_left": Action.turn_left(),
-            "turn_right": Action.turn_right(),
-        }
-        return action_map.get(action_str.lower(), Action.forward())
+    def reset_episode(self) -> None:
+        """Reset episode statistics for new episode."""
+        if self._performance_tracker:
+            self._performance_tracker.reset_episode()

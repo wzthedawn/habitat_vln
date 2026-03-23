@@ -87,9 +87,9 @@ class EvaluationAgent(BaseAgent):
             else:
                 self._model_manager.load_all_models()
 
-                # Load Qwen3.5-4B for evaluation (shares with DecisionAgent)
+                # Load Qwen3.5-4B for evaluation (uses dedicated model config)
                 self.logger.info("Loading Qwen3.5-4B for evaluation...")
-                if self._model_manager.load_llm("qwen-4b"):
+                if self._model_manager.load_llm("qwen-4b-evaluation"):
                     self.logger.info("Qwen3.5-4B loaded successfully for evaluation")
                 else:
                     self.logger.warning("Failed to load Qwen3.5-4B, using fallback evaluation")
@@ -157,14 +157,25 @@ class EvaluationAgent(BaseAgent):
                 "vertical_nav_ok": vertical_nav_ok,  # NEW
             }
             context.metadata["last_evaluation_score"] = score
+            self.logger.info(f"[Evaluation] 评分:{score:.2f}, 反馈:{feedback[:30]}...")
 
             return AgentOutput.success_output(
                 data={
+                    "evaluation": {
+                        "score": score,
+                        "feedback": feedback,
+                        "score_level": self._get_score_level(score),
+                    },
+                    "recommendation": {
+                        "action": suggestions[0] if suggestions else "continue",
+                        "replan_needed": replan_needed,
+                        "vertical_nav_ok": vertical_nav_ok,
+                    },
                     "score": score,
                     "feedback": feedback,
                     "suggestions": suggestions,
                     "replan_needed": replan_needed,
-                    "vertical_nav_ok": vertical_nav_ok,  # NEW
+                    "vertical_nav_ok": vertical_nav_ok,
                     "score_level": self._get_score_level(score),
                     "recent_avg_score": sum(self._recent_scores[-5:]) / max(len(self._recent_scores[-5:]), 1),
                 },
@@ -173,7 +184,7 @@ class EvaluationAgent(BaseAgent):
             )
 
         except Exception as e:
-            self.logger.error(f"Evaluation error: {e}")
+            self.logger.error(f"[Evaluation] 错误: {e}")
             return AgentOutput.failure_output([str(e)], "Evaluation failed")
 
     def _evaluate_decision(
@@ -204,7 +215,7 @@ class EvaluationAgent(BaseAgent):
                 return self._fallback_evaluation(context, decision)
 
         except Exception as e:
-            self.logger.warning(f"LLM evaluation failed: {e}")
+            self.logger.warning(f"[Evaluation] LLM失败: {e}")
             return self._fallback_evaluation(context, decision)
 
     def _build_evaluation_prompt(
@@ -336,8 +347,8 @@ class EvaluationAgent(BaseAgent):
     def _parse_evaluation_response(self, response: str) -> Dict[str, Any]:
         """Parse evaluation from LLM response."""
         try:
-            # Find JSON in response - use a more robust regex for multiline JSON
-            json_match = re.search(r'\{[^{}]*\}', response, re.DOTALL)
+            # Find JSON in response - support nested objects up to 2 levels
+            json_match = re.search(r'\{(?:[^{}]|\{[^{}]*\})*\}', response, re.DOTALL)
             if json_match:
                 evaluation = json.loads(json_match.group())
                 return {
@@ -347,7 +358,7 @@ class EvaluationAgent(BaseAgent):
                     "suggestions": evaluation.get("suggestions", []),
                 }
         except (json.JSONDecodeError, ValueError) as e:
-            self.logger.warning(f"Failed to parse JSON: {e}")
+            self.logger.warning(f"[Evaluation] JSON解析失败: {e}")
 
         # Fallback: extract score from text
         score_match = re.search(r'(\d+\.?\d*)', response)
@@ -427,24 +438,27 @@ class EvaluationAgent(BaseAgent):
 
     def _check_replan_needed(self) -> bool:
         """Check if re-planning is needed based on scores."""
-        if len(self._recent_scores) < self.replan_consecutive_low:
-            return False
-
-        # Check for consecutive low scores
-        recent = self._recent_scores[-self.replan_consecutive_low:]
-        if all(score < self.low_score_threshold for score in recent):
-            self.logger.warning(f"Re-planning triggered: {self.replan_consecutive_low} consecutive low scores")
-            return True
-
-        # Check for total low scores
-        if len(self._recent_scores) >= self.replan_total_low:
-            low_count = sum(1 for score in self._recent_scores[-self.replan_total_low:]
-                          if score < self.medium_score_threshold)
-            if low_count >= self.replan_total_low:
-                self.logger.warning(f"Re-planning triggered: {low_count} low scores in {self.replan_total_low} steps")
-                return True
-
+        # 禁用重新规划功能
         return False
+
+        # if len(self._recent_scores) < self.replan_consecutive_low:
+        #     return False
+
+        # # Check for consecutive low scores
+        # recent = self._recent_scores[-self.replan_consecutive_low:]
+        # if all(score < self.low_score_threshold for score in recent):
+        #     self.logger.warning(f"Re-planning triggered: {self.replan_consecutive_low} consecutive low scores")
+        #     return True
+
+        # # Check for total low scores
+        # if len(self._recent_scores) >= self.replan_total_low:
+        #     low_count = sum(1 for score in self._recent_scores[-self.replan_total_low:]
+        #                   if score < self.medium_score_threshold)
+        #     if low_count >= self.replan_total_low:
+        #         self.logger.warning(f"Re-planning triggered: {low_count} low scores in {self.replan_total_low} steps")
+        #         return True
+
+        # return False
 
     def _get_score_level(self, score: float) -> str:
         """Get score level description."""
@@ -627,3 +641,677 @@ class EvaluationAgent(BaseAgent):
         """Reset evaluation history."""
         self._evaluation_history.clear()
         self._recent_scores.clear()
+
+    # ========== Debate Judge Role ==========
+
+    def build_debate_opinion(
+        self,
+        context: NavContext,
+        opinions: Dict[str, Any] = None,
+        performance_tracker: 'PerformanceTracker' = None
+    ) -> 'DebateOpinion':
+        """
+        Build evaluation opinion for debate strategy.
+
+        As the judge, this method:
+        1. Evaluates quality of other agents' opinions
+        2. Detects conflicts between opinions
+        3. Provides final arbitration
+
+        Args:
+            context: Navigation context
+            opinions: Dict of agent_name -> DebateOpinion from other agents
+            performance_tracker: Tracker for dynamic weights
+
+        Returns:
+            DebateOpinion with evaluation results
+        """
+        from core.debate_types import DebateOpinion, ActionConstraint
+
+        # Initialize performance tracker if not provided
+        if performance_tracker is None:
+            performance_tracker = get_performance_tracker(self.config)
+
+        # Get current agent opinions from context metadata if not provided
+        if opinions is None:
+            opinions = context.metadata.get("debate_opinions", {})
+
+        # Calculate dynamic weights based on historical performance
+        weights = self._calculate_debate_weights(performance_tracker)
+
+        # Evaluate each opinion
+        opinion_scores = {}
+        conflicts = []
+
+        for agent_name, opinion in opinions.items():
+            # Handle both DebateOpinion objects and dicts
+            if hasattr(opinion, 'primary_action') or isinstance(opinion, dict):
+                score = self._evaluate_opinion_quality(context, agent_name, opinion)
+                opinion_scores[agent_name] = score
+
+        # Detect conflicts between opinions
+        conflicts = self._detect_opinion_conflicts(opinions)
+
+        # Generate arbitration result
+        arbitration = self._arbitrate_opinions(context, opinions, weights, opinion_scores, conflicts)
+
+        # Build constraints based on evaluation
+        constraints = {"hard": [], "soft": []}
+
+        # Add hard constraints for blocked actions
+        if arbitration.get("blocked_actions"):
+            for action in arbitration["blocked_actions"]:
+                constraints["hard"].append(ActionConstraint(
+                    action=action,
+                    blocked=True,
+                    reason="评估结果禁止"
+                ))
+
+        # Add soft constraints for weight adjustments
+        if arbitration.get("weight_adjustments"):
+            for action, multiplier in arbitration["weight_adjustments"].items():
+                constraints["soft"].append(ActionConstraint(
+                    action=action,
+                    weight_multiplier=multiplier,
+                    reason="评估权重调整"
+                ))
+
+        # Store evaluation result in context
+        context.metadata["evaluation_output"] = {
+            "weights": weights,
+            "opinion_scores": opinion_scores,
+            "conflicts": conflicts,
+            "arbitration": arbitration,
+        }
+
+        return DebateOpinion(
+            agent="evaluation",
+            primary_action=arbitration.get("recommended_action", "move_forward"),
+            confidence=arbitration.get("confidence", 0.5),
+            evidence={
+                "opinion_scores": opinion_scores,
+                "weights": weights,
+                "conflicts": conflicts,
+            },
+            reasoning=arbitration.get("reasoning", "评估完成"),
+            constraints=constraints,
+        )
+
+    def _calculate_debate_weights(self, tracker: 'PerformanceTracker') -> Dict[str, float]:
+        """Calculate weights for each agent based on performance."""
+        return {
+            "perception": tracker.get_accuracy("perception_agent"),
+            "trajectory": tracker.get_accuracy("trajectory_agent"),
+            "instruction": tracker.get_accuracy("instruction_agent"),
+        }
+
+    def _evaluate_opinion_quality(
+        self,
+        context: NavContext,
+        agent_name: str,
+        opinion: Dict[str, Any]
+    ) -> float:
+        """Evaluate quality of a single opinion."""
+        score = 0.5
+
+        # Handle DebateOpinion objects
+        if hasattr(opinion, 'reasoning'):
+            reasoning = opinion.reasoning or ""
+            confidence = opinion.confidence
+            evidence = opinion.evidence if hasattr(opinion, 'evidence') else {}
+        elif isinstance(opinion, dict):
+            reasoning = opinion.get("reasoning", "")
+            confidence = opinion.get("confidence", 0.5)
+            evidence = opinion.get("evidence", {})
+        else:
+            return score
+
+        # Check if opinion has good reasoning
+        if len(reasoning) > 50:
+            score += 0.1
+
+        # Check confidence alignment with evidence
+        confidence = confidence if isinstance(confidence, (int, float)) else 0.5
+
+        # Perception opinion quality
+        if "perception" in agent_name:
+            # Check for detected objects/obstacles or landmarks
+            if evidence.get("objects") or evidence.get("obstacles") or evidence.get("obstacle_ahead"):
+                score += 0.2
+            if evidence.get("landmarks"):
+                score += 0.1
+            if evidence.get("nav_hint"):
+                score += 0.1
+
+        # Trajectory opinion quality
+        elif "trajectory" in agent_name:
+            if evidence.get("distance_traveled", 0) > 1.0:
+                score += 0.1
+            if evidence.get("corrections"):
+                score -= 0.1
+
+        # Instruction opinion quality
+        elif "instruction" in agent_name:
+            if evidence.get("subtasks"):
+                score += 0.1
+            if evidence.get("current_subtask"):
+                score += 0.1
+
+        return min(1.0, max(0.0, score))
+
+    def _detect_opinion_conflicts(self, opinions: Dict[str, Any]) -> List[Dict[str, Any]]:
+        """Detect conflicts between agent opinions."""
+        conflicts = []
+
+        if not opinions:
+            return conflicts
+
+        # Action name normalization
+        action_normalize = {
+            "move_forward": "forward",
+            "left": "turn_left",
+            "right": "turn_right",
+        }
+
+        # Extract recommended actions
+        actions = {}
+        for agent_name, opinion in opinions.items():
+            # Handle DebateOpinion objects
+            if hasattr(opinion, 'primary_action'):
+                action = opinion.primary_action
+            elif isinstance(opinion, dict):
+                action = opinion.get("primary_action", "unknown")
+            else:
+                action = "unknown"
+            # Normalize
+            action = action_normalize.get(action, action)
+            actions[agent_name] = action
+
+        # Check for opposing recommendations
+        action_set = set(actions.values())
+
+        # Forward vs Stop conflict
+        if "forward" in action_set and "stop" in action_set:
+            conflicts.append({
+                "type": "action_conflict",
+                "agents": [k for k, v in actions.items() if v in ["forward", "stop"]],
+                "description": "前进与停止建议冲突",
+            })
+
+        # Turn left vs Turn right conflict
+        if "turn_left" in action_set and "turn_right" in action_set:
+            conflicts.append({
+                "type": "direction_conflict",
+                "agents": [k for k, v in actions.items() if v in ["turn_left", "turn_right"]],
+                "description": "左右转向建议冲突",
+            })
+
+        return conflicts
+
+    def _arbitrate_opinions(
+        self,
+        context: NavContext,
+        opinions: Dict[str, Any],
+        weights: Dict[str, float],
+        opinion_scores: Dict[str, float],
+        conflicts: List[Dict[str, Any]]
+    ) -> Dict[str, Any]:
+        """Arbitrate between conflicting opinions and generate final recommendation."""
+
+        # Score each action (use "forward" for consistency)
+        action_scores = {
+            "forward": 0.0,
+            "turn_left": 0.0,
+            "turn_right": 0.0,
+            "stop": 0.0,
+        }
+
+        # Action name normalization
+        action_normalize = {
+            "move_forward": "forward",
+            "left": "turn_left",
+            "right": "turn_right",
+        }
+
+        for agent_name, opinion in opinions.items():
+            # Handle DebateOpinion objects
+            if hasattr(opinion, 'primary_action'):
+                action = opinion.primary_action
+                confidence = opinion.confidence
+                weight = weights.get(agent_name.replace("_agent", ""), 0.5)
+                quality = opinion_scores.get(agent_name, 0.5)
+            # Handle dict opinions
+            elif isinstance(opinion, dict):
+                action = opinion.get("primary_action", "forward")
+                confidence = opinion.get("confidence", 0.5)
+                weight = weights.get(agent_name.replace("_agent", ""), 0.5)
+                quality = opinion_scores.get(agent_name, 0.5)
+            else:
+                continue
+
+            # Normalize action name
+            action = action_normalize.get(action, action)
+
+            if action in action_scores:
+                action_scores[action] += confidence * weight * quality
+
+        # Find best action
+        best_action = max(action_scores, key=action_scores.get)
+        total_score = sum(action_scores.values())
+        confidence = action_scores[best_action] / total_score if total_score > 0 else 0.5
+
+        # Determine blocked actions (low score actions)
+        blocked_actions = []
+        for action, score in action_scores.items():
+            if score == 0.0 and action != best_action:
+                blocked_actions.append(action)
+
+        # Generate reasoning
+        conflict_str = ""
+        if conflicts:
+            conflict_str = f"，解决{len(conflicts)}个冲突"
+
+        reasoning = f"综合{len(opinions)}个意见{conflict_str}，推荐{best_action}"
+
+        return {
+            "recommended_action": best_action,
+            "confidence": confidence,
+            "reasoning": reasoning,
+            "action_scores": action_scores,
+            "blocked_actions": blocked_actions,
+            "weight_adjustments": {},
+        }
+
+
+# ============================================================================
+# Phase 2: Performance Tracking and Dynamic Scoring for Debate Strategy
+# ============================================================================
+
+import os
+from dataclasses import dataclass, asdict
+from typing import Dict as TypingDict
+
+
+@dataclass
+class AgentPerformance:
+    """Historical performance record for an agent.
+
+    Tracks both persistent (cross-episode) and current episode statistics.
+    """
+    agent_name: str
+
+    # Persistent storage (cross-episode)
+    total_opinions: int = 0
+    correct_predictions: int = 0        # Predicted action succeeded
+    critical_contributions: int = 0     # Key contributions (e.g., obstacle detection)
+
+    # Current episode
+    episode_opinions: int = 0
+    episode_correct: int = 0
+    episode_critical: int = 0
+
+    def get_accuracy(
+        self,
+        use_persistent: bool = True,
+        use_episode: bool = True,
+        persistent_weight: float = 0.7
+    ) -> float:
+        """Calculate composite accuracy score.
+
+        Args:
+            use_persistent: Include persistent history
+            use_episode: Include current episode
+            persistent_weight: Weight for persistent vs episode in hybrid mode
+
+        Returns:
+            Accuracy score between 0.0 and 1.0
+        """
+        scores = []
+
+        if use_persistent and self.total_opinions > 0:
+            persistent_acc = self.correct_predictions / self.total_opinions
+            scores.append((persistent_acc, persistent_weight))
+
+        if use_episode and self.episode_opinions > 0:
+            episode_acc = self.episode_correct / self.episode_opinions
+            scores.append((episode_acc, 1.0 - persistent_weight))
+
+        if not scores:
+            return 0.5  # Default value
+
+        total_weight = sum(w for _, w in scores)
+        return sum(s * w for s, w in scores) / total_weight
+
+    def to_dict(self) -> TypingDict[str, Any]:
+        """Convert to dictionary for serialization."""
+        return {
+            "agent_name": self.agent_name,
+            "total_opinions": self.total_opinions,
+            "correct_predictions": self.correct_predictions,
+            "critical_contributions": self.critical_contributions,
+            "episode_opinions": self.episode_opinions,
+            "episode_correct": self.episode_correct,
+            "episode_critical": self.episode_critical,
+        }
+
+
+class PerformanceTracker:
+    """Tracks historical performance of agents for dynamic weight calculation.
+
+    Supports three modes:
+    - persistent: Use only cross-episode history
+    - episode: Use only current episode history
+    - hybrid: Combine both with configurable weights
+    """
+
+    def __init__(self, config: Dict[str, Any] = None):
+        """Initialize the performance tracker.
+
+        Args:
+            config: Configuration dictionary with:
+                - weight_mode: "persistent", "episode", or "hybrid"
+                - persistent_weight: Weight for persistent history in hybrid mode
+                - performance_file: Path to save performance data
+        """
+        self.config = config or {}
+        self.logger = logging.getLogger("PerformanceTracker")
+
+        self.weight_mode = self.config.get("weight_mode", "hybrid")
+        self.persistent_weight = self.config.get("persistent_weight", 0.7)
+        self.performance_file = self.config.get("performance_file", "data/agent_performance.json")
+        self.agents: TypingDict[str, AgentPerformance] = {}
+
+    def load(self) -> None:
+        """Load historical performance from file."""
+        if os.path.exists(self.performance_file):
+            try:
+                with open(self.performance_file, 'r') as f:
+                    data = json.load(f)
+                for name, perf in data.items():
+                    self.agents[name] = AgentPerformance(
+                        agent_name=name,
+                        total_opinions=perf.get("total_opinions", 0),
+                        correct_predictions=perf.get("correct_predictions", 0),
+                        critical_contributions=perf.get("critical_contributions", 0),
+                        episode_opinions=0,  # Reset episode stats on load
+                        episode_correct=0,
+                        episode_critical=0,
+                    )
+                self.logger.info(f"[Evaluation] 加载性能数据: {len(self.agents)}个agent")
+            except Exception as e:
+                self.logger.warning(f"[Evaluation] 加载失败: {e}")
+
+    def save(self) -> None:
+        """Save historical performance to file."""
+        try:
+            os.makedirs(os.path.dirname(self.performance_file), exist_ok=True)
+            with open(self.performance_file, 'w') as f:
+                json.dump(
+                    {name: perf.to_dict() for name, perf in self.agents.items()},
+                    f, indent=2
+                )
+            self.logger.debug(f"Saved performance data to {self.performance_file}")
+        except Exception as e:
+            self.logger.warning(f"[Evaluation] 保存失败: {e}")
+
+    def record_opinion(
+        self,
+        agent_name: str,
+        was_correct: bool,
+        was_critical: bool = False
+    ) -> None:
+        """Record the outcome of an agent's opinion.
+
+        Args:
+            agent_name: Name of the agent
+            was_correct: Whether the predicted action succeeded
+            was_critical: Whether this was a critical contribution (e.g., obstacle detection)
+        """
+        if agent_name not in self.agents:
+            self.agents[agent_name] = AgentPerformance(agent_name=agent_name)
+
+        perf = self.agents[agent_name]
+        perf.total_opinions += 1
+        perf.episode_opinions += 1
+
+        if was_correct:
+            perf.correct_predictions += 1
+            perf.episode_correct += 1
+
+        if was_critical:
+            perf.critical_contributions += 1
+            perf.episode_critical += 1
+
+    def get_performance(self, agent_name: str) -> Optional[AgentPerformance]:
+        """Get performance record for an agent."""
+        return self.agents.get(agent_name)
+
+    def get_accuracy(self, agent_name: str) -> float:
+        """Get accuracy for an agent."""
+        perf = self.agents.get(agent_name)
+        if perf is None:
+            return 0.5
+
+        return perf.get_accuracy(
+            use_persistent=self.weight_mode in ["persistent", "hybrid"],
+            use_episode=self.weight_mode in ["episode", "hybrid"],
+            persistent_weight=self.persistent_weight,
+        )
+
+    def reset_episode(self) -> None:
+        """Reset current episode statistics for all agents."""
+        for perf in self.agents.values():
+            perf.episode_opinions = 0
+            perf.episode_correct = 0
+            perf.episode_critical = 0
+
+    def get_summary(self) -> TypingDict[str, Any]:
+        """Get summary of all agent performances."""
+        return {
+            name: {
+                "accuracy": perf.get_accuracy(),
+                "total_opinions": perf.total_opinions,
+                "critical_contributions": perf.critical_contributions,
+            }
+            for name, perf in self.agents.items()
+        }
+
+
+class DynamicScorer:
+    """Dynamic scoring system for debate opinions.
+
+    Calculates action scores based on:
+    1. Agent weights (static + dynamic adjustment)
+    2. Opinion confidence
+    3. Hard constraints (blocking actions)
+    4. Soft constraints (weight multipliers)
+    """
+
+    BASE_WEIGHTS = {
+        "perception": 1.0,
+        "instruction": 1.0,
+        "trajectory": 1.0,
+        "decision": 1.0,
+    }
+
+    def __init__(self, performance_tracker: PerformanceTracker):
+        """Initialize the dynamic scorer.
+
+        Args:
+            performance_tracker: PerformanceTracker instance for dynamic weights
+        """
+        self.tracker = performance_tracker
+        self.logger = logging.getLogger("DynamicScorer")
+
+    def calculate_weights(self) -> TypingDict[str, float]:
+        """Calculate dynamic weights for all agents.
+
+        Weights are adjusted based on historical accuracy:
+        - Higher accuracy -> higher weight
+        - Range: 0.5 * base to 1.5 * base
+
+        Returns:
+            Dictionary of agent weights
+        """
+        weights = {}
+
+        for agent, base_weight in self.BASE_WEIGHTS.items():
+            accuracy = self.tracker.get_accuracy(agent)
+
+            # Weight adjustment: 0.5 to 1.5 multiplier based on accuracy
+            # accuracy 0.0 -> 0.5x, accuracy 0.5 -> 1.0x, accuracy 1.0 -> 1.5x
+            adjustment = 0.5 + accuracy
+            weights[agent] = base_weight * adjustment
+
+        return weights
+
+    def score_opinions(
+        self,
+        opinions: List[Any],  # List[DebateOpinion]
+        weights: TypingDict[str, float]
+    ) -> TypingDict[str, float]:
+        """Score candidate actions based on opinions.
+
+        Args:
+            opinions: List of DebateOpinion objects
+            weights: Agent weights
+
+        Returns:
+            Dictionary of action scores
+        """
+        # Use "forward" for consistency
+        action_scores = {
+            "forward": 0.0,
+            "turn_left": 0.0,
+            "turn_right": 0.0,
+            "stop": 0.0,
+        }
+
+        # Action normalization
+        action_normalize = {
+            "move_forward": "forward",
+            "left": "turn_left",
+            "right": "turn_right",
+        }
+
+        # 1. Process hard constraints first
+        hard_constraints: TypingDict[str, float] = {}
+        for opinion in opinions:
+            for constraint in opinion.constraints.get("hard", []):
+                if constraint.blocked:
+                    action = action_normalize.get(constraint.action, constraint.action)
+                    hard_constraints[action] = 0.0
+
+        # 2. Process opinions with soft constraints
+        for opinion in opinions:
+            agent = opinion.agent
+            base_weight = weights.get(agent, 1.0)
+
+            # Apply soft constraint adjustments
+            weight = base_weight
+            for constraint in opinion.constraints.get("soft", []):
+                weight *= constraint.weight_multiplier
+
+            action = opinion.primary_action
+
+            # Normalize action name
+            action = action_normalize.get(action, action)
+
+            # Skip if blocked by hard constraint
+            if action in hard_constraints:
+                continue
+
+            # Add to score
+            if action in action_scores:
+                action_scores[action] += opinion.confidence * weight
+
+        # 3. Apply hard constraints
+        for action, score in hard_constraints.items():
+            if action in action_scores:
+                action_scores[action] = score
+
+        return action_scores
+
+    def generate_evaluation_output(
+        self,
+        opinions: List[Any],
+        action_scores: TypingDict[str, float],
+        weights: TypingDict[str, float]
+    ) -> TypingDict[str, Any]:
+        """Generate structured evaluation output.
+
+        Args:
+            opinions: List of DebateOpinion objects
+            action_scores: Calculated action scores
+            weights: Weights used
+
+        Returns:
+            Evaluation output dictionary
+        """
+        # Find best action
+        best_action = max(action_scores, key=action_scores.get)
+        total_score = sum(action_scores.values())
+        confidence = action_scores[best_action] / total_score if total_score > 0 else 0.5
+
+        # Find hard constraints applied
+        hard_constraints_applied = [
+            action for action, score in action_scores.items()
+            if score == 0.0
+        ]
+
+        # Generate reasoning
+        reasoning = self._generate_reasoning(opinions, action_scores, best_action)
+
+        return {
+            "evaluation": {
+                "weights_used": weights,
+                "action_scores": action_scores,
+                "best_action": best_action,
+                "confidence": confidence,
+                "hard_constraints_applied": hard_constraints_applied,
+                "reasoning": reasoning,
+            }
+        }
+
+    def _generate_reasoning(
+        self,
+        opinions: List[Any],
+        action_scores: TypingDict[str, float],
+        best_action: str
+    ) -> str:
+        """Generate human-readable reasoning for the decision."""
+        # Find supporting opinions for best action
+        supporting = []
+
+        # Action normalization
+        action_normalize = {
+            "move_forward": "forward",
+            "left": "turn_left",
+            "right": "turn_right",
+        }
+
+        for opinion in opinions:
+            action = opinion.primary_action
+            action = action_normalize.get(action, action)
+
+            if action == best_action:
+                supporting.append(f"{opinion.agent}: {opinion.reasoning[:50]}")
+
+        if supporting:
+            return f"选择{best_action} - " + "; ".join(supporting[:2])
+
+        return f"选择{best_action} (得分: {action_scores[best_action]:.2f})"
+
+
+def get_performance_tracker(config: Dict[str, Any] = None) -> PerformanceTracker:
+    """Factory function to get or create a PerformanceTracker instance.
+
+    Args:
+        config: Configuration dictionary
+
+    Returns:
+        PerformanceTracker instance
+    """
+    tracker = PerformanceTracker(config)
+    tracker.load()
+    return tracker
