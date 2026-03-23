@@ -174,15 +174,68 @@ def load_all_models(gpu_memory_utilization: float = 0.5) -> bool:
 
     logger.info("=" * 60)
     logger.info("Loading vLLM engines...")
-    logger.info(f"GPU memory utilization: {gpu_memory_utilization}")
     logger.info(f"Models to load: {list(model_configs.keys())}")
     logger.info("=" * 60)
 
+    # Group models by model_path to share engines
+    unique_models = {}
+    for model_key, config in model_configs.items():
+        model_path = config["model_name"]
+        if model_path not in unique_models:
+            unique_models[model_path] = []
+        unique_models[model_path].append(model_key)
+
+    logger.info(f"Unique models to load: {list(unique_models.keys())}")
+
+    # Calculate GPU memory per engine
+    num_engines = len(unique_models)
+    # Reserve some memory for system, distribute rest evenly
+    memory_per_engine = min(0.45, 0.9 / num_engines)  # Max 45% per engine, or split 90%
+
+    logger.info(f"GPU memory per engine: {memory_per_engine:.2f}")
+
     success = True
-    for model_key in model_configs:
-        loaded = load_vllm_engine(model_key, gpu_memory_utilization)
-        if not loaded:
-            logger.warning(f"Failed to load {model_key}")
+    loaded_paths = set()
+
+    for model_path, model_keys in unique_models.items():
+        # Load one engine per unique model path
+        first_key = model_keys[0]
+
+        if model_path in loaded_paths:
+            # Already loaded via sharing
+            continue
+
+        if not os.path.exists(model_path):
+            logger.error(f"Model path does not exist: {model_path}")
+            success = False
+            continue
+
+        try:
+            from vllm import LLM
+
+            logger.info(f"Loading vLLM engine for {first_key} from {model_path}...")
+
+            engine = LLM(
+                model=model_path,
+                dtype="float16",
+                gpu_memory_utilization=memory_per_engine,
+                max_model_len=4096,
+                trust_remote_code=True,
+                enforce_eager=True,
+            )
+
+            # Share engine among all model_keys with same path
+            for key in model_keys:
+                llm_engines[key] = engine
+                logger.info(f"Registered engine for {key}")
+
+            loaded_paths.add(model_path)
+            logger.info(f"vLLM engine loaded: {first_key} (shared by: {model_keys})")
+
+        except Exception as e:
+            logger.error(f"Failed to load engine for {first_key}: {e}")
+            import traceback
+            traceback.print_exc()
             success = False
 
     logger.info("=" * 60)
@@ -300,8 +353,8 @@ def generate_vision(
 ) -> Dict[str, Any]:
     """Generate text from image and prompt using vLLM.
 
-    Note: vLLM supports multimodal models. For Qwen3.5-VL, we use the
-    offline inference with image inputs.
+    Note: vLLM supports multimodal models. For Qwen3.5-VL, we need to use
+    the <|image_pad|> token and TextPrompt format for multimodal inputs.
 
     Args:
         model_key: Model identifier (e.g., qwen-4b-perception)
@@ -330,6 +383,7 @@ def generate_vision(
 
     try:
         from vllm import SamplingParams
+        from vllm.inputs import TextPrompt
         from PIL import Image
 
         # Decode base64 RGB image
@@ -338,12 +392,12 @@ def generate_vision(
         if image.mode != 'RGB':
             image = image.convert('RGB')
 
-        # Prepare inputs for vLLM multimodal
-        # vLLM uses a specific format for multimodal inputs
-        inputs = {
-            "prompt": prompt,
-            "multi_modal_data": {"image": image},
-        }
+        # Build the prompt with image token
+        # Qwen3.5-VL uses <|image_pad|> as the image placeholder
+        # Format: <|image_pad|> followed by the text prompt
+
+        images = [image]
+        image_tokens = "<|image_pad|>"
 
         # Add depth image if provided
         if depth_base64:
@@ -351,8 +405,17 @@ def generate_vision(
             depth_image = Image.open(BytesIO(depth_data))
             if depth_image.mode != 'RGB':
                 depth_image = depth_image.convert('RGB')
-            # Note: For dual images, we concatenate prompts
-            inputs["prompt"] = f"[Image 1: RGB]\n[Image 2: Depth]\n{prompt}"
+            images.append(depth_image)
+            image_tokens = "<|image_pad|><|image_pad|>"  # Two images
+
+        # Build full prompt with image tokens
+        full_prompt = f"{image_tokens}{prompt}"
+
+        # Create TextPrompt with multimodal data
+        text_prompt = TextPrompt(
+            prompt=full_prompt,
+            multi_modal_data={"image": images}
+        )
 
         sampling_params = SamplingParams(
             temperature=temp,
@@ -362,7 +425,7 @@ def generate_vision(
         )
 
         # Generate with vLLM
-        outputs = engine.generate([inputs], sampling_params)
+        outputs = engine.generate([text_prompt], sampling_params)
 
         generated_text = outputs[0].outputs[0].text.strip()
         tokens_generated = len(outputs[0].outputs[0].token_ids)
