@@ -1,9 +1,6 @@
 name: habitat_py310
 channels:
   - conda-forge
-  - https://mirrors.tuna.tsinghua.edu.cn/anaconda/cloud/pytorch
-  - https://mirrors.tuna.tsinghua.edu.cn/anaconda/pkgs/free
-  - https://mirrors.tuna.tsinghua.edu.cn/anaconda/pkgs/main
   - defaults
 dependencies:
   - _openmp_mutex=4.5=7_kmp_llvm
@@ -248,4 +245,3 @@ dependencies:
       - websockets==16.0
       - yarl==1.23.0
       - zipp==3.23.0
-prefix: /opt/conda/envs/habitat_py310

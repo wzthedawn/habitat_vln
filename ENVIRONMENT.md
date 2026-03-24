@@ -28,6 +28,19 @@
 
 ## 新服务器环境搭建
 
+### 国内服务器镜像加速 (可选)
+
+如果在国内服务器，可以添加清华镜像源加速下载：
+```bash
+# 编辑 yml 文件，在 channels 下添加：
+channels:
+  - aihabitat  # 仅 Habitat 环境需要
+  - conda-forge
+  - https://mirrors.tuna.tsinghua.edu.cn/anaconda/cloud/pytorch
+  - https://mirrors.tuna.tsinghua.edu.cn/anaconda/pkgs/main
+  - defaults
+```
+
 ### Step 1: 创建 Habitat 环境
 
 ```bash
@@ -119,11 +132,30 @@ xvfb-run -a python run_vln_experiment.py \
 
 ## 模型路径配置
 
-模型默认路径:
-- Qwen3.5-4B: `/root/.cache/modelscope/hub/models/Qwen/Qwen3___5-4B`
-- Qwen3.5-2B: `/root/.cache/modelscope/hub/models/Qwen/Qwen3___5-2B`
+**重要**: 需要修改以下文件中的模型路径：
 
-修改 `vllm_server.py` 中的 `get_model_configs()` 函数以更新路径。
+### 1. vllm_server.py (第64-90行)
+```python
+# 修改 get_model_configs() 函数中的 model_name
+"model_name": "/your/path/to/Qwen3___5-4B"
+```
+
+### 2. models/remote_client.py (第95-100行)
+```python
+# 修改 MODEL_PATHS 字典
+MODEL_PATHS = {
+    "qwen-4b-perception": "/your/path/to/Qwen3___5-4B",
+    ...
+}
+```
+
+### 3. start_vllm.sh
+```bash
+# 修改 MODEL_PATH 变量
+MODEL_PATH="/your/path/to/Qwen3___5-4B"
+```
+
+**默认路径**: `/root/.cache/modelscope/hub/models/Qwen/Qwen3___5-4B`
 
 ## 常见问题
 

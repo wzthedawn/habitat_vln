@@ -1,9 +1,6 @@
 name: vllm_env
 channels:
   - conda-forge
-  - https://mirrors.tuna.tsinghua.edu.cn/anaconda/cloud/pytorch
-  - https://mirrors.tuna.tsinghua.edu.cn/anaconda/pkgs/free
-  - https://mirrors.tuna.tsinghua.edu.cn/anaconda/pkgs/main
   - defaults
 dependencies:
   - _openmp_mutex=4.5=20_gnu
@@ -206,4 +203,3 @@ dependencies:
       - xgrammar==0.1.32
       - yarl==1.23.0
       - zipp==3.23.0
-prefix: /opt/conda/envs/vllm_env

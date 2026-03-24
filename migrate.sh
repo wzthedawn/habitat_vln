@@ -1,7 +1,13 @@
 #!/bin/bash
 # VLN项目迁移脚本
 # 总大小: 代码 646MB + 模型 31GB + 数据集 25GB = ~57GB
-TARGET="WZ@10.95.66.199"
+#
+# 注意: 请根据实际情况修改以下变量:
+#   - TARGET: 目标服务器地址
+#   - 模型路径: /habitat-t1/Habitat-test1/Model
+#   - 数据集路径: /habitat-t1/Habitat-test1
+#
+TARGET="WZ@10.95.66.199"  # 修改为目标服务器地址
 
 echo "=========================================="
 echo "VLN项目迁移脚本"

@@ -108,7 +108,6 @@ opentelemetry-sdk==1.40.0
 opentelemetry-semantic-conventions==0.61b0
 opentelemetry-semantic-conventions-ai==0.5.0
 outlines_core==0.2.11
-packaging @ file:///home/conda/feedstock_root/build_artifacts/bld/rattler-build_packaging_1769093650/work
 partial-json-parser==0.2.1.1.post7
 pillow==12.1.1
 prometheus-fastapi-instrumentator==7.1.0
@@ -172,3 +171,4 @@ websockets==16.0
 xgrammar==0.1.32
 yarl==1.23.0
 zipp==3.23.0
+packaging>=26.0

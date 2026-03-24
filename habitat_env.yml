@@ -7,9 +7,6 @@ name: Habitat
 channels:
   - aihabitat
   - conda-forge
-  - https://mirrors.tuna.tsinghua.edu.cn/anaconda/cloud/pytorch
-  - https://mirrors.tuna.tsinghua.edu.cn/anaconda/pkgs/free
-  - https://mirrors.tuna.tsinghua.edu.cn/anaconda/pkgs/main
   - defaults
 dependencies:
   - _libgcc_mutex=0.1=main
@@ -280,4 +277,3 @@ dependencies:
       - ultralytics==8.4.22
       - ultralytics-thop==2.0.18
       - urllib3==2.6.3
-prefix: /opt/conda/envs/Habitat
