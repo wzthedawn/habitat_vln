@@ -38,14 +38,23 @@ conda env create -f habitat_env.yml
 conda create -n Habitat python=3.9 -y
 conda activate Habitat
 
-# 安装 habitat-sim (需要 conda-forge)
-conda install habitat-sim -c conda-forge
+# 安装 habitat-sim (需要 aihabitat 频道)
+conda install habitat-sim -c aihabitat -c conda-forge
 
-# 安装 habitat-lab
-pip install habitat-lab
+# 安装 habitat-lab (需要从源码安装)
+git clone https://github.com/facebookresearch/habitat-lab.git
+cd habitat-lab
+pip install -e habitat-lab  # 可编辑安装
 
 # 安装其他依赖
 pip install -r habitat_requirements.txt
+```
+
+**注意**: `habitat-lab` 不在 PyPI 上，必须从源码安装：
+```bash
+git clone https://github.com/facebookresearch/habitat-lab.git
+cd habitat-lab
+pip install -e habitat-lab
 ```
 
 ### Step 2: 创建 vllm_env 环境
