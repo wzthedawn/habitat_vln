@@ -36,6 +36,12 @@ try:
 except ImportError:
     REQUESTS_AVAILABLE = False
 
+try:
+    from openai import OpenAI
+    OPENAI_AVAILABLE = True
+except ImportError:
+    OPENAI_AVAILABLE = False
+
 
 @dataclass
 class GenerateResult:
@@ -72,13 +78,27 @@ class RemoteLLMClient:
     Provides both async and sync methods for generating text
     using remote Qwen3.5 models.
 
+    Supports two modes:
+    - OpenAI mode (recommended): Uses vLLM's OpenAI-compatible server
+    - HTTP mode (fallback): Uses custom FastAPI server
+
     Attributes:
         server_url: Base URL of the LLM server
         timeout: Request timeout in seconds
         max_retries: Maximum number of retry attempts
         retry_delay: Delay between retries in seconds
         fallback_enabled: Whether to use fallback responses on error
+        use_openai: Whether to use OpenAI SDK format
     """
+
+    # Model path mapping for vLLM OpenAI server
+    MODEL_PATHS = {
+        "qwen-4b-perception": "/root/.cache/modelscope/hub/models/Qwen/Qwen3___5-4B",
+        "qwen-4b-instruction": "/root/.cache/modelscope/hub/models/Qwen/Qwen3___5-4B",
+        "qwen-4b-decision": "/root/.cache/modelscope/hub/models/Qwen/Qwen3___5-4B",
+        "qwen-4b-evaluation": "/root/.cache/modelscope/hub/models/Qwen/Qwen3___5-4B",
+        "qwen-2b-trajectory": "/root/.cache/modelscope/hub/models/Qwen/Qwen3___5-2B",
+    }
 
     def __init__(
         self,
@@ -87,6 +107,7 @@ class RemoteLLMClient:
         max_retries: int = 2,   # Reduced retries
         retry_delay: float = 1.0,
         fallback_enabled: bool = True,  # Enable fallback by default
+        use_openai: bool = False,  # Use HTTP mode by default (custom endpoints)
     ):
         """Initialize the remote LLM client.
 
@@ -96,6 +117,7 @@ class RemoteLLMClient:
             max_retries: Maximum number of retry attempts
             retry_delay: Delay between retries in seconds
             fallback_enabled: Whether to use fallback responses on error
+            use_openai: Whether to use OpenAI SDK format (recommended for vLLM)
         """
         self.server_url = server_url.rstrip("/")
         self.timeout = timeout
@@ -110,6 +132,17 @@ class RemoteLLMClient:
                 "Neither aiohttp nor requests is installed. "
                 "Install with: pip install aiohttp or pip install requests"
             )
+
+        # Initialize OpenAI client if available and requested
+        self.use_openai = use_openai and OPENAI_AVAILABLE
+        self.openai_client = None
+        if self.use_openai:
+            self.openai_client = OpenAI(
+                api_key="EMPTY",
+                base_url=f"{self.server_url}/v1",
+                timeout=timeout
+            )
+            self.logger.info("Using OpenAI SDK mode for vLLM server")
 
         # Cache for health check
         self._last_health_check: Optional[float] = None
@@ -316,14 +349,23 @@ class RemoteLLMClient:
         Returns:
             Generated text, or fallback response on error
         """
-        result = self.generate_sync(
-            model=model,
-            prompt=prompt,
-            max_new_tokens=max_new_tokens,
-            temperature=temperature,
-            conversation_id=conversation_id,
-            keep_context=keep_context,
-        )
+        # Use OpenAI mode if available
+        if self.use_openai:
+            result = self.generate_openai(
+                model=model,
+                prompt=prompt,
+                max_new_tokens=max_new_tokens,
+                temperature=temperature,
+            )
+        else:
+            result = self.generate_sync(
+                model=model,
+                prompt=prompt,
+                max_new_tokens=max_new_tokens,
+                temperature=temperature,
+                conversation_id=conversation_id,
+                keep_context=keep_context,
+            )
 
         if result.error:
             self.logger.warning(f"Generation error: {result.error}")
@@ -365,6 +407,175 @@ class RemoteLLMClient:
         # Generic fallback
         return "继续执行。"
 
+    def _get_model_path(self, model_key: str) -> str:
+        """Get model path for vLLM OpenAI server.
+
+        Args:
+            model_key: Model identifier (e.g., qwen-4b-perception)
+
+        Returns:
+            Full model path for vLLM server
+        """
+        return self.MODEL_PATHS.get(model_key, model_key)
+
+    def generate_openai(
+        self,
+        model: str,
+        prompt: str,
+        max_new_tokens: Optional[int] = None,
+        temperature: Optional[float] = None,
+    ) -> GenerateResult:
+        """Generate text using OpenAI SDK format.
+
+        This method uses vLLM's OpenAI-compatible server.
+
+        Args:
+            model: Model identifier
+            prompt: Input prompt
+            max_new_tokens: Maximum tokens to generate
+            temperature: Sampling temperature
+
+        Returns:
+            GenerateResult with response and metadata
+        """
+        if not self.openai_client:
+            return GenerateResult(
+                response="",
+                model=model,
+                tokens_generated=0,
+                latency_ms=0,
+                error="OpenAI client not initialized"
+            )
+
+        start_time = time.time()
+        model_path = self._get_model_path(model)
+
+        try:
+            response = self.openai_client.chat.completions.create(
+                model=model_path,
+                messages=[{"role": "user", "content": prompt}],
+                max_tokens=max_new_tokens or 300,
+                temperature=temperature if temperature is not None else 0.2
+            )
+
+            latency = (time.time() - start_time) * 1000
+
+            return GenerateResult(
+                response=response.choices[0].message.content or "",
+                model=model,
+                tokens_generated=response.usage.completion_tokens if response.usage else 0,
+                latency_ms=latency,
+            )
+
+        except Exception as e:
+            self.logger.error(f"OpenAI generation failed: {e}")
+            return GenerateResult(
+                response="",
+                model=model,
+                tokens_generated=0,
+                latency_ms=0,
+                error=str(e)
+            )
+
+    def generate_vision_openai(
+        self,
+        image: Any,
+        prompt: str,
+        model: str = "qwen-4b-perception",
+        max_new_tokens: Optional[int] = None,
+        temperature: Optional[float] = None,
+        depth_image: Optional[Any] = None,
+    ) -> GenerateVisionResult:
+        """Generate text from image using OpenAI SDK format.
+
+        This method uses vLLM's OpenAI-compatible server with multimodal support.
+
+        Args:
+            image: PIL Image or numpy array
+            prompt: Input prompt
+            model: VLM model identifier
+            max_new_tokens: Maximum tokens to generate
+            temperature: Sampling temperature
+            depth_image: Optional depth image (will be added as second image)
+
+        Returns:
+            GenerateVisionResult with response and metadata
+        """
+        if not self.openai_client:
+            return GenerateVisionResult(
+                response="",
+                model=model,
+                tokens_generated=0,
+                latency_ms=0,
+                error="OpenAI client not initialized"
+            )
+
+        start_time = time.time()
+        model_path = self._get_model_path(model)
+
+        try:
+            # Convert RGB image to base64 data URL
+            image_base64 = self._image_to_base64(image)
+            image_url = f"data:image/jpeg;base64,{image_base64}"
+
+            # Build content list
+            content = []
+
+            # Add RGB image
+            content.append({
+                "type": "image_url",
+                "image_url": {"url": image_url}
+            })
+
+            # Add depth image if provided
+            if depth_image is not None:
+                depth_colored = self._depth_to_colormap(depth_image)
+                depth_base64 = self._image_to_base64(depth_colored)
+                depth_url = f"data:image/jpeg;base64,{depth_base64}"
+                content.append({
+                    "type": "image_url",
+                    "image_url": {"url": depth_url}
+                })
+
+            # Add text prompt
+            content.append({
+                "type": "text",
+                "text": prompt
+            })
+
+            response = self.openai_client.chat.completions.create(
+                model=model_path,
+                messages=[{
+                    "role": "user",
+                    "content": content
+                }],
+                max_tokens=max_new_tokens or 400,
+                temperature=temperature if temperature is not None else 0.3
+            )
+
+            latency = (time.time() - start_time) * 1000
+
+            self.logger.info(f"[OpenAI-VLM] {model}: generated in {latency:.0f}ms")
+
+            return GenerateVisionResult(
+                response=response.choices[0].message.content or "",
+                model=model,
+                tokens_generated=response.usage.completion_tokens if response.usage else 0,
+                latency_ms=latency,
+            )
+
+        except Exception as e:
+            self.logger.error(f"OpenAI vision generation failed: {e}")
+            import traceback
+            traceback.print_exc()
+            return GenerateVisionResult(
+                response="",
+                model=model,
+                tokens_generated=0,
+                latency_ms=0,
+                error=str(e)
+            )
+
     def generate_vision(
         self,
         image: Any,
@@ -374,6 +585,8 @@ class RemoteLLMClient:
         temperature: Optional[float] = None,
     ) -> GenerateVisionResult:
         """Generate text from image using VLM (sync).
+
+        Automatically uses OpenAI mode if available, otherwise falls back to HTTP.
 
         Args:
             image: PIL Image or numpy array
@@ -385,6 +598,17 @@ class RemoteLLMClient:
         Returns:
             GenerateVisionResult with response and metadata
         """
+        # Use OpenAI mode if available
+        if self.use_openai:
+            return self.generate_vision_openai(
+                image=image,
+                prompt=prompt,
+                model=model,
+                max_new_tokens=max_new_tokens,
+                temperature=temperature,
+            )
+
+        # Fallback to HTTP mode
         if not REQUESTS_AVAILABLE:
             raise ImportError("requests is not installed. Install with: pip install requests")
 
@@ -455,6 +679,7 @@ class RemoteLLMClient:
     ) -> GenerateVisionResult:
         """Generate text from RGB + Depth images using VLM (sync).
 
+        Automatically uses OpenAI mode if available, otherwise falls back to HTTP.
         Depth image will be converted to pseudocolor (JET colormap) for
         better visualization by the VLM.
 
@@ -469,6 +694,18 @@ class RemoteLLMClient:
         Returns:
             GenerateVisionResult with response and metadata
         """
+        # Use OpenAI mode if available
+        if self.use_openai:
+            return self.generate_vision_openai(
+                image=rgb_image,
+                prompt=prompt,
+                model=model,
+                max_new_tokens=max_new_tokens,
+                temperature=temperature,
+                depth_image=depth_image,
+            )
+
+        # Fallback to HTTP mode
         if not REQUESTS_AVAILABLE:
             raise ImportError("requests is not installed. Install with: pip install requests")
 
