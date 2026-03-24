@@ -277,7 +277,8 @@ class EvaluationAgent(BaseAgent):
                 y_trend = f"最近{'上升' if y_change_recent > 0 else '下降'}{abs(y_change_recent):.2f}米"
 
         # === NEW: Enhanced prompt template ===
-        prompt = f"""你是导航决策评估专家。评估决策合理性。
+        prompt = f"""/no_think
+你是导航决策评估专家。评估决策合理性。
 
 ## 导航目标
 - 指令: {instruction[:80]}

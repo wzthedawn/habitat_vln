@@ -476,16 +476,15 @@ class TrajectoryAgent(BaseAgent):
             # Convert rotation to heading degrees (0-360)
             heading_degrees = int(math.degrees(rotation)) % 360
 
-            prompt = f"""直接输出JSON，不要思考或解释:
+            prompt = f"""/no_think
+直接输出JSON:
 
 {{
   "当前位置": [{position[0]:.2f}, {position[1]:.2f}, {position[2]:.2f}],
   "当前朝向": {heading_degrees},
   "已走距离": {distance:.1f},
   "距离目标": {goal_distance:.1f}
-}}
-
-只输出上面JSON，无其他内容。"""
+}}"""
 
             # Get episode_id for conversation context isolation
             episode_id = context.metadata.get("episode_id", 0) if context else 0
@@ -1027,7 +1026,8 @@ class TrajectoryAgent(BaseAgent):
                 loop_pattern = "连续右转"
 
         # Build enhanced prompt
-        prompt = f"""你是轨迹规划专家。基于导航轨迹分析最佳动作。
+        prompt = f"""/no_think
+你是轨迹规划专家。基于导航轨迹分析最佳动作。
 
 ## 轨迹状态
 - 总步数: {context.step_count}
@@ -1077,7 +1077,7 @@ class TrajectoryAgent(BaseAgent):
   }}
 }}
 
-只输出JSON。"""
+只输出JSON，无其他内容。"""
         try:
             response = self._model_manager.generate(
                 "qwen-2b-trajectory",

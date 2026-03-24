@@ -254,23 +254,25 @@ class PerceptionAgent(BaseAgent):
 
             if has_depth:
                 # RGB + Depth: Full perception with distance info
-                prompt = """你是室内导航机器人的视觉感知系统。
+                prompt = """/no_think
+你是室内导航机器人的视觉感知系统。
 
 ## 图像说明
 - 第一张: RGB彩色图
 - 第二张: 深度图(红色=近,蓝色=远)
 
 ## 任务
-分析图像，输出JSON格式的感知结果。
+分析图像，直接输出JSON格式的感知结果。
 
 ## 输出格式
 {"room_type":"房间类型","scene_brief":"场景描述","objects":[{"name":"物体","distance":1.0,"angle":0}],"stairs":{"detected":false,"direction":"none","distance":5},"obstacle_ahead":{"blocked":false,"min_distance":3.0},"nav_hint":"导航提示"}"""
             else:
                 # RGB-only: Simplified perception without distance requirements
-                prompt = """你是室内导航机器人的视觉感知系统。
+                prompt = """/no_think
+你是室内导航机器人的视觉感知系统。
 
 ## 任务
-分析RGB图像，输出JSON格式的感知结果。
+分析RGB图像，直接输出JSON格式的感知结果。
 
 ## 输出格式
 {"room_type":"房间类型","scene_brief":"场景描述","objects":[{"name":"物体"}],"nav_hint":"导航提示"}"""
@@ -338,7 +340,19 @@ class PerceptionAgent(BaseAgent):
         object_names = []
 
         # Try parsing JSON format (support nested objects)
-        json_match = re.search(r'\{(?:[^{}]|\{[^{}]*\})*\}', response)
+        # Handle markdown code blocks: ```json ... ```
+        json_str = response
+        if '```json' in response:
+            json_match = re.search(r'```json\s*([\s\S]*?)\s*```', response)
+            if json_match:
+                json_str = json_match.group(1).strip()
+        elif '```' in response:
+            json_match = re.search(r'```\s*([\s\S]*?)\s*```', response)
+            if json_match:
+                json_str = json_match.group(1).strip()
+
+        # Extract JSON object
+        json_match = re.search(r'\{(?:[^{}]|\{[^{}]*\})*\}', json_str)
         if json_match:
             try:
                 data = json.loads(json_match.group())
@@ -362,14 +376,14 @@ class PerceptionAgent(BaseAgent):
                 if "objects" in data and isinstance(data["objects"], list):
                     for obj in data["objects"][:self.max_objects]:
                         if isinstance(obj, dict):
-                            name = obj.get("name", "")
+                            name = obj.get("name", "") or ""  # Ensure name is not None
                             if name:
                                 object_names.append(name)
                                 result["objects"].append({
                                     "name": name,
                                     "confidence": 0.6,
-                                    "distance": float(obj.get("distance", 0)),
-                                    "angle": float(obj.get("angle", 0)),
+                                    "distance": float(obj.get("distance", 0) or 0),
+                                    "angle": float(obj.get("angle", 0) or 0),
                                     "is_navigation_object": name.lower() in self.NAVIGATION_OBJECTS,
                                     "is_landmark": name.lower() in self.LANDMARK_OBJECTS,
                                     "source": "vlm",
@@ -562,7 +576,8 @@ class PerceptionAgent(BaseAgent):
         """Build perception opinion using LLM."""
         from core.debate_types import DebateOpinion, ActionConstraint
 
-        prompt = f"""基于感知信息分析最佳导航动作。
+        prompt = f"""/no_think
+基于感知信息分析最佳导航动作。
 
 ## 环境感知
 - 障碍物: {obstacles if obstacles else "无"}

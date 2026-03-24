@@ -542,7 +542,8 @@ class InstructionAgent(BaseAgent):
         if subtasks:
             subtask_summary = " → ".join([s.description[:30] for s in subtasks[:4]])
 
-        prompt = f"""分析导航指令的语义含义，生成简洁的导航推理。
+        prompt = f"""/no_think
+分析导航指令的语义含义，生成简洁的导航推理。
 
 ## 导航指令
 {instruction}
@@ -697,7 +698,8 @@ class InstructionAgent(BaseAgent):
             self.logger.warning("Model manager not available, using rule-based decomposition")
             return None
 
-        prompt = f"""你是导航指令分析专家。深度分解导航指令。
+        prompt = f"""/no_think
+你是导航指令分析专家。深度分解导航指令。
 
 ## 指令
 {instruction}

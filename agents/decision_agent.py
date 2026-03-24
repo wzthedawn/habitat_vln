@@ -305,7 +305,8 @@ class DecisionAgent(BaseAgent):
         goals_str = ", ".join(goals[:2]) if goals else "无"
         condition_str = str(completion_condition) if completion_condition else "无"
 
-        return f"""你是导航决策系统。根据分析结果，生成10步动作序列。
+        return f"""/no_think
+你是导航决策系统。根据分析结果，生成10步动作序列。
 
 ## 子任务
 {subtask.description}
@@ -365,7 +366,8 @@ class DecisionAgent(BaseAgent):
         goals_str = ", ".join(goals[:2]) if goals else "无"
         condition_str = str(completion_condition) if completion_condition else "无"
 
-        return f"""你是导航决策系统。根据反思分析，生成10步动作序列。
+        return f"""/no_think
+你是导航决策系统。根据反思分析，生成10步动作序列。
 
 ## 子任务
 {subtask.description}
@@ -434,7 +436,8 @@ class DecisionAgent(BaseAgent):
         goals_str = ", ".join(goals[:2]) if goals else "无"
         condition_str = str(completion_condition) if completion_condition else "无"
 
-        return f"""你是导航决策系统。根据各Agent意见，生成10步动作序列。
+        return f"""/no_think
+你是导航决策系统。根据各Agent意见，生成10步动作序列。
 
 ## 子任务
 {subtask.description}
@@ -525,7 +528,13 @@ class DecisionAgent(BaseAgent):
                 }
 
                 for item in data.get("actions", []):
-                    action_name = item.get("action", "forward").lower()
+                    # Support both string format ("forward") and object format ({"action": "forward"})
+                    if isinstance(item, str):
+                        action_name = item.lower()
+                    elif isinstance(item, dict):
+                        action_name = item.get("action", "forward").lower()
+                    else:
+                        continue
                     if action_name in action_map:
                         actions.append((action_map[action_name], 1))
 

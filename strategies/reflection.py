@@ -218,7 +218,8 @@ class ReflectionStrategy(BaseStrategy):
                 for i, l in enumerate(recent)
             ])
 
-        prompt = f"""你是一个导航反思专家。请分析当前状态，反思历史动作，并提出改进建议。
+        prompt = f"""/no_think
+你是一个导航反思专家。请分析当前状态，反思历史动作，并提出改进建议。
 
 ## 导航指令
 {instruction_info['full_instruction']}

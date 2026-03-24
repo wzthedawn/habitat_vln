@@ -176,6 +176,7 @@ class ModelManager:
             self._remote_client = RemoteLLMClient(
                 server_url=self.remote_server_url,
                 timeout=self.config.get("remote_timeout", 60.0),
+                use_openai=True,  # 启用 OpenAI SDK 模式，使用 vLLM OpenAI 兼容服务器
             )
 
             # Check server health
@@ -579,18 +580,36 @@ class ModelManager:
             return ""
 
         # Map model keys to available remote models
-        # If the requested model is not available, fallback to qwen-4b
+        # If the requested model is not available, fallback to 4B model
         remote_model_key = model_key
         available_models = self._get_available_remote_models()
 
+        # For vLLM OpenAI server, models are returned as full paths
+        # e.g., "/root/.cache/modelscope/hub/models/Qwen/Qwen3___5-4B"
+        model_path_4b = self.MODEL_CONFIGS["qwen-4b-perception"]["model_name"]
+        model_path_2b = self.MODEL_CONFIGS["qwen-2b-trajectory"]["model_name"]
+
         if model_key not in available_models:
-            # Fallback to qwen-4b for any unavailable model
-            if "qwen-4b" in available_models:
-                self.logger.debug(f"Model {model_key} not available, using qwen-4b")
-                remote_model_key = "qwen-4b"
-            elif available_models:
-                remote_model_key = available_models[0]
-                self.logger.debug(f"Model {model_key} not available, using {remote_model_key}")
+            # Check if this is a 2B model request
+            if model_key in ["qwen-2b-trajectory", "qwen-2b-instruction"]:
+                # First try 2B model
+                if model_path_2b in available_models:
+                    remote_model_key = model_path_2b
+                    self.logger.debug(f"Model {model_key} using 2B path: {model_path_2b}")
+                # Fall back to 4B model
+                elif model_path_4b in available_models:
+                    remote_model_key = model_path_4b
+                    self.logger.info(f"Model {model_key} not available, using 4B model")
+                elif available_models:
+                    remote_model_key = available_models[0]
+                    self.logger.info(f"Model {model_key} not available, using {available_models[0]}")
+            else:
+                # For 4B models, use the full path
+                if model_path_4b in available_models:
+                    remote_model_key = model_path_4b
+                elif available_models:
+                    remote_model_key = available_models[0]
+                    self.logger.debug(f"Model {model_key} not available, using {remote_model_key}")
 
         config = self.MODEL_CONFIGS.get(model_key, {})
         if max_new_tokens is None:
@@ -622,10 +641,11 @@ class ModelManager:
             health = self._remote_client.health_check_sync()
             if isinstance(health, dict) and "models_loaded" in health:
                 return health.get("models_loaded", [])
-        except:
-            pass
+        except Exception as e:
+            self.logger.debug(f"Failed to get available models: {e}")
 
-        return []
+        # Return default 4B path as fallback
+        return [self.MODEL_CONFIGS["qwen-4b-perception"]["model_name"]]
 
     def _generate_local(
         self,

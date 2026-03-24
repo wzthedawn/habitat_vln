@@ -455,7 +455,8 @@ class RemoteLLMClient:
                 model=model_path,
                 messages=[{"role": "user", "content": prompt}],
                 max_tokens=max_new_tokens or 300,
-                temperature=temperature if temperature is not None else 0.2
+                temperature=temperature if temperature is not None else 0.2,
+                extra_body={"chat_template_kwargs": {"enable_thinking": False}}  # Disable Qwen3.5 thinking mode
             )
 
             latency = (time.time() - start_time) * 1000
@@ -550,7 +551,8 @@ class RemoteLLMClient:
                     "content": content
                 }],
                 max_tokens=max_new_tokens or 400,
-                temperature=temperature if temperature is not None else 0.3
+                temperature=temperature if temperature is not None else 0.3,
+                extra_body={"chat_template_kwargs": {"enable_thinking": False}}  # Disable Qwen3.5 thinking mode
             )
 
             latency = (time.time() - start_time) * 1000
@@ -898,14 +900,20 @@ class RemoteLLMClient:
             return {"status": "error", "error": "requests not installed"}
 
         try:
+            # For vLLM OpenAI server, use /v1/models endpoint
             response = requests.get(
-                f"{self.server_url}/health",
+                f"{self.server_url}/v1/models",
                 timeout=5.0
             )
             if response.status_code == 200:
                 self._healthy = True
                 self._last_health_check = time.time()
-                return response.json()
+                data = response.json()
+                models = [m["id"] for m in data.get("data", [])]
+                return {
+                    "status": "healthy",
+                    "models_loaded": models,
+                }
             else:
                 self._healthy = False
                 return {"status": "unhealthy", "code": response.status_code}
