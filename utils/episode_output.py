@@ -90,14 +90,25 @@ class EpisodeOutput:
 class EpisodeOutputManager:
     """Manages episode outputs including images, trajectory plots, and agent outputs."""
 
-    def __init__(self, output_dir: str = "results"):
+    def __init__(
+        self,
+        output_dir: str = "results",
+        enable_video: bool = True,
+        enable_trajectory: bool = True,
+    ):
         self.output_dir = Path(output_dir)
+        self.enable_video = enable_video
+        self.enable_trajectory = enable_trajectory
         self.logger = logging.getLogger("EpisodeOutputManager")
         self.current_episode: Optional[EpisodeOutput] = None
 
         # Create output directory
         self.output_dir.mkdir(parents=True, exist_ok=True)
         self.logger.info(f"Output directory: {self.output_dir.absolute()}")
+        if not self.enable_video:
+            self.logger.info("Video generation disabled")
+        if not self.enable_trajectory:
+            self.logger.info("Trajectory plot generation disabled")
 
     def start_episode(
         self,
@@ -116,8 +127,8 @@ class EpisodeOutputManager:
             start_position=start_position,
         )
 
-        # Create episode directory (simple naming, session dir already has timestamp)
-        episode_dir = self.output_dir / f"episode_{episode_id}"
+        # Create episode directory (session dir already has timestamp from run_vln_experiment.py)
+        episode_dir = self.output_dir / f"episode{episode_id}"
         episode_dir.mkdir(parents=True, exist_ok=True)
 
         # Create subdirectories
@@ -131,7 +142,7 @@ class EpisodeOutputManager:
         """Get current episode directory."""
         if self.current_episode is None:
             return self.output_dir
-        return self.output_dir / f"episode_{self.current_episode.episode_id}"
+        return self.output_dir / f"episode{self.current_episode.episode_id}"
 
     def save_rgb_image(
         self,
@@ -351,8 +362,8 @@ class EpisodeOutputManager:
         if subtasks:
             self.current_episode.subtasks = subtasks
 
-        # Save trajectory plot
-        if goal_position:
+        # Save trajectory plot (if enabled)
+        if goal_position and self.enable_trajectory:
             self.save_trajectory_plot(trajectory, goal_position, reference_path)
 
         # Save agent outputs
