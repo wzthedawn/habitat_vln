@@ -663,6 +663,16 @@ class DecisionAgent(BaseAgent):
         angle_to_goal = context.metadata.get("angle_to_goal", 0) if context else 0
         direction_hint = context.metadata.get("direction_hint", "前方") if context else "前方"
 
+        # Get obstacle info
+        obstacle_info = context.metadata.get("obstacle_info", {}) if context else {}
+
+        # Build obstacle section string
+        obstacle_section = ""
+        if obstacle_info:
+            obstacle_section = f"""
+- 障碍物: {obstacle_info.get('direction', '')} {obstacle_info.get('distance', 0):.1f}m, 半径 {obstacle_info.get('radius', 1.0):.1f}m
+- 绕行建议: 向{obstacle_info.get('bypass_direction', '右')}绕行"""
+
         # NEW: Get stair entrance info
         stair_entrance = perception_output.get("stair_entrance", {})
         stairs = perception_output.get("stairs", {})
@@ -815,7 +825,7 @@ You are a navigation decision system. Synthesize information from all agents and
 - Heading: {heading}
 - Distance traveled: {dist_traveled:.1f}m
 - Distance to goal: {distance_to_goal:.1f}m
-- Goal direction: 目标在{direction_hint} (相对角度: {angle_to_goal:.0f}°){history_section}
+- Goal direction: 目标在{direction_hint} (相对角度: {angle_to_goal:.0f}°){obstacle_section}{history_section}
 ## Action Types
 - forward: move forward one step
 - turn_left: turn left 15 degrees
@@ -847,6 +857,16 @@ IMPORTANT: Keep reasoning brief (1-2 sentences). Output JSON directly:"""
         # Get goal direction info
         angle_to_goal = context.metadata.get("angle_to_goal", 0) if context else 0
         direction_hint = context.metadata.get("direction_hint", "前方") if context else "前方"
+
+        # Get obstacle info
+        obstacle_info = context.metadata.get("obstacle_info", {}) if context else {}
+
+        # Build obstacle section string
+        obstacle_section = ""
+        if obstacle_info:
+            obstacle_section = f"""
+- 障碍物: {obstacle_info.get('direction', '')} {obstacle_info.get('distance', 0):.1f}m, 半径 {obstacle_info.get('radius', 1.0):.1f}m
+- 绕行建议: 向{obstacle_info.get('bypass_direction', '右')}绕行"""
 
         # Format completion condition with auto-check
         visible_objects = [{"name": o} if isinstance(o, str) else o for o in (objects or [])]
@@ -977,7 +997,7 @@ You are a navigation decision system. {seq_constraint}.
 - Heading: {heading}
 - Distance traveled: {dist_traveled:.1f}m
 - Distance to goal: {distance_to_goal:.1f}m
-- Goal direction: 目标在{direction_hint} (相对角度: {angle_to_goal:.0f}°)
+- Goal direction: 目标在{direction_hint} (相对角度: {angle_to_goal:.0f}°){obstacle_section}
 
 ## Strategy Analysis (CoT)
 {analysis[:300] if analysis else "none"}{history_section}
@@ -1043,6 +1063,16 @@ Generate action sequence based on strategy analysis:
         # Get goal direction info
         angle_to_goal = context.metadata.get("angle_to_goal", 0) if context else 0
         direction_hint = context.metadata.get("direction_hint", "前方") if context else "前方"
+
+        # Get obstacle info
+        obstacle_info = context.metadata.get("obstacle_info", {}) if context else {}
+
+        # Build obstacle section string
+        obstacle_section = ""
+        if obstacle_info:
+            obstacle_section = f"""
+- 障碍物: {obstacle_info.get('direction', '')} {obstacle_info.get('distance', 0):.1f}m, 半径 {obstacle_info.get('radius', 1.0):.1f}m
+- 绕行建议: 向{obstacle_info.get('bypass_direction', '右')}绕行"""
 
         # Format completion condition with auto-check
         visible_objects = [{"name": o} if isinstance(o, str) else o for o in (objects or [])]
@@ -1163,7 +1193,7 @@ You are a navigation decision system. {seq_constraint}.
 - Heading: {heading}
 - Distance traveled: {dist_traveled:.1f}m
 - Distance to goal: {distance_to_goal:.1f}m
-- Goal direction: 目标在{direction_hint} (相对角度: {angle_to_goal:.0f}°)
+- Goal direction: 目标在{direction_hint} (相对角度: {angle_to_goal:.0f}°){obstacle_section}
 
 ## Agent Opinions
 {opinions_str if opinions_str else "none"}

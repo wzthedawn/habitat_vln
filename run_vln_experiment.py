@@ -712,6 +712,55 @@ class MultiAgentVLNEvaluator:
                         obstacle_state = obstacle_manager.get_obstacle_state()
                         context.metadata["obstacle_state"] = obstacle_state
 
+                        # === 计算障碍物相对位置 ===
+                        obstacles = obstacle_state.get("obstacles", [])
+                        if obstacles:
+                            obstacle = obstacles[0]  # 取第一个障碍物
+                            obstacle_pos = obstacle.get("position", (0, 0, 0))
+
+                            # 获取当前位置
+                            current_pos = tuple(context.position) if context.position else (0, 0, 0)
+
+                            # 计算相对位置
+                            dx = obstacle_pos[0] - current_pos[0]
+                            dz = obstacle_pos[2] - current_pos[2]
+                            obstacle_angle = math.atan2(dx, dz)
+                            current_rotation = context.rotation if hasattr(context, 'rotation') and context.rotation is not None else 0
+                            obstacle_relative_angle = obstacle_angle - current_rotation
+                            obstacle_relative_angle_deg = math.degrees(obstacle_relative_angle)
+                            obstacle_relative_angle_deg = ((obstacle_relative_angle_deg + 180) % 360) - 180
+
+                            obstacle_radius = obstacle.get("radius", 1.0)
+                            obstacle_dist = math.sqrt(dx*dx + dz*dz)
+
+                            # 障碍物方向提示
+                            if -60 < obstacle_relative_angle_deg < 60:
+                                obstacle_direction = "前方"
+                            elif 60 <= obstacle_relative_angle_deg < 120:
+                                obstacle_direction = "右前方"
+                            elif -120 <= obstacle_relative_angle_deg < -60:
+                                obstacle_direction = "左前方"
+                            elif 120 <= obstacle_relative_angle_deg <= 180 or -180 <= obstacle_relative_angle_deg < -120:
+                                obstacle_direction = "侧后方"
+                            else:
+                                obstacle_direction = "前方"
+
+                            # 绕行建议
+                            bypass_direction = "左" if obstacle_relative_angle_deg > 0 else "右"
+
+                            # 存入context
+                            context.metadata["obstacle_info"] = {
+                                "position": obstacle_pos,
+                                "radius": obstacle_radius,
+                                "distance": obstacle_dist,
+                                "relative_angle": obstacle_relative_angle_deg,
+                                "direction": obstacle_direction,
+                                "bypass_direction": bypass_direction,
+                                "description": obstacle.get("description", "障碍物")
+                            }
+
+                            self.logger.info(f"[EMERGENCY] Obstacle at {obstacle_direction}, distance {obstacle_dist:.1f}m, bypass {bypass_direction}")
+
                         # Update emergency detector
                         if emergency_detector:
                             event = emergency_detector.update(
