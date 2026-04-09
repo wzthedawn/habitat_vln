@@ -26,6 +26,13 @@ class InstructionAgent(BaseAgent):
     # Emergency instruction template regex - flexible for variable spacing and comma handling
     EMERGENCY_TEMPLATE_PATTERN = r"(.+?),\s*the path is blocked,?\s*(.+?)\s+to\s+reach\s+(.+)"
 
+    # Emergency instruction keywords for detection
+    EMERGENCY_KEYWORDS = [
+        "blocked", "obstacle", "emergency", "urgent",
+        "suddenly", "path is blocked", "route blocked",
+        "obstacle detected", "avoid the obstacle"
+    ]
+
     # Direction keywords
     DIRECTION_KEYWORDS = {
         "left", "right", "straight", "forward", "back", "backward",
@@ -469,6 +476,20 @@ class InstructionAgent(BaseAgent):
                 f"Continue to reach {goal}"
             ]
         return None
+
+    def _is_emergency_instruction(self, instruction: str) -> bool:
+        """检测是否为应急指令
+
+        通过关键词检测识别应急类型的导航指令。
+
+        Args:
+            instruction: 导航指令文本
+
+        Returns:
+            True如果是应急指令，False否则
+        """
+        instruction_lower = instruction.lower()
+        return any(kw in instruction_lower for kw in self.EMERGENCY_KEYWORDS)
 
     def _split_instruction(self, text: str) -> List[str]:
         """Split instruction into subtask segments with enhanced recognition.
