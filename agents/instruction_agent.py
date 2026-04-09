@@ -491,6 +491,62 @@ class InstructionAgent(BaseAgent):
         instruction_lower = instruction.lower()
         return any(kw in instruction_lower for kw in self.EMERGENCY_KEYWORDS)
 
+    def _emergency_decompose_with_llm(self, instruction: str) -> Optional[List[str]]:
+        """使用LLM分解应急指令
+
+        专门用于应急指令的智能分解，输出稳定的JSON格式。
+
+        Args:
+            instruction: 应急导航指令
+
+        Returns:
+            分解后的子任务列表，失败返回None
+        """
+        if not self._model_manager:
+            return None
+
+        prompt = f"""/no_think
+You are a navigation instruction analyzer. Break down this emergency instruction into 2-3 clear subtasks.
+
+## Instruction
+{instruction}
+
+## Rules
+1. Each subtask must be a complete sentence (verb + direction + object)
+2. Typical emergency pattern: detect obstacle → find alternative route → continue to goal
+3. Output strict JSON only, no other text
+
+## Output Format
+{{"subtasks":["Complete sentence 1","Complete sentence 2","Complete sentence 3"]}}
+
+## Example
+Input: "Move forward, suddenly blocked, quickly navigate around the obstacle."
+Output: {{"subtasks":["First attempt to move forward along the planned path","Obstacle detected on the path, find an alternative route around it","Continue navigating toward the goal destination"]}}
+
+Output JSON only:"""
+
+        try:
+            response = self._model_manager.generate(
+                "qwen-9b-instruction",
+                prompt=prompt,
+                max_new_tokens=150,
+                temperature=0.1,
+            )
+
+            if response:
+                import json
+                data = json.loads(response)
+                subtasks = data.get("subtasks", [])
+                if subtasks and len(subtasks) >= 2:
+                    self.logger.info(f"[Instruction] Emergency decomposition: {len(subtasks)} subtasks")
+                    return subtasks
+        except json.JSONDecodeError:
+            self.logger.warning("[Instruction] Failed to parse emergency decomposition JSON")
+        except Exception as e:
+            self.logger.error(f"[Instruction] Emergency decomposition error: {e}")
+
+        return None
+
     def _split_instruction(self, text: str) -> List[str]:
         """Split instruction into subtask segments with enhanced recognition.
 
