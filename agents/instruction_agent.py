@@ -23,6 +23,9 @@ class InstructionAgent(BaseAgent):
     4. Classify task difficulty level (简单/中等/困难)
     """
 
+    # Emergency instruction template regex - flexible for variable spacing and comma handling
+    EMERGENCY_TEMPLATE_PATTERN = r"(.+?),\s*the path is blocked,?\s*(.+?)\s+to\s+reach\s+(.+)"
+
     # Direction keywords
     DIRECTION_KEYWORDS = {
         "left", "right", "straight", "forward", "back", "backward",
@@ -121,11 +124,27 @@ class InstructionAgent(BaseAgent):
             # Get goal position from context metadata
             goal_position = context.metadata.get("goal_position")
 
-            # Create subtasks (with LLM semantic decomposition if available)
-            subtasks = self._create_subtasks(parsed, task_level, goal_position)
+            # Check if subtasks already exist with runtime state (start_context)
+            # If so, preserve them instead of recreating
+            existing_subtasks = context.subtasks
+            preserve_runtime_state = False
 
-            # Update context subtasks
-            context.subtasks = subtasks
+            if existing_subtasks and len(existing_subtasks) > 0:
+                # Check if any subtask has start_context set (indicating runtime state)
+                for st in existing_subtasks:
+                    if st.start_context is not None:
+                        preserve_runtime_state = True
+                        break
+
+            if preserve_runtime_state:
+                # Use existing subtasks with their runtime state
+                subtasks = existing_subtasks
+                self.logger.info(f"[InstructionAgent] Preserving existing subtasks with runtime state ({len(subtasks)} subtasks)")
+            else:
+                # Create new subtasks (with LLM semantic decomposition if available)
+                subtasks = self._create_subtasks(parsed, task_level, goal_position)
+                # Update context subtasks only for new creation
+                context.subtasks = subtasks
 
             # Store task level in context
             context.metadata["task_level"] = task_level
@@ -318,30 +337,30 @@ class InstructionAgent(BaseAgent):
 
     def _determine_task_level_fallback(self, parsed: Dict[str, Any]) -> str:
         """Fallback rule-based task level determination."""
-        # Check for conditional keywords (困难)
+        # Check for conditional keywords (hard)
         if parsed["conditions"]:
-            return "困难"
+            return "hard"
 
-        # Check for multiple sequences or multiple landmarks (中等 or 困难)
+        # Check for multiple sequences or multiple landmarks (medium or hard)
         num_landmarks = len(parsed["landmarks"])
         num_directions = len(parsed["directions"])
         num_goals = len(parsed["goals"])
         num_sequences = len(parsed["sequences"])
 
-        # 困难: Multiple sequences + multiple landmarks + conditions
+        # hard: Multiple sequences + multiple landmarks + conditions
         if num_sequences >= 2 and num_landmarks >= 2:
-            return "困难"
+            return "hard"
 
-        # 中等: Single goal with landmarks, or multiple directions
+        # medium: Single goal with landmarks, or multiple directions
         if num_landmarks >= 1 or num_goals >= 1 or num_directions >= 2:
-            return "中等"
+            return "medium"
 
-        # 简单: Basic operations
+        # easy: Basic operations
         if num_directions <= 1 and num_landmarks == 0 and num_goals == 0:
-            return "简单"
+            return "easy"
 
-        # Default to 中等
-        return "中等"
+        # Default to medium
+        return "medium"
 
     def _determine_subtask_level_fallback(self, segment: str) -> str:
         """Fallback rule-based subtask level determination."""
@@ -354,20 +373,20 @@ class InstructionAgent(BaseAgent):
         has_condition = any(word in segment_lower for word in self.CONDITIONAL_KEYWORDS)
         has_sequence = any(word in segment_lower for word in self.SEQUENCE_KEYWORDS)
 
-        # 简单: Basic operations (pure direction commands, no landmarks)
+        # easy: Basic operations (pure direction commands, no landmarks)
         if has_direction and not has_landmark and not has_goal:
-            return "简单"
+            return "easy"
 
-        # 困难: Conditional judgment or multi-step sequences
+        # hard: Conditional judgment or multi-step sequences
         if has_condition or has_sequence:
-            return "困难"
+            return "hard"
 
-        # 中等: Involves landmarks or goals
+        # medium: Involves landmarks or goals
         if has_landmark or has_goal:
-            return "中等"
+            return "medium"
 
-        # Default to 中等
-        return "中等"
+        # Default to medium
+        return "medium"
 
     def _create_subtasks(self, parsed: Dict[str, Any], task_level: str, goal_position: tuple = None) -> List[SubTask]:
         """Create subtasks from parsed instruction with individual difficulty levels.
@@ -380,7 +399,11 @@ class InstructionAgent(BaseAgent):
         if self.use_llm_decompose and self._model_manager:
             llm_subtasks = self._semantic_decompose_with_llm(instruction, goal_position)
             if llm_subtasks:
-                self.logger.info(f"[Instruction] 语义分解: {len(llm_subtasks)}个子任务")
+                self.logger.info(f"[Instruction] Semantic decomposition: {len(llm_subtasks)} subtasks")
+                # Print to console
+                print(f"\n[InstructionAgent] Decomposed into {len(llm_subtasks)} subtasks:")
+                for i, st in enumerate(llm_subtasks):
+                    print(f"  [{i}] {st.description[:50]}... (level: {st.level})")
                 return llm_subtasks
 
         # Fallback to rule-based decomposition
@@ -421,14 +444,56 @@ class InstructionAgent(BaseAgent):
 
         return subtasks
 
+    def _parse_emergency_instruction(self, instruction: str) -> Optional[List[str]]:
+        """Parse emergency instruction template format.
+
+        Emergency instruction template: "{normal_action}, the path is blocked, {reroute_action} to reach {goal}"
+
+        Args:
+            instruction: Navigation instruction
+
+        Returns:
+            List of parsed subtasks, or None if no match
+        """
+        match = re.match(self.EMERGENCY_TEMPLATE_PATTERN, instruction, re.IGNORECASE)
+        if match:
+            normal_action = match.group(1).strip()  # "Go straight"
+            reroute_action = match.group(2).strip()  # "go back and try different path"
+            goal = match.group(3).strip()  # "the table"
+
+            self.logger.info(f"[Instruction] Matched emergency template: action={normal_action}, reroute={reroute_action}, goal={goal}")
+
+            return [
+                f"First attempt: {normal_action}",
+                f"Path blocked detected, executing: {reroute_action}",
+                f"Continue to reach {goal}"
+            ]
+        return None
+
     def _split_instruction(self, text: str) -> List[str]:
-        """Split instruction into subtask segments."""
+        """Split instruction into subtask segments with enhanced recognition.
+
+        Enhanced rules:
+        1. Check for emergency instruction template first
+        2. Identify key action keywords as segment boundaries
+        3. Handle conjunction patterns more accurately
+        4. Preserve landmark context with each segment
+        """
+        # 首先检测应急指令模板
+        emergency_segments = self._parse_emergency_instruction(text)
+        if emergency_segments:
+            return emergency_segments
+
+        # Key action keywords that typically start new subtasks
+        action_keywords = ["turn", "walk", "go", "move", "stop", "wait", "find", "enter", "exit", "head", "pass", "cross"]
+
         # Common conjunctions for navigation instructions
         conjunctions = [
             ", and ", " and then ", ", then ", " then ", "; ",
             " after that ", " next ", " finally ",
         ]
 
+        # Step 1: Split by conjunctions
         segments = [text]
         for conj in conjunctions:
             new_segments = []
@@ -437,38 +502,56 @@ class InstructionAgent(BaseAgent):
                 new_segments.extend(parts)
             segments = new_segments
 
-        # Also split by periods
+        # Step 2: Split by periods
         final_segments = []
         for segment in segments:
             parts = segment.split(".")
             final_segments.extend(p.strip() for p in parts if p.strip())
 
-        # Further split by comma if it separates direction instructions
-        # e.g., "Walk down the stairs, turn right" -> ["Walk down the stairs", "turn right"]
+        # Step 3: Enhanced comma splitting with action keyword detection
         refined_segments = []
         for segment in final_segments:
-            # Check if segment contains direction change after comma
-            lower = segment.lower()
             if ", " in segment:
                 parts = segment.split(", ")
                 for i, part in enumerate(parts):
-                    part_lower = part.lower()
-                    # If this part starts with a direction keyword, it's a separate subtask
-                    if any(part_lower.startswith(kw) for kw in ["turn ", "go ", "walk ", "move "]) and i > 0:
+                    part_lower = part.lower().strip()
+                    # Check if this part starts with an action keyword
+                    starts_with_action = any(part_lower.startswith(kw) or part_lower.startswith(f"and {kw}")
+                                            for kw in action_keywords)
+
+                    if starts_with_action and i > 0:
+                        # This is a new subtask
                         refined_segments.append(part.strip())
                     elif i == 0:
                         # First part is always added
                         refined_segments.append(part.strip())
                     else:
-                        # Merge with previous if not a separate instruction
-                        if refined_segments:
+                        # Check for implicit action patterns
+                        # e.g., "the rug" after "walk towards" → merge with previous
+                        if refined_segments and any(kw in refined_segments[-1].lower() for kw in ["towards", "to", "near", "by"]):
                             refined_segments[-1] += ", " + part.strip()
                         else:
                             refined_segments.append(part.strip())
             else:
                 refined_segments.append(segment)
 
-        return refined_segments if refined_segments else [text]
+        # Step 4: Merge very short segments with previous if they're continuations
+        merged_segments = []
+        for segment in refined_segments:
+            # Skip very short segments that are just conjunctions
+            if len(segment.strip()) < 5 and any(segment.lower().strip() == conj.strip() for conj in ["and", "then"]):
+                continue
+
+            # Check if segment is just a landmark (no action) - merge with previous
+            if len(segment.split()) <= 2 and not any(kw in segment.lower() for kw in action_keywords):
+                if merged_segments:
+                    merged_segments[-1] += " " + segment.strip()
+                else:
+                    merged_segments.append(segment.strip())
+            else:
+                merged_segments.append(segment)
+
+        return merged_segments if merged_segments else [text]
 
     def _determine_required_agents(self, segment: str) -> List[str]:
         """Determine which agents are needed for a segment."""
@@ -543,30 +626,30 @@ class InstructionAgent(BaseAgent):
             subtask_summary = " → ".join([s.description[:30] for s in subtasks[:4]])
 
         prompt = f"""/no_think
-分析导航指令的语义含义，生成简洁的导航推理。
+Analyze the semantic meaning of the navigation instruction and generate concise navigation reasoning.
 
-## 导航指令
+## Navigation Instruction
 {instruction}
 
-## 解析信息
-- 方向词: {parsed.get('directions', [])}
-- 地标: {parsed.get('landmarks', [])}
-- 目标: {parsed.get('goals', [])}
+## Parsed Info
+- Directions: {parsed.get('directions', [])}
+- Landmarks: {parsed.get('landmarks', [])}
+- Goals: {parsed.get('goals', [])}
 
-## 子任务序列
-{subtask_summary if subtask_summary else "无"}
+## Subtask Sequence
+{subtask_summary if subtask_summary else "none"}
 
-## 输出要求
-生成一段简洁的语义推理（50字以内），包括：
-1. 主要导航意图
-2. 关键路径特征
-3. 注意事项
+## Output Requirements
+Generate a concise semantic reasoning (within 50 words), including:
+1. Main navigation intent
+2. Key path features
+3. Notes/attention points
 
-直接输出推理结果，不要JSON格式："""
+Output reasoning result directly, no JSON format:"""
 
         try:
             response = self._model_manager.generate(
-                "qwen-4b-instruction",
+                "qwen-9b-instruction",
                 prompt,
                 max_new_tokens=80,
                 temperature=0.2,
@@ -593,23 +676,23 @@ class InstructionAgent(BaseAgent):
         # Direction summary
         if parsed.get("directions"):
             dirs = "/".join(parsed["directions"][:3])
-            parts.append(f"方向:{dirs}")
+            parts.append(f"directions:{dirs}")
 
         # Landmark summary
         if parsed.get("landmarks"):
             landmarks = parsed["landmarks"][:2]
-            parts.append(f"地标:{'/'.join(landmarks)}")
+            parts.append(f"landmarks:{'/'.join(landmarks)}")
 
         # Goal summary
         if parsed.get("goals"):
             goals = parsed["goals"][:2]
-            parts.append(f"目标:{'/'.join(goals)}")
+            parts.append(f"goals:{'/'.join(goals)}")
 
         # Subtask count
         if subtasks:
-            parts.append(f"{len(subtasks)}步")
+            parts.append(f"{len(subtasks)} steps")
 
-        return "，".join(parts) if parts else "简单导航任务"
+        return ", ".join(parts) if parts else "Simple navigation task"
 
     def get_subtask_summary(self, context: NavContext) -> str:
         """Get a summary of current subtask progress."""
@@ -699,52 +782,50 @@ class InstructionAgent(BaseAgent):
             return None
 
         prompt = f"""/no_think
-你是导航指令分析专家。深度分解导航指令。
+你是导航指令分析专家。将指令分解为可执行的子任务。
 
 ## 指令
 {instruction}
 
-## 分析要求
-1. **子任务分解**: 将指令分解为独立的可执行步骤
-2. **空间拓扑**: 分析房间之间的连接关系
-3. **条件约束**: 识别每个子任务的前置条件和完成条件
+## 分解规则
+1. 每个子任务必须是完整的句子（动词+方向+目标）
+2. 应急指令（含"blocked"、"obstacle"、"path"）分解为：检测障碍 → 寻找替代路线 → 继续前进
+3. 不要按逗号机械分割，要理解语义
+4. 子任务数量控制在2-4个
 
-## 输出格式(JSON)
+## 输出格式（严格JSON，无其他内容）
 {{
   "subtasks": [
     {{
+      "id": 0,
+      "description": "检测到路径阻塞，准备绕行",
+      "level": "easy"
+    }},
+    {{
       "id": 1,
-      "action": "动作描述",
-      "level": "简单/中等/困难",
-      "precondition": "开始此步骤的前置条件",
-      "completion_condition": "如何判断此步骤完成",
-      "expected_landmarks": ["预期看到的地标"],
-      "spatial_constraint": "空间约束，如'必须在上楼前'"
+      "description": "寻找替代路线避开障碍物",
+      "level": "medium"
+    }},
+    {{
+      "id": 2,
+      "description": "继续向目标前进",
+      "level": "easy"
     }}
-  ],
-  "spatial_topology": {{
-    "rooms_sequence": ["房间序列"],
-    "vertical_change": "上楼/下楼/同层",
-    "total_distance_estimate": "预估距离"
-  }},
-  "critical_landmarks": [
-    {{"name": "地标名", "role": "转折点/确认点/目标", "expected_room": "所在房间"}}
-  ],
-  "reasoning": "整体任务流程分析"
+  ]
 }}
 
-只输出JSON。"""
+只输出JSON，无其他内容。"""
 
         try:
-            # Call LLM with qwen-4b-instruction for better instruction understanding
+            # Call LLM with qwen-9b-instruction for better instruction understanding
             response = self._model_manager.generate(
-                "qwen-4b-instruction",  # Use dedicated instruction model config
+                "qwen-9b-instruction",  # Use dedicated instruction model config
                 prompt=prompt,
                 max_new_tokens=200,
                 temperature=0.1,
             )
 
-            self.logger.info(f"[Instruction] LLM响应: {response[:100] if response else 'None'}...")
+            self.logger.info(f"[Instruction] LLM response: {response[:100] if response else 'None'}...")
 
             if not response:
                 self.logger.warning("LLM returned empty response")
@@ -776,7 +857,7 @@ class InstructionAgent(BaseAgent):
         """
         import json
 
-        self.logger.info(f"[Instruction] 解析响应: {response[:150] if response else 'None'}...")
+        self.logger.info(f"[Instruction] Parsing response: {response[:150] if response else 'None'}...")
 
         if not response:
             return None
@@ -799,7 +880,7 @@ class InstructionAgent(BaseAgent):
                 if "subtasks" in data and isinstance(data["subtasks"], list):
                     subtasks = self._parse_enhanced_json_format(data)
                     if subtasks:
-                        self.logger.info(f"[Instruction] JSON格式: {len(subtasks)}个子任务")
+                        self.logger.info(f"[Instruction] JSON format: {len(subtasks)} subtasks")
                         # Store additional metadata if available
                         if "spatial_topology" in data:
                             self._last_spatial_topology = data["spatial_topology"]
@@ -813,14 +894,14 @@ class InstructionAgent(BaseAgent):
         if '子任务' in text or '难度' in text:
             subtasks = self._parse_chinese_format(text)
             if subtasks:
-                self.logger.info(f"[Instruction] 中文格式: {len(subtasks)}个子任务")
+                self.logger.info(f"[Instruction] Chinese format: {len(subtasks)} subtasks")
                 return subtasks
 
         # 3. Try JSON array format: [{"action":"xxx","level":"easy"}]
         if '[' in text:
             subtasks = self._parse_json_format(text)
             if subtasks:
-                self.logger.info(f"[Instruction] 数组格式: {len(subtasks)}个子任务")
+                self.logger.info(f"[Instruction] Array format: {len(subtasks)} subtasks")
                 return subtasks
 
         self.logger.warning("No valid subtask decomposition found")
@@ -839,13 +920,13 @@ class InstructionAgent(BaseAgent):
                 continue
 
             # Map level
-            level = item.get("level", "中等")
+            level = item.get("level", "medium")
             if level in ["简单", "easy", "simple"]:
-                level = "简单"
+                level = "easy"
             elif level in ["困难", "hard", "difficult"]:
-                level = "困难"
+                level = "hard"
             else:
-                level = "中等"
+                level = "medium"
 
             # Extract precondition
             precondition = item.get("precondition", "")
@@ -922,14 +1003,18 @@ class InstructionAgent(BaseAgent):
             if not item.strip():
                 continue
 
-            # Parse: 子任务1：xxx，难度：简单 (allow space after 子任务)
-            # Extract action: matches "子任务 1：" or "子任务1：" with various colon types
-            action_match = re.search(r'子任务\s*\d+[：:]\s*([^，,；;]+)', item)
-            level_match = re.search(r'难度[：:]\s*(简单|中等|困难)', item)
+            # Parse: subtask 1: xxx, level: easy (allow space after subtask)
+            # Extract action: matches "subtask 1:" or "子任务1：" with various colon types
+            action_match = re.search(r'(?:subtask|子任务)\s*\d+[：:]\s*([^，,；;]+)', item)
+            level_match = re.search(r'(?:level|难度)[：:]\s*(easy|medium|hard|简单|中等|困难)', item)
 
             if action_match:
                 description = action_match.group(1).strip()
-                level = level_match.group(1) if level_match else "中等"
+                level_raw = level_match.group(1) if level_match else "medium"
+                # Normalize level
+                level_map = {"easy": "easy", "medium": "medium", "hard": "hard",
+                            "简单": "easy", "中等": "medium", "困难": "hard"}
+                level = level_map.get(level_raw.lower() if isinstance(level_raw, str) else "medium", "medium")
 
                 # Infer completion condition
                 _, condition = self._extract_action_and_condition(description)
@@ -983,10 +1068,10 @@ class InstructionAgent(BaseAgent):
                 description = item.get("action", item.get("description", ""))
                 level_raw = item.get("level", "medium")
 
-                # Map level
-                level_map = {"easy": "简单", "medium": "中等", "hard": "困难",
-                            "简单": "简单", "中等": "中等", "困难": "困难"}
-                level = level_map.get(level_raw.lower() if isinstance(level_raw, str) else "medium", "中等")
+                # Map level (normalize to English)
+                level_map = {"easy": "easy", "medium": "medium", "hard": "hard",
+                            "简单": "easy", "中等": "medium", "困难": "hard"}
+                level = level_map.get(level_raw.lower() if isinstance(level_raw, str) else "medium", "medium")
 
                 if description:
                     _, condition = self._extract_action_and_condition(description)
@@ -1106,7 +1191,7 @@ class InstructionAgent(BaseAgent):
                     subtasks.append(subtask)
 
                 if subtasks:
-                    self.logger.info(f"[Instruction] 创建{len(subtasks)}个子任务(含语义条件)")
+                    self.logger.info(f"[Instruction] Created {len(subtasks)} subtasks (with semantic conditions)")
                     return subtasks
 
         except json.JSONDecodeError as e:
@@ -1119,35 +1204,85 @@ class InstructionAgent(BaseAgent):
         return None
 
     def _parse_condition_string_fallback(self, condition_str: str) -> Optional[Dict[str, Any]]:
-        """Fallback rule-based condition parsing."""
-        condition_str = condition_str.lower()
+        """Fallback rule-based condition parsing with enhanced pattern recognition.
 
-        # Height change patterns
-        if "高度下降" in condition_str or "下楼" in condition_str or "down the stairs" in condition_str:
+        Enhanced rules:
+        1. More accurate height change detection (stairs up/down)
+        2. Rotation direction extraction with landmark context
+        3. Object/landmark approach detection
+        4. Spatial relationship parsing
+        """
+        condition_str_lower = condition_str.lower()
+
+        # === Height change patterns (stairs) ===
+        if any(kw in condition_str_lower for kw in ["down the stairs", "下楼", "下楼梯", "descend", "stair going down", "downstairs"]):
             return {"type": "y_change", "direction": "down", "min_change": 1.5, "description": condition_str}
-        elif "高度上升" in condition_str or "上楼" in condition_str or "up the stairs" in condition_str:
+        elif any(kw in condition_str_lower for kw in ["up the stairs", "上楼", "上楼梯", "ascend", "stair going up", "upstairs"]):
             return {"type": "y_change", "direction": "up", "min_change": 1.5, "description": condition_str}
 
-        # Rotation patterns
-        if "右转" in condition_str or "turn right" in condition_str or "右旋转" in condition_str:
+        # === Rotation patterns with direction ===
+        # Right turn
+        if any(kw in condition_str_lower for kw in ["turn right", "右转", "向右转", "right turn", "turn to the right"]):
             return {"type": "rotation", "direction": "right", "min_degrees": 60, "description": condition_str}
-        elif "左转" in condition_str or "turn left" in condition_str or "左旋转" in condition_str:
+        # Left turn
+        elif any(kw in condition_str_lower for kw in ["turn left", "左转", "向左转", "left turn", "turn to the left"]):
             return {"type": "rotation", "direction": "left", "min_degrees": 60, "description": condition_str}
 
-        # Distance/approach patterns
-        if "接近" in condition_str or "near" in condition_str or "reach" in condition_str or "arrive" in condition_str:
-            # Extract object name
-            for keyword in ["地毯", "rug", "bench", "piano", "door", "stairs", "staircase"]:
-                if keyword in condition_str:
-                    return {"type": "object_near", "object": keyword, "max_distance": 2.0, "description": condition_str}
+        # === Object/landmark approach patterns ===
+        # Common landmark objects
+        landmarks = ["rug", "carpet", "bench", "piano", "door", "stairs", "staircase", "kitchen",
+                     "bedroom", "bathroom", "hallway", "corridor", "table", "chair", "sofa",
+                     "window", "exit", "entrance", "floor", "wall"]
 
-        # Walk/distance patterns
-        if "walk" in condition_str or "move" in condition_str or "走" in condition_str:
+        # "walk towards/to/near/by [landmark]" patterns
+        approach_patterns = [
+            r"walk\s+(towards|to|near|by)\s+(?:the\s+)?(\w+)",
+            r"go\s+(towards|to|near|by)\s+(?:the\s+)?(\w+)",
+            r"reach\s+(?:the\s+)?(\w+)",
+            r"find\s+(?:the\s+)?(\w+)",
+            r"stop\s+(at|by|near)\s+(?:the\s+)?(\w+)",
+            r"wait\s+(at|by|near)\s+(?:the\s+)?(\w+)",
+        ]
+
+        import re
+        for pattern in approach_patterns:
+            match = re.search(pattern, condition_str_lower)
+            if match:
+                target = match.group(match.lastindex).strip()
+                # Check if target is a known landmark
+                if target in landmarks or any(lk in target for lk in landmarks):
+                    return {"type": "object_near", "object": target, "max_distance": 2.0, "description": condition_str}
+
+        # === Spatial relationship patterns ===
+        # "along [direction] side of wall/floor"
+        wall_patterns = [
+            r"(?:along|on)\s+(?:the\s+)?(left|right)\s+side\s+of\s+(?:the\s+)?(\w+)",
+            r"(?:beside|near)\s+(?:the\s+)?(\w+)\s+(?:along|on)\s+(?:the\s+)?(left|right)",
+        ]
+
+        for pattern in wall_patterns:
+            match = re.search(pattern, condition_str_lower)
+            if match:
+                direction = match.group(1) if "left" in match.group(1) or "right" in match.group(1) else match.group(2)
+                object_name = match.group(2) if direction == match.group(1) else match.group(1)
+                return {"type": "spatial_position", "direction": direction, "object": object_name, "description": condition_str}
+
+        # === Distance/walking patterns ===
+        if any(kw in condition_str_lower for kw in ["walk", "move", "走", "前进", "forward", "straight"]):
+            # Check for specific distance mentions
+            dist_match = re.search(r"(\d+)\s*(meter|m|step)", condition_str_lower)
+            if dist_match:
+                distance = float(dist_match.group(1))
+                return {"type": "distance", "min_meters": distance, "description": condition_str}
             return {"type": "distance", "min_meters": 3.0, "description": condition_str}
 
-        # At goal pattern
-        if "at goal" in condition_str or "目标" in condition_str or "目的地" in condition_str:
+        # === Goal/destination patterns ===
+        if any(kw in condition_str_lower for kw in ["at goal", "目标", "目的地", "destination", "end point", "final"]):
             return {"type": "at_goal", "max_distance": 2.0, "description": condition_str}
+
+        # === Wait/stop patterns ===
+        if any(kw in condition_str_lower for kw in ["wait", "stop", "停下", "等待"]):
+            return {"type": "wait", "steps": 3, "description": condition_str}
 
         # Return as generic condition with description
         return {"type": "generic", "description": condition_str}
@@ -1190,7 +1325,7 @@ class InstructionAgent(BaseAgent):
                 primary_action="forward",
                 confidence=0.5,
                 evidence={},
-                reasoning="无当前子任务",
+                reasoning="No current subtask",
                 constraints={},
             )
 
@@ -1233,11 +1368,11 @@ class InstructionAgent(BaseAgent):
 
         if "turn right" in description_lower or "右转" in description_lower:
             constraints["soft"].append(ActionConstraint(
-                action="turn_right", weight_multiplier=1.5, reason="子任务要求右转"
+                action="turn_right", weight_multiplier=1.5, reason="Subtask requires right turn"
             ))
         elif "turn left" in description_lower or "左转" in description_lower:
             constraints["soft"].append(ActionConstraint(
-                action="turn_left", weight_multiplier=1.5, reason="子任务要求左转"
+                action="turn_left", weight_multiplier=1.5, reason="Subtask requires left turn"
             ))
 
         # Calculate subtask progress
@@ -1341,6 +1476,6 @@ class InstructionAgent(BaseAgent):
                 "current_subtask": description[:60],
                 "subtask_progress": progress,
             },
-            reasoning=f"子任务: {description[:40]}",
+            reasoning=f"Subtask: {description[:40]}",
             constraints=constraints,
         )
