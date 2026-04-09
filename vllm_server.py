@@ -28,6 +28,9 @@ from typing import Dict, Optional, Any, List
 from contextlib import asynccontextmanager
 from io import BytesIO
 
+import cv2
+import numpy as np
+
 # Configure logging
 logging.basicConfig(
     level=logging.INFO,
@@ -43,51 +46,97 @@ model_configs: Dict[str, Dict] = {}
 conversation_contexts: Dict[str, List[Dict[str, str]]] = {}
 
 
+def process_depth_image(depth_image: "Image.Image", max_depth: float = 10.0) -> "Image.Image":
+    """将深度图像转换为 JET colormap 可视化。
+
+    Args:
+        depth_image: PIL Image，深度图像（单通道灰度）
+        max_depth: 最大深度值（米），用于归一化
+
+    Returns:
+        PIL Image，应用 JET colormap 后的彩色图像
+
+    颜色映射说明：
+        - 蓝色（冷色）：近距离（0m）
+        - 绿色/黄色：中等距离（2-5m）
+        - 红色（暖色）：远距离（10m+）
+    """
+    from PIL import Image
+
+    # 转为 numpy 数组
+    depth_array = np.array(depth_image)
+
+    # 根据数据类型进行归一化
+    if depth_array.dtype == np.uint16:
+        # 16-bit 深度图，值范围 0-65535
+        # 假设值与米成正比，需要根据实际传感器调整
+        depth_normalized = (depth_array / 65535.0 * max_depth).clip(0, max_depth)
+    elif depth_array.dtype == np.float32 or depth_array.dtype == np.float64:
+        # 浮点深度图，值单位可能是米
+        depth_normalized = depth_array.clip(0, max_depth)
+    else:
+        # 8-bit 深度图
+        depth_normalized = (depth_array / 255.0 * max_depth).clip(0, max_depth)
+
+    # 归一化到 0-255
+    depth_uint8 = (depth_normalized / max_depth * 255).astype(np.uint8)
+
+    # 应用 JET colormap
+    depth_colored = cv2.applyColorMap(depth_uint8, cv2.COLORMAP_JET)
+    depth_colored = cv2.cvtColor(depth_colored, cv2.COLOR_BGR2RGB)
+
+    return Image.fromarray(depth_colored)
+
+
 def get_model_configs() -> Dict[str, Dict]:
     """Get model configurations.
 
     Model allocation (same as llm_server.py for compatibility):
-    - qwen-4b-perception: Visual perception and scene description
-    - qwen-4b-instruction: Instruction decomposition with semantic analysis
-    - qwen-4b-decision: Navigation decision making
-    - qwen-4b-evaluation: Decision evaluation and feedback
-    - qwen-2b-trajectory: Trajectory summarization (2B for efficiency)
+    - qwen-9b-perception: Visual perception and scene description
+    - qwen-9b-instruction: Instruction decomposition with semantic analysis
+    - qwen-9b-decision: Navigation decision making
+    - qwen-9b-evaluation: Decision evaluation and feedback
+    - qwen-9b-trajectory: Trajectory summarization (2B for efficiency)
 
-    Note: All 4B models share the same physical weights but have independent configurations.
+    Note: All 9B models share the same physical weights but have independent configurations.
     Each agent uses a unique model key for isolated conversation contexts.
 
-    Total VRAM: ~6GB (2B) + ~8GB (4B) = ~14GB + Habitat ~2GB = ~16GB (safe for 24GB GPU)
+    Total VRAM: ~12GB (9B) + Habitat ~2GB = ~14GB (safe for 24GB GPU)
+
+    LoRA Support:
+    - Base model: Qwen3.5-9B (non-AWQ) for LoRA compatibility
+    - DecisionAgent can use LoRA adapter for enhanced decision making
     """
     return {
-        # === 4B Models (shared weights, independent configs) ===
-        "qwen-4b-perception": {
-            "model_name": "/root/.cache/modelscope/hub/models/Qwen/Qwen3___5-4B",
-            "max_new_tokens": 400,
+        # === 9B Models (shared weights, independent configs) ===
+        "qwen-9b-perception": {
+            "model_name": "/data/WZ/Model/Qwen/Qwen3___5-9B",  # Original model for LoRA support
+            "max_new_tokens": 200,
             "default_temperature": 0.3,
             "description": "Visual perception and scene description",
-            "is_vlm": True,  # Qwen3.5-4B is a multimodal VLM
+            "is_vlm": True,  # Qwen3.5-9B is a multimodal VLM
         },
-        "qwen-4b-instruction": {
-            "model_name": "/root/.cache/modelscope/hub/models/Qwen/Qwen3___5-4B",
-            "max_new_tokens": 300,
+        "qwen-9b-instruction": {
+            "model_name": "/data/WZ/Model/Qwen/Qwen3___5-9B",
+            "max_new_tokens": 200,
             "default_temperature": 0.1,  # Lower temperature for stable JSON output
             "description": "Instruction decomposition with semantic analysis",
         },
-        "qwen-4b-decision": {
-            "model_name": "/root/.cache/modelscope/hub/models/Qwen/Qwen3___5-4B",
-            "max_new_tokens": 250,
+        "qwen-9b-decision": {
+            "model_name": "/data/WZ/Model/Qwen/Qwen3___5-9B",
+            "max_new_tokens": 200,
             "default_temperature": 0.2,
-            "description": "Navigation decision making",
+            "description": "Navigation decision making (with LoRA support)",
+            "use_lora": True,  # This agent can use LoRA
         },
-        "qwen-4b-evaluation": {
-            "model_name": "/root/.cache/modelscope/hub/models/Qwen/Qwen3___5-4B",
-            "max_new_tokens": 150,
+        "qwen-9b-evaluation": {
+            "model_name": "/data/WZ/Model/Qwen/Qwen3___5-9B",
+            "max_new_tokens": 200,
             "default_temperature": 0.2,
             "description": "Decision evaluation and feedback",
         },
-        # === 2B Model ===
-        "qwen-2b-trajectory": {
-            "model_name": "/root/.cache/modelscope/hub/models/Qwen/Qwen3___5-2B",
+        "qwen-9b-trajectory": {
+            "model_name": "/data/WZ/Model/Qwen/Qwen3___5-9B",
             "max_new_tokens": 200,
             "default_temperature": 0.2,
             "description": "Trajectory summarization and navigation progress",
@@ -95,7 +144,17 @@ def get_model_configs() -> Dict[str, Dict]:
     }
 
 
-def load_vllm_engine(model_key: str, gpu_memory_utilization: float = 0.5) -> bool:
+# LoRA configuration
+LORA_CONFIG = {
+    "decision-lora": {
+        "path": "outputs/qlora_balanced/decision",
+        "target_model": "qwen-9b-decision",
+        "rank": 16,
+    }
+}
+
+
+def load_vllm_engine(model_key: str, gpu_memory_utilization: float = 0.5, enable_lora: bool = True) -> bool:
     """Load a vLLM engine for a model.
 
     Models with the same model_path share the same engine to save VRAM.
@@ -103,6 +162,7 @@ def load_vllm_engine(model_key: str, gpu_memory_utilization: float = 0.5) -> boo
     Args:
         model_key: Model identifier
         gpu_memory_utilization: GPU memory fraction for this engine
+        enable_lora: Whether to enable LoRA support
 
     Returns:
         True if loaded successfully
@@ -135,17 +195,27 @@ def load_vllm_engine(model_key: str, gpu_memory_utilization: float = 0.5) -> boo
         from vllm import LLM
 
         logger.info(f"Loading vLLM engine for {model_key} from {model_path}...")
+        logger.info(f"LoRA support: {'enabled' if enable_lora else 'disabled'}")
 
-        # vLLM engine initialization
+        # vLLM engine initialization with LoRA support
         # Note: vLLM automatically manages KV cache with PagedAttention
-        engine = LLM(
-            model=model_path,
-            dtype="float16",
-            gpu_memory_utilization=gpu_memory_utilization,
-            max_model_len=4096,  # Context length
-            trust_remote_code=True,
-            enforce_eager=True,  # Disable CUDA graphs for compatibility
-        )
+        engine_kwargs = {
+            "model": model_path,
+            "dtype": "float16",
+            "gpu_memory_utilization": gpu_memory_utilization,
+            "max_model_len": 4096,  # Context length
+            "trust_remote_code": True,
+            "enforce_eager": True,  # Disable CUDA graphs for compatibility
+        }
+
+        # Add LoRA support if enabled
+        if enable_lora:
+            engine_kwargs["enable_lora"] = True
+            engine_kwargs["max_lora_rank"] = 16
+            engine_kwargs["max_loras"] = 1
+            logger.info("LoRA enabled: max_rank=16, max_adapters=1")
+
+        engine = LLM(**engine_kwargs)
 
         llm_engines[model_key] = engine
         logger.info(f"vLLM engine for {model_key} loaded successfully")
@@ -189,8 +259,9 @@ def load_all_models(gpu_memory_utilization: float = 0.5) -> bool:
 
     # Calculate GPU memory per engine
     num_engines = len(unique_models)
+    # Use the passed gpu_memory_utilization parameter
     # Reserve some memory for system, distribute rest evenly
-    memory_per_engine = min(0.45, 0.9 / num_engines)  # Max 45% per engine, or split 90%
+    memory_per_engine = min(gpu_memory_utilization, 0.9 / num_engines) if num_engines > 0 else gpu_memory_utilization
 
     logger.info(f"GPU memory per engine: {memory_per_engine:.2f}")
 
@@ -214,7 +285,9 @@ def load_all_models(gpu_memory_utilization: float = 0.5) -> bool:
             from vllm import LLM
 
             logger.info(f"Loading vLLM engine for {first_key} from {model_path}...")
+            logger.info("LoRA support: enabled")
 
+            # Enable LoRA support for all engines
             engine = LLM(
                 model=model_path,
                 dtype="float16",
@@ -222,6 +295,9 @@ def load_all_models(gpu_memory_utilization: float = 0.5) -> bool:
                 max_model_len=4096,
                 trust_remote_code=True,
                 enforce_eager=True,
+                enable_lora=True,
+                max_lora_rank=16,
+                max_loras=1,
             )
 
             # Share engine among all model_keys with same path
@@ -252,6 +328,7 @@ def generate_text(
     temperature: Optional[float] = None,
     conversation_id: Optional[str] = None,
     keep_context: bool = False,
+    lora_name: Optional[str] = None,
 ) -> Dict[str, Any]:
     """Generate text using vLLM engine.
 
@@ -262,6 +339,7 @@ def generate_text(
         temperature: Sampling temperature
         conversation_id: Optional ID for multi-turn conversations
         keep_context: Whether to keep conversation context
+        lora_name: Optional LoRA adapter name (e.g., "decision-lora")
 
     Returns:
         Dictionary with response and metadata
@@ -307,8 +385,20 @@ def generate_text(
             top_k=50,
         )
 
+        # Prepare LoRA request if specified
+        lora_request = None
+        if lora_name and lora_name in LORA_CONFIG:
+            from vllm.lora.request import LoRARequest
+            lora_config = LORA_CONFIG[lora_name]
+            lora_request = LoRARequest(
+                lora_name=lora_name,
+                lora_int_id=hash(lora_name) % 10000 + 1,  # Generate unique int ID
+                lora_path=lora_config["path"],
+            )
+            logger.info(f"Using LoRA adapter: {lora_name} from {lora_config['path']}")
+
         # Generate with vLLM
-        outputs = engine.generate([full_prompt], sampling_params)
+        outputs = engine.generate([full_prompt], sampling_params, lora_request=lora_request)
 
         # Extract response
         generated_text = outputs[0].outputs[0].text.strip()
@@ -331,6 +421,7 @@ def generate_text(
             "tokens_generated": tokens_generated,
             "latency_ms": latency,
             "conversation_id": conversation_id,
+            "lora_used": lora_name,
         }
 
     except Exception as e:
@@ -357,7 +448,7 @@ def generate_vision(
     the <|image_pad|> token and TextPrompt format for multimodal inputs.
 
     Args:
-        model_key: Model identifier (e.g., qwen-4b-perception)
+        model_key: Model identifier (e.g., qwen-9b-perception)
         prompt: Input prompt
         image_base64: Base64 encoded RGB image
         max_new_tokens: Maximum tokens to generate
@@ -400,6 +491,7 @@ def generate_vision(
         image_tokens = "<|image_pad|>"
 
         # Add depth image if provided
+        # Note: depth_base64 is already a colored image (JET colormap applied by remote_client)
         if depth_base64:
             depth_data = base64.b64decode(depth_base64)
             depth_image = Image.open(BytesIO(depth_data))
@@ -408,8 +500,17 @@ def generate_vision(
             images.append(depth_image)
             image_tokens = "<|image_pad|><|image_pad|>"  # Two images
 
+        # Wrap prompt with Qwen chat format if not already present
+        # Qwen3.5-VL requires proper chat format for correct generation
+        if "<|im_start|>" not in prompt:
+            # Remove /no_think directive if present (Qwen3.5 uses thinking tags internally)
+            clean_prompt = prompt.replace("/no_think", "").strip()
+            formatted_prompt = f"<|im_start|>user\n{clean_prompt}\n<|im_end|>\n<|im_start|>assistant\n"
+        else:
+            formatted_prompt = prompt
+
         # Build full prompt with image tokens
-        full_prompt = f"{image_tokens}{prompt}"
+        full_prompt = f"{image_tokens}{formatted_prompt}"
 
         # Create TextPrompt with multimodal data
         text_prompt = TextPrompt(
@@ -483,12 +584,13 @@ def create_app() -> "FastAPI":
 
     class GenerateRequest(BaseModel):
         """Request model for text generation."""
-        model: str = Field(..., description="Model identifier (e.g., qwen-4b-decision)")
+        model: str = Field(..., description="Model identifier (e.g., qwen-9b-decision)")
         prompt: str = Field(..., description="Input prompt for generation")
         max_new_tokens: Optional[int] = Field(None, description="Maximum tokens to generate")
         temperature: Optional[float] = Field(None, description="Sampling temperature (0.0-2.0)")
         conversation_id: Optional[str] = Field(None, description="Optional ID for multi-turn conversations")
         keep_context: bool = Field(False, description="Whether to keep conversation context")
+        lora_name: Optional[str] = Field(None, description="Optional LoRA adapter name (e.g., decision-lora)")
 
     class GenerateResponse(BaseModel):
         """Response model for text generation."""
@@ -497,6 +599,7 @@ def create_app() -> "FastAPI":
         tokens_generated: int
         latency_ms: float
         conversation_id: Optional[str] = None
+        lora_used: Optional[str] = None
         error: Optional[str] = None
 
     class HealthResponse(BaseModel):
@@ -537,7 +640,7 @@ def create_app() -> "FastAPI":
 
     @app.post("/generate", response_model=GenerateResponse)
     async def generate(request: GenerateRequest):
-        """Generate text using specified model."""
+        """Generate text using specified model with optional LoRA."""
         if request.model not in llm_engines:
             raise HTTPException(
                 status_code=400,
@@ -551,6 +654,7 @@ def create_app() -> "FastAPI":
             temperature=request.temperature,
             conversation_id=request.conversation_id,
             keep_context=request.keep_context,
+            lora_name=request.lora_name,
         )
 
         if "error" in result and "response" not in result:
@@ -562,12 +666,13 @@ def create_app() -> "FastAPI":
             tokens_generated=result.get("tokens_generated", 0),
             latency_ms=result.get("latency_ms", 0),
             conversation_id=result.get("conversation_id"),
+            lora_used=result.get("lora_used"),
             error=result.get("error"),
         )
 
     class GenerateVisionRequest(BaseModel):
         """Request model for vision-language generation."""
-        model: str = Field(default="qwen-4b-perception", description="VLM model identifier")
+        model: str = Field(default="qwen-9b-perception", description="VLM model identifier")
         prompt: str = Field(..., description="Input prompt for generation")
         image_base64: str = Field(..., description="Base64 encoded RGB image")
         max_new_tokens: Optional[int] = Field(None, description="Maximum tokens to generate")
@@ -649,7 +754,7 @@ def main():
     parser = argparse.ArgumentParser(description="VLN vLLM Inference Server")
     parser.add_argument("--port", type=int, default=8000, help="Server port")
     parser.add_argument("--host", type=str, default="0.0.0.0", help="Server host")
-    parser.add_argument("--gpu-memory", type=float, default=0.5,
+    parser.add_argument("--gpu-memory", type=float, default=0.85,
                         help="GPU memory utilization per engine (0.0-1.0)")
     parser.add_argument("--models", type=str, nargs="*", default=None,
                         help="Specific models to load (default: all)")
