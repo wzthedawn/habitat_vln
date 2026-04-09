@@ -548,15 +548,33 @@ Output JSON only:"""
         return None
 
     def _split_instruction(self, text: str) -> List[str]:
-        """Split instruction into subtask segments with enhanced recognition.
+        """Split instruction into subtask segments with multi-level decomposition.
 
-        Enhanced rules:
-        1. Check for emergency instruction template first
-        2. Identify key action keywords as segment boundaries
-        3. Handle conjunction patterns more accurately
-        4. Preserve landmark context with each segment
+        Decomposition flow:
+        1. Emergency detection via keyword matching (_is_emergency_instruction)
+        2. If emergency: try LLM intelligent decomposition (_emergency_decompose_with_llm)
+        3. Fallback: regex template parsing (_parse_emergency_instruction)
+        4. Final fallback: general splitting by conjunctions and actions
+
+        Args:
+            text: Navigation instruction text
+
+        Returns:
+            List of subtask description strings
         """
-        # 首先检测应急指令模板
+
+        # 首先检测是否为应急指令
+        if self._is_emergency_instruction(text):
+            self.logger.info(f"[Instruction] Detected emergency instruction: {text[:50]}...")
+            # 尝试LLM智能分解
+            llm_subtasks = self._emergency_decompose_with_llm(text)
+            if llm_subtasks:
+                self.logger.info(f"[Instruction] LLM decomposition returned {len(llm_subtasks)} subtasks")
+                return llm_subtasks
+            else:
+                self.logger.warning("[Instruction] LLM decomposition failed, falling back to regex")
+
+        # 原有逻辑：检测应急指令模板
         emergency_segments = self._parse_emergency_instruction(text)
         if emergency_segments:
             return emergency_segments
