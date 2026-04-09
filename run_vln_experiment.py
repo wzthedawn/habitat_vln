@@ -1127,6 +1127,36 @@ class MultiAgentVLNEvaluator:
                         self.logger.warning(f"Failed to extract rotation: {e}")
 
                 dist = self._distance(pos, episode.goal_position)
+
+                # === 计算目标方向角度 ===
+                dx = episode.goal_position[0] - pos[0]
+                dz = episode.goal_position[2] - pos[2]
+                angle_to_goal = math.atan2(dx, dz)
+                relative_angle = angle_to_goal - context.rotation
+                relative_angle_deg = math.degrees(relative_angle)
+                # 归一化到 [-180, 180]
+                relative_angle_deg = ((relative_angle_deg + 180) % 360) - 180
+
+                # 生成人类可读方向提示
+                if -30 < relative_angle_deg < 30:
+                    direction_hint = "前方"
+                elif 30 <= relative_angle_deg < 60:
+                    direction_hint = "右前方"
+                elif 60 <= relative_angle_deg < 120:
+                    direction_hint = "右边"
+                elif 120 <= relative_angle_deg <= 180:
+                    direction_hint = "右后方"
+                elif -60 <= relative_angle_deg < -30:
+                    direction_hint = "左前方"
+                elif -120 <= relative_angle_deg < -60:
+                    direction_hint = "左边"
+                else:
+                    direction_hint = "左后方"
+
+                # 存入 context metadata
+                context.metadata["angle_to_goal"] = relative_angle_deg
+                context.metadata["direction_hint"] = direction_hint
+
                 min_distance = min(min_distance, dist)
 
                 # Record step output
