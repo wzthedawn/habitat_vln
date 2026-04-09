@@ -1177,6 +1177,23 @@ class MultiAgentVLNEvaluator:
 
                 dist = self._distance(pos, episode.goal_position)
 
+                # === 距离变化反馈 ===
+                last_distance = context.metadata.get("last_distance", dist)
+                distance_delta = last_distance - dist  # 正数=靠近，负数=远离
+
+                # 判断趋势
+                if distance_delta > 0.1:
+                    distance_trend = "正在靠近目标"
+                elif distance_delta < -0.1:
+                    distance_trend = "正在远离目标"
+                else:
+                    distance_trend = "距离稳定"
+
+                # 更新记录
+                context.metadata["last_distance"] = dist
+                context.metadata["distance_delta"] = distance_delta
+                context.metadata["distance_trend"] = distance_trend
+
                 # === 计算目标方向角度 ===
                 dx = episode.goal_position[0] - pos[0]
                 dz = episode.goal_position[2] - pos[2]

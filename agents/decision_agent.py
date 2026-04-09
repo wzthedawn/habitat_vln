@@ -666,6 +666,10 @@ class DecisionAgent(BaseAgent):
         # Get obstacle info
         obstacle_info = context.metadata.get("obstacle_info", {}) if context else {}
 
+        # Get distance change info
+        distance_delta = context.metadata.get("distance_delta", 0) if context else 0
+        distance_trend = context.metadata.get("distance_trend", "未知") if context else "未知"
+
         # Build obstacle section string
         obstacle_section = ""
         if obstacle_info:
@@ -825,6 +829,7 @@ You are a navigation decision system. Synthesize information from all agents and
 - Heading: {heading}
 - Distance traveled: {dist_traveled:.1f}m
 - Distance to goal: {distance_to_goal:.1f}m
+- Distance change: {distance_trend} ({distance_delta:+.2f}m)
 - Goal direction: 目标在{direction_hint} (相对角度: {angle_to_goal:.0f}°){obstacle_section}{history_section}
 ## Action Types
 - forward: move forward one step
@@ -860,6 +865,10 @@ IMPORTANT: Keep reasoning brief (1-2 sentences). Output JSON directly:"""
 
         # Get obstacle info
         obstacle_info = context.metadata.get("obstacle_info", {}) if context else {}
+
+        # Get distance change info
+        distance_delta = context.metadata.get("distance_delta", 0) if context else 0
+        distance_trend = context.metadata.get("distance_trend", "未知") if context else "未知"
 
         # Build obstacle section string
         obstacle_section = ""
@@ -997,6 +1006,7 @@ You are a navigation decision system. {seq_constraint}.
 - Heading: {heading}
 - Distance traveled: {dist_traveled:.1f}m
 - Distance to goal: {distance_to_goal:.1f}m
+- Distance change: {distance_trend} ({distance_delta:+.2f}m)
 - Goal direction: 目标在{direction_hint} (相对角度: {angle_to_goal:.0f}°){obstacle_section}
 
 ## Strategy Analysis (CoT)
@@ -1066,6 +1076,10 @@ Generate action sequence based on strategy analysis:
 
         # Get obstacle info
         obstacle_info = context.metadata.get("obstacle_info", {}) if context else {}
+
+        # Get distance change info
+        distance_delta = context.metadata.get("distance_delta", 0) if context else 0
+        distance_trend = context.metadata.get("distance_trend", "未知") if context else "未知"
 
         # Build obstacle section string
         obstacle_section = ""
@@ -1193,6 +1207,7 @@ You are a navigation decision system. {seq_constraint}.
 - Heading: {heading}
 - Distance traveled: {dist_traveled:.1f}m
 - Distance to goal: {distance_to_goal:.1f}m
+- Distance change: {distance_trend} ({distance_delta:+.2f}m)
 - Goal direction: 目标在{direction_hint} (相对角度: {angle_to_goal:.0f}°){obstacle_section}
 
 ## Agent Opinions
