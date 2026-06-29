@@ -5,6 +5,7 @@ from .perception_agent import PerceptionAgent
 from .trajectory_agent import TrajectoryAgent
 from .decision_agent import DecisionAgent
 from .evaluation_agent import EvaluationAgent
+from .topology_graph import TopologyGraph, GraphNode, GraphEdge, KeyPositionDetector
 
 __all__ = [
     "BaseAgent",
@@ -15,4 +16,8 @@ __all__ = [
     "TrajectoryAgent",
     "DecisionAgent",
     "EvaluationAgent",
+    "TopologyGraph",
+    "GraphNode",
+    "GraphEdge",
+    "KeyPositionDetector",
 ]

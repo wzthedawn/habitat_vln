@@ -155,7 +155,7 @@ MODEL_PATHS = {
 MODEL_PATH="/your/path/to/Qwen3___5-4B"
 ```
 
-**默认路径**: `/root/.cache/modelscope/hub/models/Qwen/Qwen3___5-4B`
+**默认路径**: `/data/WZ/Model/Qwen/Qwen3___5-4B`
 
 ## 常见问题
 

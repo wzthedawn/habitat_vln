@@ -7,7 +7,7 @@ This version uses Qwen3.5-9B-AWQ (via remote LLM server) for:
 4. Emergency response for dynamic obstacles
 """
 
-from typing import Dict, Any, Optional, List
+from typing import Dict, Any, Optional, List, Tuple
 import logging
 import json
 import re
@@ -15,7 +15,7 @@ import math
 
 from .base_agent import BaseAgent, AgentOutput, AgentRole
 from core.context import NavContext
-from core.action import Action, ActionType
+from core.action import Action, ActionType, ActionSequence
 
 
 class DecisionAgent(BaseAgent):
@@ -31,8 +31,13 @@ class DecisionAgent(BaseAgent):
     4. Emergency response for dynamic obstacles (Phase 2a)
     """
 
+    # Class constants
+    MAX_STEPS = 150  # Maximum navigation steps
+
     # Action mapping
+    # Action mapping - comprehensive for all parsing scenarios
     ACTION_MAP = {
+        # Standard actions
         "forward": ActionType.MOVE_FORWARD,
         "move_forward": ActionType.MOVE_FORWARD,
         "turn_left": ActionType.TURN_LEFT,
@@ -42,6 +47,15 @@ class DecisionAgent(BaseAgent):
         "stop": ActionType.STOP,
         "look_up": ActionType.LOOK_UP,
         "look_down": ActionType.LOOK_DOWN,
+        # Natural language variants
+        "move forward": ActionType.MOVE_FORWARD,
+        "go forward": ActionType.MOVE_FORWARD,
+        "walk forward": ActionType.MOVE_FORWARD,
+        "turn left": ActionType.TURN_LEFT,
+        "rotate left": ActionType.TURN_LEFT,
+        "turn right": ActionType.TURN_RIGHT,
+        "rotate right": ActionType.TURN_RIGHT,
+        "wait": ActionType.STOP,
     }
 
     def __init__(self, config: Dict[str, Any] = None):
@@ -74,20 +88,12 @@ class DecisionAgent(BaseAgent):
         self._path_replanner = None  # PathReplanner instance
         self._emergency_mode = False  # Current emergency state
 
-        # === LoRA CONFIGURATION ===
-        self._use_lora = True  # Default: use LoRA for decision tasks
-        self._lora_name = "decision-lora"  # LoRA adapter name
+        # === EMERGENCY RESPONSE (Phase 2a) ===
 
     @property
     def name(self) -> str:
         return "decision_agent"
 
-    def set_use_lora(self, use_lora: bool):
-        """Enable or disable LoRA for decision tasks."""
-        self._use_lora = use_lora
-        self.logger.info(f"LoRA {'enabled' if use_lora else 'disabled'} for DecisionAgent")
-
-    @property
     def role(self) -> AgentRole:
         return AgentRole.DECISION
 
@@ -165,8 +171,6 @@ class DecisionAgent(BaseAgent):
         Returns:
             ActionSequence with actions, reasoning, and subtask_completed
         """
-        from core.action import ActionSequence, ActionType
-
         self.initialize()
 
         # === EMERGENCY RESPONSE (Phase 2a) ===
@@ -178,6 +182,17 @@ class DecisionAgent(BaseAgent):
 
         # Get strategy data
         strategy_data = strategy_result.metadata if strategy_result else {}
+
+        # FIX: For easy tasks (strategy skipped), populate strategy_data from context.metadata
+        if not strategy_data:
+            perception_output = context.metadata.get("perception_output", {})
+            trajectory_output = context.metadata.get("trajectory_output", {})
+            instruction_output = context.metadata.get("instruction_output", {})
+            strategy_data = {
+                "perception": perception_output,
+                "trajectory": trajectory_output,
+                "instruction": instruction_output,
+            }
 
         # ===== NEW: Update spatial memory =====
         perception_output = context.metadata.get("perception_output", {}) if context else {}
@@ -205,60 +220,136 @@ class DecisionAgent(BaseAgent):
             if auto_completed:
                 self.logger.info(f"[Decision] AUTO-COMPLETED: Condition '{completion_condition.get('type')}' satisfied")
 
+        # === NEW: Priority use structured suggestion from CoT ===
+        # EXPERIMENTAL: Temporarily disable skip to test Direct VLM
+        FORCE_LLM = True  # TODO: Set to False after testing
+        if level == "medium" and strategy_data and not FORCE_LLM:
+            suggestion = strategy_data.get("suggestion", {})
+            if suggestion and suggestion.get("direction"):
+                # Direct conversion - skip LLM call
+                self.logger.info(f"[Decision] Using structured suggestion: direction={suggestion.get('direction')}")
+                actions = self._convert_suggestion_to_actions(suggestion)
+
+                reasoning = strategy_data.get("analysis", "")[:200] if strategy_data.get("analysis") else "CoT suggestion"
+                subtask_completed_flag = strategy_data.get("subtask_completed", False)
+
+                return ActionSequence(
+                    subtask_id=subtask.id if subtask else 0,
+                    subtask_description=subtask.description if subtask else "",
+                    actions=actions,
+                    estimated_steps=len(actions),
+                    reasoning=f"Suggestion converted: {reasoning[:100]}",
+                    confidence=0.8,
+                    abort_conditions={"stuck_for_steps": 5},
+                    subtask_completed=subtask_completed_flag,
+                )
+
+        # === Skip LLM for medium tasks when CoT analysis has clear actions ===
+        if level == "medium" and strategy_data and strategy_data.get("analysis"):
+            direct_actions = self._extract_actions_from_cot_analysis(strategy_data.get("analysis", ""))
+            min_actions_for_medium = 3
+
+            if len(direct_actions) >= min_actions_for_medium:
+                self.logger.info(f"[Decision] 直接提取CoT动作: {len(direct_actions)}步，跳过LLM调用")
+                reasoning_preview = strategy_data.get("analysis", "")[:200]
+
+                return ActionSequence(
+                    subtask_id=subtask.id if subtask else 0,
+                    subtask_description=subtask.description if subtask else "",
+                    actions=direct_actions,
+                    estimated_steps=sum(a[1] for a in direct_actions),
+                    reasoning=f"CoT直接提取: {reasoning_preview[:100]}",
+                    confidence=0.7,
+                    abort_conditions={"stuck_for_steps": 5},
+                    subtask_completed=False,
+                )
+            else:
+                self.logger.info(f"[Decision] CoT提取动作不足({len(direct_actions)}步)，继续LLM调用")
+
         # Build prompt based on difficulty
-        prompt = self._build_sequence_prompt_v2(context, subtask, strategy_data, level)
+        base_prompt = self._build_prompt(context, subtask, strategy_data, level)
 
         actions = []
         reasoning = ""
         subtask_completed = False
+        last_response = ""
 
-        try:
-            # Call LLM to generate sequence
-            # Use LoRA adapter for decision tasks (fine-tuned for navigation decisions)
-            if self._model_manager:
-                # Determine LoRA usage based on configuration
-                lora_name = self._lora_name if self._use_lora else None
+        # 强制要求5个动作
+        REQUIRED_ACTIONS = 5
+        MAX_RETRIES = 2
 
-                response = self._model_manager.generate(
-                    "qwen-9b-decision",
-                    prompt,
-                    max_new_tokens=2000,
-                    temperature=0.01,
-                    lora_name=lora_name,
-                )
-                if response:
-                    self.logger.info(f"[Decision] LLM response : {response[:500]}...")
-                    self.logger.info(f"[Decision] LLM response length: {len(response)} chars")
-                    actions, reasoning, subtask_completed = self._parse_sequence_response(response)
-                    self.logger.info(f"[Decision] Parsed: {len(actions)} steps, completed:{subtask_completed}")
+        for attempt in range(MAX_RETRIES + 1):
+            prompt = base_prompt
+            if attempt > 0 and last_response:
+                # 重试时添加失败反馈
+                prompt += f"\n\n**上次输出解析失败，必须输出{REQUIRED_ACTIONS}个动作！**\n上次输出: {last_response[:300]}\n\n请重新输出完整JSON，actions数组必须包含{REQUIRED_ACTIONS}个动作对象。"
+
+            try:
+                if self._model_manager:
+                    response = self._model_manager.generate(
+                        "qwen-9b-decision",
+                        prompt,
+                        max_new_tokens=1500,
+                        temperature=0.01,
+                    )
+                    if response:
+                        last_response = response
+                        self.logger.info(f"[Decision] LLM response (attempt {attempt+1}): {response[:500]}...")
+                        self.logger.info(f"[Decision] LLM response length: {len(response)} chars")
+                        actions, reasoning, subtask_completed = self._parse_sequence_response(response)
+                        self.logger.info(f"[Decision] Parsed: {len(actions)} steps, completed:{subtask_completed}")
+
+                        # 检查是否满足动作数量要求
+                        if len(actions) >= REQUIRED_ACTIONS:
+                            break  # 成功，跳出重试循环
+                        else:
+                            self.logger.warning(f"[Decision] Attempt {attempt+1}: got {len(actions)} actions, need {REQUIRED_ACTIONS}")
+                    else:
+                        self.logger.error("[Decision] LLM returned empty response")
                 else:
-                    self.logger.error("[Decision] LLM returned empty response")
-            else:
-                raise RuntimeError("Model manager not initialized")
+                    raise RuntimeError("Model manager not initialized")
 
-        except Exception as e:
-            raise RuntimeError(f"[SEQUENCE] LLM generation failed: {e}")
+            except Exception as e:
+                self.logger.error(f"[Decision] Attempt {attempt+1} error: {e}")
+                if attempt == MAX_RETRIES:
+                    raise RuntimeError(f"[SEQUENCE] LLM generation failed after {MAX_RETRIES+1} attempts: {e}")
 
-        # ===== NEW: Override with auto-detected completion =====
-        if auto_completed and not subtask_completed:
-            self.logger.info(f"[Decision] Overriding LLM completion: False -> True (auto-detected)")
-            subtask_completed = True
+        # 所有重试都失败
+        if len(actions) < REQUIRED_ACTIONS:
+            raise RuntimeError(
+                f"[SEQUENCE] Parse failed after {MAX_RETRIES+1} attempts. "
+                f"Got {len(actions)} actions, need {REQUIRED_ACTIONS}. "
+                f"Last LLM output: {last_response[:500]}"
+            )
 
-        # Determine minimum actions based on adaptive mode
-        if self.adaptive_sequence:
-            min_actions = self.min_sequence_length
+        # ===== NEW: Dual verification with conservative strategy =====
+        # 任一判断未完成 → 继续导航（保守策略）
+        if auto_completed and subtask_completed:
+            # 两者都完成才标记完成
+            final_completed = True
+            self.logger.info(f"[Decision] 双重验证通过: 自动={auto_completed}, LLM={subtask_completed}")
+        elif auto_completed and not subtask_completed:
+            # 自动检测完成但LLM未完成 → 继续执行（保守）
+            final_completed = False
+            self.logger.info(f"[Decision] 保守策略: 自动完成但LLM未确认")
+        elif not auto_completed and subtask_completed:
+            # LLM完成但自动检测未完成 → 继续执行（保守）
+            final_completed = False
+            self.logger.warning(f"[Decision] 保守策略: LLM声称完成但自动检测未通过")
         else:
-            min_actions = max(3, self.sequence_length - 2)
+            # 两方都未完成
+            final_completed = False
 
-        if len(actions) < min_actions:
-            raise RuntimeError(f"[SEQUENCE] Parse failed, got {len(actions)} actions, need at least {min_actions}")
+        # Override subtask_completed with final verification result
+        subtask_completed = final_completed
 
+        # 动作数量已在重试循环中验证（必须>=5）
         self.logger.info(f"[Decision] Level:{level}, {len(actions)} steps, completed:{subtask_completed}")
 
         # Print to console
         action_names = [a[0].name if isinstance(a, tuple) else str(a) for a in actions]
         print(f"\n[DecisionAgent] Generated {len(actions)} actions: {action_names[:5]}{'...' if len(actions) > 5 else ''}")
-        print(f"[DecisionAgent] Reasoning: {reasoning[:200]}{'...' if len(reasoning) > 200 else ''}")
+        print(f"[DecisionAgent] Reasoning: {reasoning}")
 
         subtask_id = subtask.id if subtask and hasattr(subtask, 'id') else 0
 
@@ -285,8 +376,6 @@ class DecisionAgent(BaseAgent):
         Only triggers stuck detection when executing forward actions.
         Turning in place (turn_left/turn_right) should not trigger stuck.
         """
-        from core.action import ActionType
-
         # Only check stuck when moving forward, not when turning
         is_forward_action = False
         if current_action:
@@ -330,8 +419,6 @@ class DecisionAgent(BaseAgent):
         Returns:
             ActionSequence with emergency response actions
         """
-        from core.action import ActionSequence
-
         self._emergency_mode = True
         event_type = emergency_signal.get("event_type", "unknown")
         event_position = emergency_signal.get("position")
@@ -400,6 +487,48 @@ class DecisionAgent(BaseAgent):
             confidence=0.7
         )
 
+    def _convert_suggestion_to_actions(self, suggestion: dict) -> List[tuple]:
+        """将CoT建议转换为精确动作序列.
+
+        Args:
+            suggestion: CoT建议字典，格式如下:
+                {
+                    "direction": "left" | "right" | "forward",
+                    "turn_count": {"min": 2, "max": 3},
+                    "forward_count": {"min": 3, "max": 5}
+                }
+
+        Returns:
+            List of (ActionType, count) tuples
+        """
+        direction = suggestion.get("direction", "forward")
+        turn_data = suggestion.get("turn_count", {})
+        forward_data = suggestion.get("forward_count", {})
+
+        turn_min = turn_data.get("min", 0) if isinstance(turn_data, dict) else 0
+        turn_max = turn_data.get("max", 0) if isinstance(turn_data, dict) else 0
+        forward_min = forward_data.get("min", 1) if isinstance(forward_data, dict) else 1
+        forward_max = forward_data.get("max", 5) if isinstance(forward_data, dict) else 5
+
+        actions = []
+
+        # 1. 转向动作
+        if direction == "left":
+            turn_count = max(2, (turn_min + turn_max) // 2)  # Middle value with minimum 2
+            actions.extend([(ActionType.TURN_LEFT, 1)] * turn_count)
+            self.logger.info(f"[Decision] Suggestion: turn_left {turn_count} times")
+        elif direction == "right":
+            turn_count = max(2, (turn_min + turn_max) // 2)  # Middle value with minimum 2
+            actions.extend([(ActionType.TURN_RIGHT, 1)] * turn_count)
+            self.logger.info(f"[Decision] Suggestion: turn_right {turn_count} times")
+
+        # 2. 前进动作
+        forward_count = max(3, (forward_min + forward_max) // 2)  # Middle value with minimum 3
+        actions.extend([(ActionType.MOVE_FORWARD, 1)] * forward_count)
+        self.logger.info(f"[Decision] Suggestion: forward {forward_count} times")
+
+        return actions
+
     def _generate_escape_actions(
         self,
         context: NavContext,
@@ -458,12 +587,12 @@ class DecisionAgent(BaseAgent):
         self._exploration_directions = []
         self.logger.info("[Decision] Spatial memory reset for new episode")
 
-    def update_spatial_memory(self, position: List[float], perception_output: Dict = None) -> None:
+    def update_spatial_memory(self, position: List[float], perception_output: str = None) -> None:
         """Update spatial memory with current position and perception.
 
         Args:
             position: Current [x, y, z] position
-            perception_output: Latest perception output with stair info
+            perception_output: Natural language scene description (now a string)
         """
         if position and len(position) >= 3:
             # Round to 0.5m grid for visited positions
@@ -476,25 +605,27 @@ class DecisionAgent(BaseAgent):
                 if len(self._visited_positions) > 50:
                     self._visited_positions.pop(0)
 
-        # Track stair detections
-        if perception_output:
-            stair_entrance = perception_output.get("stair_entrance", {})
-            stairs = perception_output.get("stairs", {})
+        # 楼梯检测：从自然语言描述中简单判断
+        if perception_output and isinstance(perception_output, str):
+            desc_lower = perception_output.lower()
+            if "stairs" in desc_lower or "stair" in desc_lower or "step" in desc_lower:
+                # 检测到楼梯相关词汇
+                if "up" in desc_lower or "ascend" in desc_lower:
+                    stair_dir = "up"
+                elif "down" in desc_lower or "descend" in desc_lower:
+                    stair_dir = "down"
+                else:
+                    stair_dir = "unknown"
 
-            if stair_entrance.get("found"):
                 detection = {
-                    "direction": stair_entrance.get("direction", "unknown"),
-                    "stair_direction": stair_entrance.get("stair_direction", "unknown"),
-                    "distance": stair_entrance.get("distance", 0),
+                    "direction": "detected",
+                    "stair_direction": stair_dir,
                     "position": position[:3] if position else None,
                 }
                 self._stair_detections.append(detection)
-                # Keep last 10 detections
                 if len(self._stair_detections) > 10:
                     self._stair_detections.pop(0)
-
-                # Track most recent stair direction
-                self._last_stair_direction = detection["stair_direction"]
+                self._last_stair_direction = stair_dir
                 self.logger.info(f"[Decision] Remembered stair: {detection}")
 
     def get_spatial_memory_guidance(self) -> str:
@@ -525,713 +656,206 @@ class DecisionAgent(BaseAgent):
 
         return " ".join(guidance_parts) if guidance_parts else ""
 
+    # ========== Coordinate Extraction ==========
+
+    def _extract_position_info(self, context: NavContext) -> Dict[str, Any]:
+        """Extract position and vertical direction info from context.
+
+        Returns:
+            Dict with: goal_x, goal_y, goal_z, curr_x, curr_y, curr_z,
+                       vertical_diff, vertical_ok, vertical_direction, vertical_hint
+        """
+        goal_position = context.metadata.get("goal_position") if context else None
+        current_position = context.position if context else None
+
+        goal_x, goal_y, goal_z = 0.0, 0.0, 0.0
+        curr_x, curr_y, curr_z = 0.0, 0.0, 0.0
+        vertical_diff = 0.0
+        vertical_ok = True
+        vertical_direction = "位置未知"
+        vertical_hint = ""
+
+        if goal_position and len(goal_position) >= 3:
+            goal_x, goal_y, goal_z = goal_position[0], goal_position[1], goal_position[2]
+        if current_position and len(current_position) >= 3:
+            curr_x, curr_y, curr_z = current_position[0], current_position[1], current_position[2]
+
+        if goal_position and current_position:
+            vertical_diff = curr_y - goal_y
+            vertical_ok = abs(vertical_diff) < 1.0
+            if vertical_diff > 0.1:
+                vertical_direction = "当前在目标上方"
+                vertical_hint = "需要向下走"
+            elif vertical_diff < -0.1:
+                vertical_direction = "当前在目标下方"
+                vertical_hint = "需要向上走"
+            else:
+                vertical_direction = "与目标同高度"
+                vertical_hint = ""
+
+        return {
+            "goal_x": goal_x, "goal_y": goal_y, "goal_z": goal_z,
+            "curr_x": curr_x, "curr_y": curr_y, "curr_z": curr_z,
+            "vertical_diff": vertical_diff,
+            "vertical_ok": vertical_ok,
+            "vertical_direction": vertical_direction,
+            "vertical_hint": vertical_hint,
+        }
+
     # ========== Prompt Building ==========
 
-    def _build_sequence_prompt_v2(
+    def _build_prompt(
         self,
         context: NavContext,
         subtask: 'SubTask',
         strategy_data: Dict[str, Any],
         level: str
     ) -> str:
-        """Build prompt based on subtask difficulty."""
-        import math
+        """Unified prompt builder: template + level-specific sections."""
+        # Extract all common data
+        common = self._extract_prompt_data(context, subtask, strategy_data)
 
-        # Basic info
-        distance_to_goal = context.get_distance_to_goal() if hasattr(context, 'get_distance_to_goal') else 5.0
+        # Level-specific section
+        if level in ("easy", "medium"):
+            analysis = strategy_data.get("analysis", "根据场景和目标距离规划路径")
+            extra_section = f"## CoT分析\n{analysis}"
+        else:  # hard
+            opinions = strategy_data.get("opinions", {})
+            consensus = strategy_data.get("consensus", {})
+            if consensus and consensus.get("confidence", 0) > 0.8:
+                opinion_str = f"共识: {consensus.get('recommended_focus', 'forward')}"
+            else:
+                opinion_str = self._summarize_opinions(opinions)
+            extra_section = f"## 观点汇总\n{opinion_str}"
 
-        # Get sequence length from config
-        seq_len = getattr(self, 'sequence_length', 5)
+            # Hard level also needs completion check
+            completion_condition = subtask.completion_condition if subtask else None
+            completion_str, _ = self._format_completion_check(
+                completion_condition, common["pos_delta"], common["rot_delta"], common["objects_raw"]
+            )
+            if "COMPLETED" in completion_str:
+                extra_section += "\n\n**完成检测**: 已满足条件"
 
-        # Extract from strategy data
-        perception = strategy_data.get("perception", {})
+        return f"""导航决策。生成{common['seq_constraint']}动作序列。
+
+## 任务
+{common['task_desc']}
+
+## 目标坐标
+- 目标: ({common['goal_x']:.2f}, {common['goal_y']:.2f}, {common['goal_z']:.2f})
+- 当前: ({common['curr_x']:.2f}, {common['curr_y']:.2f}, {common['curr_z']:.2f})
+- 距离: {common['distance']:.1f}m, 方向: {common['direction_hint']} ({common['angle']:.0f}°)
+- 垂直: {common['vertical_dir']} ({abs(common['vertical_diff']):.1f}m) - {common['vertical_hint']}
+- 成功: 水平<3m 且 垂直<1m
+
+## 场景感知（自然语言描述）
+{common['perception_text']}
+
+## 状态
+- 已走: {common['dist_traveled']:.1f}m
+{common['topology_str']}
+
+{extra_section}
+
+## 规则
+1. 输出{common['seq_constraint']}
+2. 方向偏差>15°需转向
+3. 仅当: "水平<3m" 且 "垂直满足" 且 "所有子任务完成" 才能输出stop！！！
+
+输出JSON（必须严格遵循，不要添加任何额外文字）:
+{{"reasoning": "一句话说明", "subtask_completed": false, "actions": [{{"action": "turn_left"}}, {{"action": "turn_left"}}, {{"action": "forward"}}, {{"action": "forward"}}, {{"action": "forward"}}]}}
+
+## 格式要求（违反会导致解析失败）：
+1. 必须是纯JSON，不要有任何前缀或后缀文字
+2. actions数组必须包含至少5个动作
+3. 动作名称只能是: turn_left, turn_right, forward, stop
+4. 不要输出代码块标记，直接输出JSON
+5. 如果需要转向，先转向动作，然后forward动作
+6. 如果直走，直接输出5个forward动作"""
+
+    def _extract_prompt_data(self, context: NavContext, subtask: 'SubTask', strategy_data: dict) -> dict:
+        """Extract all common data for prompt building."""
+        # perception现在是自然语言字符串，直接使用
+        perception_text = strategy_data.get("perception", "No perception data available")
         trajectory = strategy_data.get("trajectory", {})
-        instruction = strategy_data.get("instruction", {})
-        trajectory_agent = strategy_data.get("trajectory_agent", None)
 
-        # Perception info
-        room_type = perception.get("room_type", "unknown")
-        objects_raw = perception.get("objects", [])
-        objects = [o.get("object", o.get("name", str(o))) for o in objects_raw[:3]]
-        scene_desc = perception.get("scene_description", "")[:80]
-        walkable = perception.get("walkable_analysis", {})
-        obstacle = perception.get("obstacle_ahead", {})
-        nav_hint = perception.get("nav_hint", "")
-
-        # Open directions
-        open_dirs = []
-        if isinstance(walkable, dict):
-            if walkable.get("left", {}).get("clear", True):
-                open_dirs.append("left")
-            if walkable.get("center", {}).get("clear", True):
-                open_dirs.append("front")
-            if walkable.get("right", {}).get("clear", True):
-                open_dirs.append("right")
-        open_dirs_str = "/".join(open_dirs) if open_dirs else "unknown"
-
-        # Obstacle
-        if isinstance(obstacle, dict):
-            blocked = obstacle.get("blocked", False)
-            min_dist = obstacle.get("min_distance", 5.0)
-        elif isinstance(obstacle, bool):
-            blocked = obstacle
-            min_dist = 5.0
-        else:
-            blocked = False
-            min_dist = 5.0
+        # Position info
+        pos_info = self._extract_position_info(context)
 
         # Trajectory info
-        dist_traveled = trajectory.get("distance_traveled", 0)
-        heading = trajectory.get("heading", "unknown")
-
-        # ===== NEW: Extract structured state data =====
         subtask_delta = trajectory.get("subtask_delta", {})
-        navigation = trajectory.get("navigation", {})
-        current_state = trajectory.get("state", {})
-
-        # Position delta for prompt
         pos_delta = subtask_delta.get("position_delta", {})
         rot_delta = subtask_delta.get("rotation_delta", {})
+        dist_traveled = trajectory.get("distance_traveled", 0)
 
-        # Instruction semantics
-        directions = instruction.get("directions", [])
-        instruction_analysis = instruction.get("instruction_analysis", {})
-        landmarks = instruction_analysis.get("landmarks", []) if instruction_analysis else instruction.get("landmarks", [])
-        goals = instruction_analysis.get("goals", []) if instruction_analysis else instruction.get("goals", [])
-
-        # Completion condition
-        completion_condition = subtask.completion_condition if subtask else None
-
-        # Get action history summary from TrajectoryAgent
-        action_history_summary = ""
-        if trajectory_agent and hasattr(trajectory_agent, 'get_history_summary'):
-            current_pos = context.position
-            if current_pos:
-                action_history_summary = trajectory_agent.get_history_summary(current_pos)
-
-        # ===== NEW: Get spatial memory guidance =====
-        spatial_memory_guidance = self.get_spatial_memory_guidance()
-
-        # Build prompt based on level
-        if level == "easy":
-            return self._build_simple_prompt_direct_v2(seq_len,
-                context, subtask, blocked, min_dist, dist_traveled,
-                heading, distance_to_goal, directions, nav_hint,
-                landmarks, goals, completion_condition, action_history_summary,
-                pos_delta, rot_delta, navigation,  # state change data
-                spatial_memory_guidance  # NEW: spatial memory
-            )
-        elif level == "medium":
-            return self._build_medium_prompt_with_analysis_v2(
-                seq_len, subtask, room_type, objects, scene_desc, open_dirs_str,
-                blocked, min_dist, dist_traveled, heading, distance_to_goal,
-                strategy_data.get("analysis", ""),
-                directions, nav_hint, landmarks, goals, completion_condition,
-                action_history_summary,
-                pos_delta, rot_delta, navigation,  # state change data
-                context,  # pass context for stair info
-                spatial_memory_guidance  # NEW: spatial memory
-            )
-        else:  # hard
-            return self._build_hard_prompt(
-                subtask, room_type, objects, scene_desc, open_dirs_str,
-                blocked, min_dist, dist_traveled, heading, distance_to_goal,
-                strategy_data.get("opinions", {}),
-                strategy_data.get("consensus", {}),
-                directions, nav_hint, landmarks, goals, completion_condition,
-                action_history_summary,
-                pos_delta, rot_delta, navigation,  # state change data
-                context,  # pass context for stair info
-                spatial_memory_guidance  # NEW: spatial memory
-            )
-
-    def _build_simple_prompt_direct_v2(
-        self, seq_len: int, context, subtask, blocked, min_dist, dist_traveled,
-        heading, distance_to_goal, directions, nav_hint, landmarks,
-        goals, completion_condition=None, action_history_summary="",
-        pos_delta=None, rot_delta=None, navigation=None, spatial_memory_guidance=""
-    ) -> str:
-        """Easy task prompt: directly synthesize agent info without strategy analysis."""
-        # Get perception info directly from context
-        perception_output = context.metadata.get("perception_output", {})
-        room_type = perception_output.get("room_type", "unknown")
-        objects_raw = perception_output.get("objects", [])
-        objects = [o.get("object", o.get("name", str(o))) for o in objects_raw[:3]]
-        scene_desc = perception_output.get("scene_description", "")[:80]
-
-        # Get goal direction info
-        angle_to_goal = context.metadata.get("angle_to_goal", 0) if context else 0
+        # Direction info
+        angle = context.metadata.get("angle_to_goal", 0) if context else 0
         direction_hint = context.metadata.get("direction_hint", "前方") if context else "前方"
-
-        # Get obstacle info
-        obstacle_info = context.metadata.get("obstacle_info", {}) if context else {}
-
-        # Get distance change info
-        distance_delta = context.metadata.get("distance_delta", 0) if context else 0
-        distance_trend = context.metadata.get("distance_trend", "未知") if context else "未知"
-
-        # Build obstacle section string
-        obstacle_section = ""
-        if obstacle_info:
-            obstacle_section = f"""
-- 障碍物: {obstacle_info.get('direction', '')} {obstacle_info.get('distance', 0):.1f}m, 半径 {obstacle_info.get('radius', 1.0):.1f}m
-- 绕行建议: 向{obstacle_info.get('bypass_direction', '右')}绕行"""
-
-        # NEW: Get stair entrance info
-        stair_entrance = perception_output.get("stair_entrance", {})
-        stairs = perception_output.get("stairs", {})
-
-        directions_str = "/".join(directions) if directions else "unknown"
-        landmarks_str = ", ".join(landmarks[:3]) if landmarks else "none"
-        goals_str = ", ".join(goals[:2]) if goals else "none"
-
-        # Get visible objects for near_object check
-        visible_objects = context.metadata.get("perception_output", {}).get("objects", [])
-
-        # Format completion condition with auto-check
-        completion_check_str, auto_completed = self._format_completion_check(
-            completion_condition, pos_delta, rot_delta, visible_objects
-        )
-
-        # NEW: Build stair entrance guidance with direction info
-        stair_guidance = ""
-        required_steps = seq_len  # Default to configured sequence length
-
-        if stair_entrance.get("found"):
-            entrance_dir = stair_entrance.get("direction", "unknown")
-            entrance_dist = stair_entrance.get("distance", 0)
-            entrance_angle = stair_entrance.get("angle", 0)
-            stair_dir = stair_entrance.get("stair_direction", "unknown")
-            action_hint = stair_entrance.get("action_hint", "")
-
-            # Calculate required steps based on distance
-            # Each forward step ~0.25m, plus turning steps
-            if entrance_dist > 0 and stair_dir == "down":  # Only for correct direction
-                # Steps needed: distance * 4 (for forward) + turns
-                turn_steps = abs(entrance_angle) // 15 + 2  # Rough turn estimate
-                forward_steps = int(entrance_dist * 4)
-                required_steps = min(15, max(self.min_sequence_length, turn_steps + forward_steps))
-                self.logger.info(f"[Decision] Stairs at {entrance_dist:.1f}m, generating {required_steps} steps")
-
-            # Add direction-specific guidance
-            direction_note = ""
-            if stair_dir == "down":
-                direction_note = "\n**DIRECTION MATCH**: These stairs go DOWN - correct for this subtask!"
-                direction_note += f"\n**CRITICAL**: Generate {required_steps} steps to reach stairs {entrance_dist:.1f}m away!"
-            elif stair_dir == "up":
-                direction_note = "\n**WARNING**: These stairs go UP - need DOWN stairs for this subtask!"
-            elif stair_dir == "unknown":
-                direction_note = "\n**NOTE**: Stair direction unclear - verify before proceeding."
-
-            stair_guidance = f"""
-## CRITICAL: Stair Entrance Located!
-- Direction: {entrance_dir}
-- Distance: {entrance_dist:.1f}m
-- Angle from center: {entrance_angle}°
-- Stair Direction: {stair_dir}
-- Action hint: {action_hint}{direction_note}
-**PRIORITY**: Navigate toward this stair entrance if direction matches subtask!
-"""
-        elif stairs.get("detected"):
-            stair_dir = stairs.get('direction', 'unknown')
-            direction_note = ""
-            if stair_dir == "down":
-                direction_note = " (DOWNWARD - correct direction)"
-            elif stair_dir == "up":
-                direction_note = " (UPWARD - wrong direction for 'down' subtask)"
-            stair_guidance = f"""
-## Stairs Detected (but entrance not precisely located)
-- Direction: {stair_dir}{direction_note}
-- Relative position: {stairs.get('relative_pos', 'unknown')}
-- Distance: {stairs.get('distance', 'unknown')}m
-**PRIORITY**: Find the stair entrance by exploring in the indicated direction.
-"""
-
-        # Generate example actions based on adaptive mode
-        if self.adaptive_sequence:
-            example_actions = '{"action":"forward"}, {"action":"turn_right"}, {"action":"forward"}'
-        else:
-            example_actions = ', '.join(['{"action":"forward"}' if i % 2 == 0 else '{"action":"turn_right"}' for i in range(seq_len)])
-
-        # Build action history section
-        history_section = ""
-        if action_history_summary:
-            history_section = f"\n## Action History Reference (TrajectoryAgent)\n{action_history_summary}\n"
-
-        # ===== NEW: Build subtask state change section =====
-        state_change_section = ""
-        if pos_delta:
-            start_pos = pos_delta.get("start", [0, 0, 0])
-            curr_pos = pos_delta.get("current", [0, 0, 0])
-            dx = pos_delta.get("dx", 0)
-            dy = pos_delta.get("dy", 0)
-            dz = pos_delta.get("dz", 0)
-            h_dist = pos_delta.get("horizontal_distance", 0)
-
-            rot_start = rot_delta.get("start_deg", 0) if rot_delta else 0
-            rot_curr = rot_delta.get("current_deg", 0) if rot_delta else 0
-            rot_change = rot_delta.get("delta_deg", 0) if rot_delta else 0
-            rot_dir = rot_delta.get("direction", "none") if rot_delta else "none"
-
-            dist_to_goal = navigation.get("distance_to_goal", 0) if navigation else 0
-
-            state_change_section = f"""
-## Subtask State Change (from subtask start)
-- Position: {start_pos} → {curr_pos}
-- Delta: dx={dx:.2f}m, dy={dy:.2f}m, dz={dz:.2f}m
-- Horizontal Distance Moved: {h_dist:.2f}m
-- Rotation: {rot_start:.0f}° → {rot_curr:.0f}° (change: {rot_change:.0f}°, {rot_dir})
-- Distance to Goal: {dist_to_goal:.2f}m
-
-{completion_check_str}
-"""
-
-        # Determine step constraint based on adaptive mode and stair distance
-        if required_steps > seq_len:
-            # Override when stairs detected far away
-            seq_constraint = f"Generate {required_steps} steps to reach detected stairs."
-            rule_1 = f"Must output exactly {required_steps} steps to reach stairs"
-        elif self.adaptive_sequence:
-            seq_constraint = f"""Based on current situation, output {self.min_sequence_length}-{self.max_sequence_length} steps.
-
-**Step Selection Rules**:
-- 3-5 steps: Target is ahead and direction is correct, just go straight
-- 6-10 steps: Need small turn (45-90 degrees) then move forward
-- 11-15 steps: Need large turn (180 degrees) or complex exploration
-
-**Current Scene Analysis**: Determine which case applies based on environment"""
-            rule_1 = f"Output {self.min_sequence_length}-{self.max_sequence_length} steps based on actual situation"
-        else:
-            seq_constraint = f"Generate {seq_len} step action sequence"
-            rule_1 = f"Must output exactly {seq_len} steps"
-
-        return f"""/no_think
-You are a navigation decision system. Synthesize information from all agents and {seq_constraint}.
-
-## Subtask
-{subtask.description}
-{state_change_section}
-## Instruction Semantics
-- Key directions: {directions_str}
-- Target locations: {goals_str}
-- Reference objects: {landmarks_str}
-
-## Environment Analysis (PerceptionAgent)
-- Room: {room_type}
-- Visible objects: {objects if objects else "none"}
-- Scene: {scene_desc if scene_desc else "no description"}
-- Navigation hint: {nav_hint if nav_hint else "none"}
-{stair_guidance}
-## Spatial Memory
-{spatial_memory_guidance if spatial_memory_guidance else "First exploration in this area."}
-
-## Navigation State (TrajectoryAgent)
-- Heading: {heading}
-- Distance traveled: {dist_traveled:.1f}m
-- Distance to goal: {distance_to_goal:.1f}m
-- Distance change: {distance_trend} ({distance_delta:+.2f}m)
-- Goal direction: 目标在{direction_hint} (相对角度: {angle_to_goal:.0f}°){obstacle_section}{history_section}
-## Action Types
-- forward: move forward one step
-- turn_left: turn left 15 degrees
-- turn_right: turn right 15 degrees
-- stop: stop
-
-## Rules
-1. {rule_1}
-2. Must include turning actions
-3. If COMPLETION CHECK shows "COMPLETED", you MUST set subtask_completed=true
-
-## Output Format (JSON)
-{{"reasoning":"brief reasoning in 1-2 sentences","subtask_completed":false,"actions":[{example_actions}]}}
-
-IMPORTANT: Keep reasoning brief (1-2 sentences). Output JSON directly:"""
-
-    def _build_medium_prompt_with_analysis_v2(
-        self, seq_len: int, subtask, room_type, objects, scene_desc, open_dirs_str,
-        blocked, min_dist, dist_traveled, heading, distance_to_goal,
-        analysis, directions, nav_hint, landmarks, goals, completion_condition=None,
-        action_history_summary="",
-        pos_delta=None, rot_delta=None, navigation=None, context=None, spatial_memory_guidance=""
-    ) -> str:
-        """Medium task prompt: use CoT strategy analysis."""
-        directions_str = "/".join(directions) if directions else "unknown"
-        landmarks_str = ", ".join(landmarks[:3]) if landmarks else "none"
-        goals_str = ", ".join(goals[:2]) if goals else "none"
-
-        # Get goal direction info
-        angle_to_goal = context.metadata.get("angle_to_goal", 0) if context else 0
-        direction_hint = context.metadata.get("direction_hint", "前方") if context else "前方"
-
-        # Get obstacle info
-        obstacle_info = context.metadata.get("obstacle_info", {}) if context else {}
-
-        # Get distance change info
-        distance_delta = context.metadata.get("distance_delta", 0) if context else 0
-        distance_trend = context.metadata.get("distance_trend", "未知") if context else "未知"
-
-        # Build obstacle section string
-        obstacle_section = ""
-        if obstacle_info:
-            obstacle_section = f"""
-- 障碍物: {obstacle_info.get('direction', '')} {obstacle_info.get('distance', 0):.1f}m, 半径 {obstacle_info.get('radius', 1.0):.1f}m
-- 绕行建议: 向{obstacle_info.get('bypass_direction', '右')}绕行"""
-
-        # Format completion condition with auto-check
-        visible_objects = [{"name": o} if isinstance(o, str) else o for o in (objects or [])]
-        completion_check_str, auto_completed = self._format_completion_check(
-            completion_condition, pos_delta, rot_delta, visible_objects
-        )
-
-        # NEW: Build stair entrance guidance from context with direction info
-        stair_guidance = ""
-        if context:
-            perception_output = context.metadata.get("perception_output", {})
-            stair_entrance = perception_output.get("stair_entrance", {})
-            stairs = perception_output.get("stairs", {})
-            if stair_entrance.get("found"):
-                entrance_dir = stair_entrance.get("direction", "unknown")
-                entrance_dist = stair_entrance.get("distance", 0)
-                entrance_angle = stair_entrance.get("angle", 0)
-                stair_dir = stair_entrance.get("stair_direction", "unknown")
-                action_hint = stair_entrance.get("action_hint", "")
-
-                direction_note = ""
-                if stair_dir == "down":
-                    direction_note = "\n**DIRECTION MATCH**: These stairs go DOWN - correct for this subtask!"
-                elif stair_dir == "up":
-                    direction_note = "\n**WARNING**: These stairs go UP - need DOWN stairs for this subtask!"
-
-                stair_guidance = f"""
-## CRITICAL: Stair Entrance Located!
-- Direction: {entrance_dir}
-- Distance: {entrance_dist:.1f}m
-- Angle from center: {entrance_angle}°
-- Stair Direction: {stair_dir}
-- Action hint: {action_hint}{direction_note}
-**PRIORITY**: Navigate toward this stair entrance if direction matches subtask!
-"""
-            elif stairs.get("detected"):
-                stair_dir = stairs.get('direction', 'unknown')
-                direction_note = ""
-                if stair_dir == "down":
-                    direction_note = " (DOWNWARD - correct direction)"
-                elif stair_dir == "up":
-                    direction_note = " (UPWARD - wrong direction for 'down' subtask)"
-                stair_guidance = f"""
-## Stairs Detected (but entrance not precisely located)
-- Direction: {stair_dir}{direction_note}
-- Relative position: {stairs.get('relative_pos', 'unknown')}
-- Distance: {stairs.get('distance', 'unknown')}m
-**PRIORITY**: Find the stair entrance by exploring in the indicated direction.
-"""
-
-        # Generate example actions based on adaptive mode
-        if self.adaptive_sequence:
-            example_actions = '{"action":"forward"}, {"action":"turn_right"}, {"action":"forward"}'
-        else:
-            example_actions = ', '.join(['{"action":"forward"}' if i % 2 == 0 else '{"action":"turn_right"}' for i in range(seq_len)])
-
-        # Build action history section
-        history_section = ""
-        if action_history_summary:
-            history_section = f"\n## Action History Reference\n{action_history_summary}\n"
-
-        # ===== NEW: Build subtask state change section =====
-        state_change_section = ""
-        if pos_delta:
-            start_pos = pos_delta.get("start", [0, 0, 0])
-            curr_pos = pos_delta.get("current", [0, 0, 0])
-            dx = pos_delta.get("dx", 0)
-            dy = pos_delta.get("dy", 0)
-            dz = pos_delta.get("dz", 0)
-            h_dist = pos_delta.get("horizontal_distance", 0)
-
-            rot_start = rot_delta.get("start_deg", 0) if rot_delta else 0
-            rot_curr = rot_delta.get("current_deg", 0) if rot_delta else 0
-            rot_change = rot_delta.get("delta_deg", 0) if rot_delta else 0
-            rot_dir = rot_delta.get("direction", "none") if rot_delta else "none"
-
-            dist_to_goal = navigation.get("distance_to_goal", 0) if navigation else 0
-
-            state_change_section = f"""
-## Subtask State Change (from subtask start)
-- Position: {start_pos} → {curr_pos}
-- Delta: dx={dx:.2f}m, dy={dy:.2f}m, dz={dz:.2f}m
-- Horizontal Distance Moved: {h_dist:.2f}m
-- Rotation: {rot_start:.0f}° → {rot_curr:.0f}° (change: {rot_change:.0f}°, {rot_dir})
-- Distance to Goal: {dist_to_goal:.2f}m
-
-{completion_check_str}
-"""
-
-        # Determine step constraint based on adaptive mode
-        if self.adaptive_sequence:
-            seq_constraint = f"""Based on current situation, output {self.min_sequence_length}-{self.max_sequence_length} steps
-
-**Step Selection Rules**:
-- 3-5 steps: Target is ahead and direction is correct, just go straight
-- 6-10 steps: Need small turn (45-90 degrees) then move forward
-"""
-            seq_note = f"Determine which case applies based on strategy analysis"
-            rule_1 = f"Output {self.min_sequence_length}-{self.max_sequence_length} steps based on actual needs"
-        else:
-            seq_constraint = f"Based on analysis result, generate {seq_len} step action sequence"
-            seq_note = f"Action sequence length must be exactly {seq_len} steps"
-            rule_1 = f"Must output exactly {seq_len} steps"
-
-        return f"""/no_think
-You are a navigation decision system. {seq_constraint}.
-
-## Subtask
-{subtask.description}
-{state_change_section}
-## Instruction Semantics
-- Key directions: {directions_str}
-- Target locations: {goals_str}
-- Reference objects: {landmarks_str}
-
-## Environment Analysis
-- Room: {room_type}
-- Visible objects: {objects if objects else "none"}
-- Scene: {scene_desc if scene_desc else "no description"}
-- Open directions: {open_dirs_str}
-- Obstacle ahead: {"yes (" + str(min_dist) + "m)" if blocked else "no"}
-- Navigation hint: {nav_hint if nav_hint else "none"}
-{stair_guidance}
-## Spatial Memory
-{spatial_memory_guidance if spatial_memory_guidance else "First exploration in this area."}
-
-## Navigation State
-- Heading: {heading}
-- Distance traveled: {dist_traveled:.1f}m
-- Distance to goal: {distance_to_goal:.1f}m
-- Distance change: {distance_trend} ({distance_delta:+.2f}m)
-- Goal direction: 目标在{direction_hint} (相对角度: {angle_to_goal:.0f}°){obstacle_section}
-
-## Strategy Analysis (CoT)
-{analysis[:300] if analysis else "none"}{history_section}
-
-## Action Planning Guidelines
-Generate action sequence based on strategy analysis:
-
-**Direction-aware action generation (soft guidance)**:
-- If analysis mentions "forward", "straight", "no turn needed": mainly forward actions
-- If analysis mentions "left", "left side": add appropriate turn_left actions, then forward to explore
-- If analysis mentions "right", "right side": add appropriate turn_right actions, then forward to explore
-- If analysis mentions "turn around", "backward", "large turn": need multiple turns
-
-**Action combination suggestions** (non-mandatory):
-- Small adjustment: 1-3 turns + forward or just turns
-- Medium turn (~90 degrees): 4-8 turns + forward or just turns
-- Large turn (~180 degrees): 8-12 turns
-
-**Note**:
-- Each turn = 15 degrees
-- Flexibly adjust turn count based on natural language description in analysis
-- {seq_note}
-
-## Action Types
-- forward: move forward one step
-- turn_left: turn left 15 degrees
-- turn_right: turn right 15 degrees
-- stop: stop
-
-## Rules
-1. {rule_1}
-2. Must include turning actions
-3. If COMPLETION CHECK shows "COMPLETED", you MUST set subtask_completed=true
-4. Do not output stop action until all subtasks are completed
-
-## Output Format (JSON)
-{{"reasoning":"brief reasoning","subtask_completed":false,"actions":[{{"action":"turn_right"}},{{"action":"turn_right"}},{{"action":"forward"}}]}}
-
-**Output JSON only, no explanation!**"""
-
-
-    def _build_hard_prompt(
-        self, subtask, room_type, objects, scene_desc, open_dirs_str,
-        blocked, min_dist, dist_traveled, heading, distance_to_goal,
-        opinions, consensus, directions, nav_hint, landmarks, goals, completion_condition=None,
-        action_history_summary="",
-        pos_delta=None, rot_delta=None, navigation=None, context=None, spatial_memory_guidance=""
-    ) -> str:
-        """Hard task prompt with agent opinions."""
-        opinions_str = ""
-        if opinions:
-            for agent_name, opinion in opinions.items():
-                if isinstance(opinion, dict):
-                    opinions_str += f"\n### {agent_name}\n"
-                    opinions_str += f"- Recommendation: {opinion.get('primary_action', 'unknown')}\n"
-                    opinions_str += f"- Reason: {opinion.get('reasoning', '')[:50]}\n"
-
-        consensus_str = consensus.get("reasoning", "none") if consensus else "none"
-        directions_str = "/".join(directions) if directions else "unknown"
-        landmarks_str = ", ".join(landmarks[:3]) if landmarks else "none"
-        goals_str = ", ".join(goals[:2]) if goals else "none"
-
-        # Get goal direction info
-        angle_to_goal = context.metadata.get("angle_to_goal", 0) if context else 0
-        direction_hint = context.metadata.get("direction_hint", "前方") if context else "前方"
-
-        # Get obstacle info
-        obstacle_info = context.metadata.get("obstacle_info", {}) if context else {}
-
-        # Get distance change info
-        distance_delta = context.metadata.get("distance_delta", 0) if context else 0
-        distance_trend = context.metadata.get("distance_trend", "未知") if context else "未知"
-
-        # Build obstacle section string
-        obstacle_section = ""
-        if obstacle_info:
-            obstacle_section = f"""
-- 障碍物: {obstacle_info.get('direction', '')} {obstacle_info.get('distance', 0):.1f}m, 半径 {obstacle_info.get('radius', 1.0):.1f}m
-- 绕行建议: 向{obstacle_info.get('bypass_direction', '右')}绕行"""
-
-        # Format completion condition with auto-check
-        visible_objects = [{"name": o} if isinstance(o, str) else o for o in (objects or [])]
-        completion_check_str, auto_completed = self._format_completion_check(
-            completion_condition, pos_delta, rot_delta, visible_objects
-        )
-
-        # NEW: Build stair entrance guidance from context with direction info
-        stair_guidance = ""
-        if context:
-            perception_output = context.metadata.get("perception_output", {})
-            stair_entrance = perception_output.get("stair_entrance", {})
-            stairs = perception_output.get("stairs", {})
-            if stair_entrance.get("found"):
-                entrance_dir = stair_entrance.get("direction", "unknown")
-                entrance_dist = stair_entrance.get("distance", 0)
-                entrance_angle = stair_entrance.get("angle", 0)
-                stair_dir = stair_entrance.get("stair_direction", "unknown")
-                action_hint = stair_entrance.get("action_hint", "")
-
-                direction_note = ""
-                if stair_dir == "down":
-                    direction_note = "\n**DIRECTION MATCH**: These stairs go DOWN - correct for this subtask!"
-                elif stair_dir == "up":
-                    direction_note = "\n**WARNING**: These stairs go UP - need DOWN stairs for this subtask!"
-
-                stair_guidance = f"""
-## CRITICAL: Stair Entrance Located!
-- Direction: {entrance_dir}
-- Distance: {entrance_dist:.1f}m
-- Angle from center: {entrance_angle}°
-- Stair Direction: {stair_dir}
-- Action hint: {action_hint}{direction_note}
-**PRIORITY**: Navigate toward this stair entrance if direction matches subtask!
-"""
-            elif stairs.get("detected"):
-                stair_dir = stairs.get('direction', 'unknown')
-                direction_note = ""
-                if stair_dir == "down":
-                    direction_note = " (DOWNWARD - correct direction)"
-                elif stair_dir == "up":
-                    direction_note = " (UPWARD - wrong direction for 'down' subtask)"
-                stair_guidance = f"""
-## Stairs Detected (but entrance not precisely located)
-- Direction: {stair_dir}{direction_note}
-- Relative position: {stairs.get('relative_pos', 'unknown')}
-- Distance: {stairs.get('distance', 'unknown')}m
-**PRIORITY**: Find the stair entrance by exploring in the indicated direction.
-"""
-
-        # Get sequence length from config
+        distance = context.get_distance_to_goal() if hasattr(context, 'get_distance_to_goal') else 5.0
+
+        # Topology
+        topology_summary = self._get_topology_summary(context)
+        topology_str = ""
+        if topology_summary:
+            stuck = topology_summary.get("stuck_regions", [])
+            if stuck:
+                topology_str = f"- 拓扑: 卡住区域{stuck[:2]}"
+            else:
+                topology_str = f"- 拓扑: {topology_summary.get('total_nodes', 0)}节点"
+
+        # Step constraint
         seq_len = getattr(self, 'sequence_length', 5)
-        # Generate example actions based on adaptive mode
-        if self.adaptive_sequence:
-            example_actions = '{"action":"forward"}, {"action":"turn_right"}, {"action":"forward"}'
-        else:
-            example_actions = ', '.join(['{"action":"forward"}' if i % 2 == 0 else '{"action":"turn_right"}' for i in range(seq_len)])
+        seq_constraint = f"{self.min_sequence_length}-{self.max_sequence_length}步" if self.adaptive_sequence else f"{seq_len}步"
 
-        # ===== NEW: Build subtask state change section =====
-        state_change_section = ""
-        if pos_delta:
-            start_pos = pos_delta.get("start", [0, 0, 0])
-            curr_pos = pos_delta.get("current", [0, 0, 0])
-            dx = pos_delta.get("dx", 0)
-            dy = pos_delta.get("dy", 0)
-            dz = pos_delta.get("dz", 0)
-            h_dist = pos_delta.get("horizontal_distance", 0)
+        return {
+            "task_desc": subtask.description if subtask else "导航",
+            "goal_x": pos_info["goal_x"],
+            "goal_y": pos_info["goal_y"],
+            "goal_z": pos_info["goal_z"],
+            "curr_x": pos_info["curr_x"],
+            "curr_y": pos_info["curr_y"],
+            "curr_z": pos_info["curr_z"],
+            "vertical_diff": pos_info["vertical_diff"],
+            "vertical_dir": pos_info["vertical_direction"],
+            "vertical_hint": pos_info["vertical_hint"],
+            "perception_text": perception_text,  # 直接使用自然语言描述
+            "dist_traveled": dist_traveled,
+            "pos_delta": pos_delta,
+            "rot_delta": rot_delta,
+            "angle": angle,
+            "direction_hint": direction_hint,
+            "distance": distance,
+            "topology_str": topology_str,
+            "seq_constraint": seq_constraint,
+        }
 
-            rot_start = rot_delta.get("start_deg", 0) if rot_delta else 0
-            rot_curr = rot_delta.get("current_deg", 0) if rot_delta else 0
-            rot_change = rot_delta.get("delta_deg", 0) if rot_delta else 0
-            rot_dir = rot_delta.get("direction", "none") if rot_delta else "none"
+    def _get_topology_summary(self, context: NavContext) -> dict:
+        """Get topology summary from context metadata."""
+        if not context:
+            return {}
+        trajectory_output = context.metadata.get("trajectory_output", {})
+        return trajectory_output.get("topology_summary", {}) if isinstance(trajectory_output, dict) else {}
 
-            dist_to_goal = navigation.get("distance_to_goal", 0) if navigation else 0
+    def _summarize_opinions(self, opinions: Dict) -> str:
+        """精简多Agent观点。
 
-            state_change_section = f"""
-## Subtask State Change (from subtask start)
-- Position: {start_pos} → {curr_pos}
-- Delta: dx={dx:.2f}m, dy={dy:.2f}m, dz={dz:.2f}m
-- Horizontal Distance Moved: {h_dist:.2f}m
-- Rotation: {rot_start:.0f}° → {rot_curr:.0f}° (change: {rot_change:.0f}°, {rot_dir})
-- Distance to Goal: {dist_to_goal:.2f}m
+        Args:
+            opinions: 多Agent观点字典
 
-{completion_check_str}
-"""
+        Returns:
+            精简的观点摘要字符串
+        """
+        if not opinions:
+            return "无观点"
 
-        # Determine step constraint based on adaptive mode
-        if self.adaptive_sequence:
-            seq_constraint = f"Based on all agent opinions, output {self.min_sequence_length}-{self.max_sequence_length} step action sequence"
-            rule_1 = f"Output {self.min_sequence_length}-{self.max_sequence_length} steps"
-        else:
-            seq_constraint = f"Based on all agent opinions, generate {seq_len} step action sequence"
-            rule_1 = f"Must output exactly {seq_len} steps"
+        lines = []
+        for agent_name, opinion in opinions.items():
+            action = opinion.get("suggested_action", opinion.get("primary_action", "unknown"))
+            confidence = opinion.get("confidence", 0.5)
+            reason = opinion.get("reasoning", "")[:50]  # 只取前50字符
+            lines.append(f"{agent_name}: {action}({confidence:.0%}) - {reason}")
 
-        return f"""/no_think
-You are a navigation decision system. {seq_constraint}.
-
-## Subtask
-{subtask.description}
-{state_change_section}
-## Instruction Semantics
-- Key directions: {directions_str}
-- Target locations: {goals_str}
-- Reference objects: {landmarks_str}
-
-## Environment Analysis
-- Room: {room_type}
-- Visible objects: {objects if objects else "none"}
-- Scene: {scene_desc if scene_desc else "no description"}
-- Open directions: {open_dirs_str}
-- Obstacle ahead: {"yes(" + str(min_dist) + "m)" if blocked else "no"}
-- Navigation hint: {nav_hint if nav_hint else "none"}
-{stair_guidance}
-## Spatial Memory
-{spatial_memory_guidance if spatial_memory_guidance else "First exploration in this area."}
-
-## Navigation State
-- Heading: {heading}
-- Distance traveled: {dist_traveled:.1f}m
-- Distance to goal: {distance_to_goal:.1f}m
-- Distance change: {distance_trend} ({distance_delta:+.2f}m)
-- Goal direction: 目标在{direction_hint} (相对角度: {angle_to_goal:.0f}°){obstacle_section}
-
-## Agent Opinions
-{opinions_str if opinions_str else "none"}
-
-## Consensus
-{consensus_str[:200]}
-
-## Action Types
-- forward: move forward one step
-- turn_left: turn left 15 degrees
-- turn_right: turn right 15 degrees
-- stop: stop
-
-## Rules
-1. {rule_1}
-2. Make decision based on all agent opinions
-3. Must include turning actions
-4. If COMPLETION CHECK shows "COMPLETED", you MUST set subtask_completed=true
-
-## Output Format (JSON)
-{{"reasoning":"brief reasoning in 1-2 sentences","subtask_completed":false,"actions":[{example_actions}]}}
-
-IMPORTANT: Keep reasoning brief (1-2 sentences). Output JSON directly:"""
+        return "\n".join(lines[:3])  # 只显示3个Agent
 
     # ========== Response Parsing ==========
 
@@ -1296,11 +920,11 @@ IMPORTANT: Keep reasoning brief (1-2 sentences). Output JSON directly:"""
             if parse_success:
                 self.logger.info(f"[Decision] Regex fallback SUCCESS: {len(actions)} actions")
 
-        # Strategy 4: Generate default actions if all parsing failed
+        # Strategy 4: All parsing failed - do NOT generate fake sequences
         if len(actions) == 0:
-            self.logger.warning("[Decision] All parsing failed, generating default actions")
-            actions = self._generate_default_actions()
-            reasoning = "Default action: forward movement"
+            self.logger.warning("[Decision] All parsing strategies failed - returning empty")
+            # 不生成假序列，让重试机制处理
+            return [], "Parse failed", False
 
         # Log final result
         self.logger.info(f"[Decision] Final parse result: {len(actions)} actions, reasoning_len={len(reasoning)}")
@@ -1317,17 +941,6 @@ IMPORTANT: Keep reasoning brief (1-2 sentences). Output JSON directly:"""
         reasoning = data.get("reasoning", "")
         subtask_completed = data.get("subtask_completed", False)
 
-        # Action name mapping for compatibility
-        action_map = {
-            "forward": ActionType.MOVE_FORWARD,
-            "move_forward": ActionType.MOVE_FORWARD,
-            "turn_left": ActionType.TURN_LEFT,
-            "left": ActionType.TURN_LEFT,
-            "turn_right": ActionType.TURN_RIGHT,
-            "right": ActionType.TURN_RIGHT,
-            "stop": ActionType.STOP,
-        }
-
         # Extract actions from various formats
         for item in data.get("actions", []):
             if isinstance(item, str):
@@ -1338,14 +951,14 @@ IMPORTANT: Keep reasoning brief (1-2 sentences). Output JSON directly:"""
                 count = item.get("count", item.get("repeat", 1))
                 if isinstance(count, int) and count > 0:
                     for _ in range(count):
-                        if action_name in action_map:
-                            actions.append((action_map[action_name], 1))
+                        if action_name in self.ACTION_MAP:
+                            actions.append((self.ACTION_MAP[action_name], 1))
                     continue
             else:
                 continue
 
-            if action_name in action_map:
-                actions.append((action_map[action_name], 1))
+            if action_name in self.ACTION_MAP:
+                actions.append((self.ACTION_MAP[action_name], 1))
 
         return reasoning, subtask_completed
 
@@ -1377,22 +990,12 @@ IMPORTANT: Keep reasoning brief (1-2 sentences). Output JSON directly:"""
             r'"(forward|move_forward|turn_left|turn_right|left|right|stop)"\s*,?',
         ]
 
-        action_map = {
-            "forward": ActionType.MOVE_FORWARD,
-            "move_forward": ActionType.MOVE_FORWARD,
-            "turn_left": ActionType.TURN_LEFT,
-            "left": ActionType.TURN_LEFT,
-            "turn_right": ActionType.TURN_RIGHT,
-            "right": ActionType.TURN_RIGHT,
-            "stop": ActionType.STOP,
-        }
-
         for pattern in action_patterns:
             matches = re.findall(pattern, json_str, re.IGNORECASE)
             for match in matches:
                 action_name = match.lower() if isinstance(match, str) else match[0].lower()
-                if action_name in action_map:
-                    actions.append((action_map[action_name], 1))
+                if action_name in self.ACTION_MAP:
+                    actions.append((self.ACTION_MAP[action_name], 1))
                     success = True
 
         if success:
@@ -1421,33 +1024,19 @@ IMPORTANT: Keep reasoning brief (1-2 sentences). Output JSON directly:"""
             r'(stop|wait)',
         ]
 
-        action_map = {
-            "forward": ActionType.MOVE_FORWARD,
-            "move_forward": ActionType.MOVE_FORWARD,
-            "move forward": ActionType.MOVE_FORWARD,
-            "go forward": ActionType.MOVE_FORWARD,
-            "walk forward": ActionType.MOVE_FORWARD,
-            "turn_left": ActionType.TURN_LEFT,
-            "turn left": ActionType.TURN_LEFT,
-            "rotate left": ActionType.TURN_LEFT,
-            "left": ActionType.TURN_LEFT,
-            "turn_right": ActionType.TURN_RIGHT,
-            "turn right": ActionType.TURN_RIGHT,
-            "rotate right": ActionType.TURN_RIGHT,
-            "right": ActionType.TURN_RIGHT,
-            "stop": ActionType.STOP,
-            "wait": ActionType.STOP,
-        }
-
         for pattern in action_patterns:
             matches = re.findall(pattern, response, re.IGNORECASE)
             for match in matches:
                 action_name = match.lower() if isinstance(match, str) else match[0].lower()
-                # Handle multi-word matches
-                action_name = action_name.replace(" ", "_")
-                if action_name in action_map:
-                    actions.append((action_map[action_name], 1))
+                # Try original action_name first, then underscore variant
+                if action_name in self.ACTION_MAP:
+                    actions.append((self.ACTION_MAP[action_name], 1))
                     success = True
+                else:
+                    action_name_underscore = action_name.replace(" ", "_")
+                    if action_name_underscore in self.ACTION_MAP:
+                        actions.append((self.ACTION_MAP[action_name_underscore], 1))
+                        success = True
 
         # Try to extract reasoning from natural text
         reasoning_match = re.search(r'(reasoning|analysis|plan)\s*:?\s*["\']?([^"\']+)["\']?', response, re.IGNORECASE)
@@ -1456,14 +1045,78 @@ IMPORTANT: Keep reasoning brief (1-2 sentences). Output JSON directly:"""
 
         return reasoning, success
 
-    def _generate_default_actions(self) -> list:
-        """Generate default actions when all parsing strategies failed.
+    def _extract_actions_from_cot_analysis(self, analysis: str) -> List[Tuple[ActionType, int]]:
+        """从CoT分析文本中提取动作建议。
+
+        CoT分析格式示例：
+        Step 4 - Action suggestion: turn left 2-3 times, then move forward 3 times
+
+        Args:
+            analysis: CoT策略生成的分析文本
 
         Returns:
-            List of default actions (typically forward movement)
+            List of (ActionType, count) tuples
+            返回空列表如果无法提取
         """
-        # Default: move forward to continue exploration
-        return [(ActionType.MOVE_FORWARD, 1)]
+        if not analysis:
+            return []
+
+        # 1. 定位"Action suggestion"行
+        suggestion_patterns = [
+            r"Step 4.*Action suggestion[:\s]+(.+)",
+            r"动作建议[:\s]+(.+)",
+            r"Action suggestion[:\s]+(.+)",
+        ]
+
+        suggestion_text = None
+        for pattern in suggestion_patterns:
+            match = re.search(pattern, analysis, re.IGNORECASE)
+            if match:
+                suggestion_text = match.group(1).strip()
+                self.logger.info(f"[Decision] 找到Action suggestion: {suggestion_text[:80]}")
+                break
+
+        if not suggestion_text:
+            self.logger.info("[Decision] 未找到Action suggestion行")
+            return []
+
+        # 2. 提取动作 - 使用finditer保持顺序
+        # 转向模式：turn left/right N-M times
+        turn_pattern = r"turn\s+(left|right)\s+(\d+)(?:-\d+)?\s*times?"
+        # 前进模式：forward/straight N times
+        forward_pattern = r"(?:move\s+forward|go\s+(?:straight\s+)?forward|forward)\s+(\d+)(?:-\d+)?\s*times?"
+
+        # 收集所有匹配及其位置，保持顺序
+        matches_with_pos = []
+
+        for match in re.finditer(turn_pattern, suggestion_text, re.IGNORECASE):
+            direction = match.group(1).lower()
+            count = int(match.group(2))
+            action = ActionType.TURN_LEFT if direction == "left" else ActionType.TURN_RIGHT
+            matches_with_pos.append((match.start(), action, count))
+
+        for match in re.finditer(forward_pattern, suggestion_text, re.IGNORECASE):
+            count = int(match.group(1))
+            matches_with_pos.append((match.start(), ActionType.MOVE_FORWARD, count))
+
+        # 按位置排序，保持文本中的顺序
+        matches_with_pos.sort(key=lambda x: x[0])
+        actions = [(m[1], m[2]) for m in matches_with_pos]
+
+        # 3. 如果没有找到模式化的动作，尝试简单关键词匹配
+        if not actions:
+            simple_patterns = [
+                ("left", ActionType.TURN_LEFT, 2),
+                ("right", ActionType.TURN_RIGHT, 2),
+                ("forward", ActionType.MOVE_FORWARD, 3),
+                ("straight", ActionType.MOVE_FORWARD, 3),
+            ]
+            for keyword, action_type, default_count in simple_patterns:
+                if keyword in suggestion_text.lower():
+                    actions.append((action_type, default_count))
+
+        self.logger.info(f"[Decision] CoT提取: {len(actions)}个动作组合")
+        return actions
 
     # ========== Completion Check ==========
 
@@ -1493,7 +1146,6 @@ IMPORTANT: Keep reasoning brief (1-2 sentences). Output JSON directly:"""
         dx = pos_delta.get("dx", 0) if pos_delta else 0
         dz = pos_delta.get("dz", 0) if pos_delta else 0
         horizontal_dist = pos_delta.get("horizontal_distance", 0) if pos_delta else 0
-        rot_change = abs(rot_delta.get("delta_deg", 0)) if rot_delta else 0
 
         is_completed = False
         current_value = 0
@@ -1501,36 +1153,44 @@ IMPORTANT: Keep reasoning brief (1-2 sentences). Output JSON directly:"""
         comparison = ""
 
         if cc_type == "y_change":
-            current_value = abs(dy)
             threshold = min_change
 
             if direction == "down":
-                comparison = f"|dy| = {current_value:.2f}m {'>=' if current_value >= threshold else '<'} {threshold}m (min_change)"
-                is_completed = current_value >= threshold
+                # 下楼需要 dy 为负（y 减小）
+                current_value = -dy if dy < 0 else 0  # 只有向下才计入
+                is_completed = dy <= -threshold
+                comparison = f"dy={dy:.2f}m, need <=-{threshold}m (down)"
             elif direction == "up":
-                # For up, dy should be positive (increasing Y)
-                current_value = dy
-                comparison = f"dy = {current_value:.2f}m {'>=' if current_value >= threshold else '<'} {threshold}m (min_change)"
-                is_completed = current_value >= threshold
+                # 上楼需要 dy 为正（y 增加）
+                current_value = dy if dy > 0 else 0
+                is_completed = dy >= threshold
+                comparison = f"dy={dy:.2f}m, need >={threshold}m (up)"
             else:
-                # Any vertical change
-                comparison = f"|dy| = {current_value:.2f}m {'>=' if current_value >= threshold else '<'} {threshold}m (min_change)"
-                is_completed = current_value >= threshold
+                # 无方向要求，用绝对值
+                current_value = abs(dy)
+                is_completed = abs(dy) >= threshold
+                comparison = f"|dy|={abs(dy):.2f}m >={threshold}m"
 
         elif cc_type == "rotation":
-            current_value = rot_change
+            # Get raw delta_deg (not absolute) for direction-aware checking
+            delta_deg = rot_delta.get("delta_deg", 0) if rot_delta else 0
             threshold = min_change
-            rot_dir = rot_delta.get("direction", "none") if rot_delta else "none"
 
-            # Check direction match
-            dir_match = True
-            if direction == "right" and rot_dir != "right":
-                dir_match = False
-            elif direction == "left" and rot_dir != "left":
-                dir_match = False
-
-            comparison = f"rotation = {current_value:.0f}° ({rot_dir}) {'>=' if current_value >= threshold else '<'} {threshold}°"
-            is_completed = current_value >= threshold and dir_match
+            if direction == "left":
+                # 左转需要 delta_deg 为正（角度增加）
+                current_value = delta_deg if delta_deg > 0 else 0
+                is_completed = delta_deg >= threshold
+                comparison = f"rotation={delta_deg:.0f}°, need >= {threshold}° (left)"
+            elif direction == "right":
+                # 右转需要 delta_deg 为负（角度减少）
+                current_value = -delta_deg if delta_deg < 0 else 0
+                is_completed = delta_deg <= -threshold
+                comparison = f"rotation={delta_deg:.0f}°, need <= -{threshold}° (right)"
+            else:
+                # 无方向要求，用绝对值
+                current_value = abs(delta_deg)
+                is_completed = abs(delta_deg) >= threshold
+                comparison = f"rotation={abs(delta_deg):.0f}° >= {threshold}°"
 
         elif cc_type == "distance":
             current_value = horizontal_dist
@@ -1540,7 +1200,7 @@ IMPORTANT: Keep reasoning brief (1-2 sentences). Output JSON directly:"""
 
         elif cc_type == "near_object" or cc_type == "object_near":
             target_lower = target_object.lower()
-            visible_objs = [o.get("name", str(o)).lower() for o in (visible_objects or [])]
+            visible_objs = [o.get("name").lower() for o in (visible_objects or [])]
             found = any(target_lower in v or v in target_lower for v in visible_objs)
             current_value = 1 if found else 0
             threshold = 1

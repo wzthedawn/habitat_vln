@@ -13,7 +13,7 @@ import logging
 import sys
 
 # 设置路径
-sys.path.insert(0, '/root/habitat_vln')
+sys.path.insert(0, '/home/WZ/MA_VLN/habitat_vln')
 
 from core.context import NavContext, NavContextBuilder, VisualFeatures
 from core.action import Action, ActionType

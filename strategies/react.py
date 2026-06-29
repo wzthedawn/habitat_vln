@@ -141,6 +141,9 @@ class ReActStrategy(BaseStrategy):
         # Get trajectory info
         trajectory_info = self._get_trajectory_info(context)
 
+        # Get topology info
+        topology_info = self._get_topology_info(context)
+
         # Get recent actions
         recent_actions = []
         if context.action_history:
@@ -165,6 +168,9 @@ class ReActStrategy(BaseStrategy):
 
 ## 轨迹信息
 {trajectory_info}
+
+## 拓扑信息
+{topology_info}
 
 ## 最近动作历史
 {', '.join(recent_actions) if recent_actions else '无'}
@@ -194,34 +200,108 @@ class ReActStrategy(BaseStrategy):
         return prompt
 
     def _get_perception_info(self, context: NavContext) -> str:
-        """Get perception information for context."""
+        """Get perception information from Agent output."""
         parts = []
 
-        if context.visual_features.scene_description:
-            parts.append(f"场景: {context.visual_features.scene_description[:100]}")
+        # 从metadata获取PerceptionAgent输出（dict格式）
+        # 注意：run_vln_experiment.py存储的是agent_result.data（直接dict）
+        perception_data = context.metadata.get("perception_output", {})
+        if not isinstance(perception_data, dict):
+            perception_data = {}
 
-        if context.visual_features.object_detections:
-            objects = [o.get("name", "") for o in context.visual_features.object_detections[:5]]
-            parts.append(f"可见物体: {', '.join(objects)}")
+        if perception_data:
+            # 使用Agent处理后的信息
+            room_type = perception_data.get("room_type", "unknown")
+            if room_type and room_type != "unknown":
+                parts.append(f"房间类型: {room_type}")
+
+            scene_desc = perception_data.get("scene_description", "")
+            if scene_desc:
+                parts.append(f"场景描述: {scene_desc[:100]}")
+
+            objects = perception_data.get("objects", [])
+            if objects:
+                obj_names = [o.get("object", o.get("name", str(o))) for o in objects[:5]]
+                parts.append(f"可见物体: {', '.join(obj_names)}")
+
+            scene_description = perception_data.get("scene_description", "")
+            if scene_description:
+                parts.append(f"场景描述: {scene_description[:100]}")
+
+        # Fallback: 如果无Agent输出，使用原始visual_features
+        if not parts and context.visual_features.scene_description:
+            parts.append(f"场景: {context.visual_features.scene_description[:100]}")
 
         return "\n".join(parts) if parts else "无感知信息"
 
     def _get_trajectory_info(self, context: NavContext) -> str:
-        """Get trajectory information for context."""
+        """Get trajectory information from Agent output."""
         parts = []
 
-        if context.metadata.get("trajectory"):
-            traj = context.metadata["trajectory"]
-            parts.append(f"已走距离: {traj.get('distance_traveled', 0):.1f}m")
-            parts.append(f"进度: {traj.get('progress_percentage', 0):.1f}%")
+        # 从metadata获取TrajectoryAgent输出（dict格式）
+        # 注意：run_vln_experiment.py存储的是agent_result.data（直接dict）
+        trajectory_data = context.metadata.get("trajectory_output", {})
+        if not isinstance(trajectory_data, dict):
+            trajectory_data = {}
 
-        if len(context.trajectory) >= 2:
+        if trajectory_data:
+            distance = trajectory_data.get("distance_traveled", 0)
+            if distance:
+                parts.append(f"已走距离: {distance:.1f}m")
+
+            heading = trajectory_data.get("heading", "unknown")
+            if heading and heading != "unknown":
+                parts.append(f"当前朝向: {heading}")
+
+            progress = trajectory_data.get("progress_percentage", 0)
+            if progress:
+                parts.append(f"进度: {progress:.1f}%")
+
+        # Fallback: 如果无Agent输出，从原始trajectory计算
+        if not parts and len(context.trajectory) >= 2:
             start = context.trajectory[0]
             current = context.trajectory[-1]
             dist = ((current[0] - start[0])**2 + (current[2] - start[2])**2)**0.5
             parts.append(f"总距离: {dist:.1f}m")
+            parts.append(f"步数: {context.step_count}")
 
         return "\n".join(parts) if parts else f"步数: {context.step_count}"
+
+    def _get_topology_info(self, context: NavContext) -> str:
+        """Get topology information from TrajectoryAgent output.
+
+        Returns formatted topology summary for ReAct prompt.
+        """
+        # 从metadata获取TrajectoryAgent输出（dict格式）
+        # 注意：run_vln_experiment.py存储的是agent_result.data（直接dict）
+        trajectory_data = context.metadata.get("trajectory_output", {})
+        if not isinstance(trajectory_data, dict):
+            trajectory_data = {}
+        topology_summary = trajectory_data.get("topology_summary", {})
+
+        if not topology_summary:
+            return "无拓扑信息"
+
+        total_nodes = topology_summary.get("total_nodes", 0)
+        key_nodes = topology_summary.get("key_nodes", [])
+        current_node = topology_summary.get("current_node", "unknown")
+        visited_rooms = topology_summary.get("visited_rooms", [])
+        stuck_regions = topology_summary.get("stuck_regions", [])
+        path_to_goal = topology_summary.get("path_to_goal", [])
+
+        # 格式化关键节点（显示类型）
+        key_nodes_str = ", ".join([n.get("type", str(n)) for n in key_nodes[:5]]) if key_nodes else "无"
+        visited_rooms_str = ", ".join(visited_rooms[:5]) if visited_rooms else "无"
+        path_str = " -> ".join(path_to_goal[:5]) if path_to_goal else "未知"
+
+        return f"""- 总节点数: {total_nodes}
+- 关键节点: {key_nodes_str}
+- 当前位置节点: {current_node}
+- 已访问房间: {visited_rooms_str}
+- 目标路径: {path_str}
+- 卡住区域: {len(stuck_regions)}个
+
+**拓扑提示**: 使用已访问房间信息避免重复探索，参考关键节点做路径规划。"""
 
     def _parse_llm_response(self, response: str) -> tuple:
         """

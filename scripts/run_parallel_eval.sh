@@ -13,6 +13,7 @@ set -e
 # Configuration
 EPISODES=${1:-10}
 NO_VIDEO="--no-video --no-trajectory"
+REMOTE_LLM="--use-remote-llm --llm-server http://localhost:8000"
 OUTPUT_DIR="results/emergency_eval_parallel"
 
 echo "========================================"
@@ -35,28 +36,28 @@ echo "Starting experiments..."
 
 # GPU 1: baseline
 CUDA_VISIBLE_DEVICES=1 python "$SCRIPT_DIR/run_emergency_eval.py" \
-    --exp baseline --episodes $EPISODES --output "$OUTPUT_DIR/baseline" $NO_VIDEO \
+    --exp baseline --episodes $EPISODES --output "$OUTPUT_DIR/baseline" $NO_VIDEO $REMOTE_LLM \
     2>&1 | tee "$OUTPUT_DIR/baseline_log.txt" &
 PID1=$!
 echo "Started baseline on GPU 1 (PID: $PID1)"
 
 # GPU 2: exp-a (PathReplanner only)
 CUDA_VISIBLE_DEVICES=2 python "$SCRIPT_DIR/run_emergency_eval.py" \
-    --exp exp-a --episodes $EPISODES --output "$OUTPUT_DIR/exp-a" $NO_VIDEO \
+    --exp exp-a --episodes $EPISODES --output "$OUTPUT_DIR/exp-a" $NO_VIDEO $REMOTE_LLM \
     2>&1 | tee "$OUTPUT_DIR/exp-a_log.txt" &
 PID2=$!
 echo "Started exp-a on GPU 2 (PID: $PID2)"
 
 # GPU 3: exp-b (PathReplanner + LoRA)
 CUDA_VISIBLE_DEVICES=3 python "$SCRIPT_DIR/run_emergency_eval.py" \
-    --exp exp-b --episodes $EPISODES --output "$OUTPUT_DIR/exp-b" $NO_VIDEO \
+    --exp exp-b --episodes $EPISODES --output "$OUTPUT_DIR/exp-b" $NO_VIDEO $REMOTE_LLM \
     2>&1 | tee "$OUTPUT_DIR/exp-b_log.txt" &
 PID3=$!
 echo "Started exp-b on GPU 3 (PID: $PID3)"
 
 # GPU 0: exp-c (LoRA only, shares with vLLM)
 CUDA_VISIBLE_DEVICES=0 python "$SCRIPT_DIR/run_emergency_eval.py" \
-    --exp exp-c --episodes $EPISODES --output "$OUTPUT_DIR/exp-c" $NO_VIDEO \
+    --exp exp-c --episodes $EPISODES --output "$OUTPUT_DIR/exp-c" $NO_VIDEO $REMOTE_LLM \
     2>&1 | tee "$OUTPUT_DIR/exp-c_log.txt" &
 PID4=$!
 echo "Started exp-c on GPU 0 (PID: $PID4)"

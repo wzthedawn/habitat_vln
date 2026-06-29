@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """Test YOLO detection fix."""
 import sys
-sys.path.insert(0, '/root/habitat_vln')
+sys.path.insert(0, '/home/WZ/MA_VLN/habitat_vln')
 
 from models.model_manager import ModelManager
 

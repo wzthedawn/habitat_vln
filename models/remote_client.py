@@ -11,7 +11,7 @@ Usage:
 
     # Generate text
     response = await client.generate(
-        model="qwen-2b-perception",
+        model="qwen-9b-perception",
         prompt="描述当前场景...",
         max_new_tokens=200
     )
@@ -41,6 +41,12 @@ try:
     OPENAI_AVAILABLE = True
 except ImportError:
     OPENAI_AVAILABLE = False
+
+
+# SiliconFlow API configuration
+SILICONFLOW_API_KEY = "sk-fjoebpuejranwmbdywtoilezpypfsodztntpfpfpfskqekgj"
+SILICONFLOW_BASE_URL = "https://api.siliconflow.cn/v1"
+SILICONFLOW_MODEL = "Qwen/Qwen3.5-397B-A17B"
 
 
 @dataclass
@@ -78,8 +84,9 @@ class RemoteLLMClient:
     Provides both async and sync methods for generating text
     using remote Qwen3.5 models.
 
-    Supports two modes:
-    - OpenAI mode (recommended): Uses vLLM's OpenAI-compatible server
+    Supports three modes:
+    - OpenAI mode: Uses vLLM's OpenAI-compatible server
+    - SiliconFlow mode: Uses SiliconFlow API (GLM-5 model)
     - HTTP mode (fallback): Uses custom FastAPI server
 
     Attributes:
@@ -89,15 +96,16 @@ class RemoteLLMClient:
         retry_delay: Delay between retries in seconds
         fallback_enabled: Whether to use fallback responses on error
         use_openai: Whether to use OpenAI SDK format
+        use_siliconflow: Whether to use SiliconFlow API
     """
 
-    # Model path mapping for vLLM OpenAI server
+    # Model path mapping for vLLM OpenAI server (all use same Qwen3.6-35B-A3B model)
     MODEL_PATHS = {
-        "qwen-4b-perception": "/root/.cache/modelscope/hub/models/Qwen/Qwen3___5-4B",
-        "qwen-4b-instruction": "/root/.cache/modelscope/hub/models/Qwen/Qwen3___5-4B",
-        "qwen-4b-decision": "/root/.cache/modelscope/hub/models/Qwen/Qwen3___5-4B",
-        "qwen-4b-evaluation": "/root/.cache/modelscope/hub/models/Qwen/Qwen3___5-4B",
-        "qwen-2b-trajectory": "/root/.cache/modelscope/hub/models/Qwen/Qwen3___5-2B",
+        "qwen-9b-perception": "/data/WZ/Model/Qwen/Qwen3.6-35B-A3B",
+        "qwen-9b-instruction": "/data/WZ/Model/Qwen/Qwen3.6-35B-A3B",
+        "qwen-9b-decision": "/data/WZ/Model/Qwen/Qwen3.6-35B-A3B",
+        "qwen-9b-evaluation": "/data/WZ/Model/Qwen/Qwen3.6-35B-A3B",
+        "qwen-9b-trajectory": "/data/WZ/Model/Qwen/Qwen3.6-35B-A3B",
     }
 
     def __init__(
@@ -108,6 +116,10 @@ class RemoteLLMClient:
         retry_delay: float = 1.0,
         fallback_enabled: bool = True,  # Enable fallback by default
         use_openai: bool = False,  # Use HTTP mode by default (custom endpoints)
+        use_siliconflow: bool = False,  # Use SiliconFlow API
+        siliconflow_api_key: Optional[str] = None,  # Optional custom API key
+        siliconflow_model: Optional[str] = None,  # Optional custom model
+        model_path: Optional[str] = None,  # Dynamic model path override
     ):
         """Initialize the remote LLM client.
 
@@ -118,6 +130,9 @@ class RemoteLLMClient:
             retry_delay: Delay between retries in seconds
             fallback_enabled: Whether to use fallback responses on error
             use_openai: Whether to use OpenAI SDK format (recommended for vLLM)
+            use_siliconflow: Whether to use SiliconFlow API
+            siliconflow_api_key: Optional custom API key (default: built-in key)
+            siliconflow_model: Optional custom model (default: Pro/zai-org/GLM-5)
         """
         self.server_url = server_url.rstrip("/")
         self.timeout = timeout
@@ -125,6 +140,12 @@ class RemoteLLMClient:
         self.retry_delay = retry_delay
         self.fallback_enabled = fallback_enabled
         self.logger = logging.getLogger("RemoteLLMClient")
+        self.model_path = model_path  # Dynamic model path override
+
+        # SiliconFlow configuration
+        self.use_siliconflow = use_siliconflow
+        self.siliconflow_api_key = siliconflow_api_key or SILICONFLOW_API_KEY
+        self.siliconflow_model = siliconflow_model or SILICONFLOW_MODEL
 
         # Check available libraries
         if not AIOHTTP_AVAILABLE and not REQUESTS_AVAILABLE:
@@ -133,10 +154,21 @@ class RemoteLLMClient:
                 "Install with: pip install aiohttp or pip install requests"
             )
 
-        # Initialize OpenAI client if available and requested
-        self.use_openai = use_openai and OPENAI_AVAILABLE
+        # Initialize OpenAI client for SiliconFlow or vLLM
+        self.use_openai = False
         self.openai_client = None
-        if self.use_openai:
+
+        if self.use_siliconflow and OPENAI_AVAILABLE:
+            # Use SiliconFlow API
+            self.openai_client = OpenAI(
+                api_key=self.siliconflow_api_key,
+                base_url=SILICONFLOW_BASE_URL,
+                timeout=timeout
+            )
+            self.logger.info(f"Using SiliconFlow API with model: {self.siliconflow_model}")
+        elif use_openai and OPENAI_AVAILABLE:
+            # Use vLLM OpenAI-compatible server
+            self.use_openai = True
             self.openai_client = OpenAI(
                 api_key="EMPTY",
                 base_url=f"{self.server_url}/v1",
@@ -156,16 +188,18 @@ class RemoteLLMClient:
         temperature: Optional[float] = None,
         conversation_id: Optional[str] = None,
         keep_context: bool = False,
+        lora_name: Optional[str] = None,
     ) -> GenerateResult:
         """Generate text using remote model (async).
 
         Args:
-            model: Model identifier (e.g., "qwen-2b-perception")
+            model: Model identifier (e.g., "qwen-9b-perception")
             prompt: Input prompt for generation
             max_new_tokens: Maximum tokens to generate
             temperature: Sampling temperature (0.0-2.0)
             conversation_id: Optional ID for multi-turn conversations
             keep_context: Whether to keep conversation context
+            lora_name: Optional LoRA adapter name (e.g., "decision-lora")
 
         Returns:
             GenerateResult with response and metadata
@@ -181,6 +215,7 @@ class RemoteLLMClient:
                     temperature=temperature,
                     conversation_id=conversation_id,
                     keep_context=keep_context,
+                    lora_name=lora_name,
                 )
             )
 
@@ -195,6 +230,8 @@ class RemoteLLMClient:
             payload["temperature"] = temperature
         if conversation_id is not None:
             payload["conversation_id"] = conversation_id
+        if lora_name is not None:
+            payload["lora_name"] = lora_name
         payload["keep_context"] = keep_context
 
         last_error = None
@@ -251,6 +288,8 @@ class RemoteLLMClient:
         temperature: Optional[float] = None,
         conversation_id: Optional[str] = None,
         keep_context: bool = False,
+        lora_name: Optional[str] = None,
+        seed: Optional[int] = None,
     ) -> GenerateResult:
         """Generate text using remote model (sync).
 
@@ -261,10 +300,23 @@ class RemoteLLMClient:
             temperature: Sampling temperature
             conversation_id: Optional ID for multi-turn conversations
             keep_context: Whether to keep conversation context
+            lora_name: Optional LoRA adapter name
+            seed: Random seed for deterministic output (default: 42)
 
         Returns:
             GenerateResult with response and metadata
         """
+        # Use OpenAI mode if available
+        if self.use_openai and self.openai_client:
+            return self.generate_openai(
+                model=model,
+                prompt=prompt,
+                max_new_tokens=max_new_tokens,
+                temperature=temperature,
+                lora_name=lora_name,
+                seed=seed,
+            )
+
         if not REQUESTS_AVAILABLE:
             raise ImportError("requests is not installed. Install with: pip install requests")
 
@@ -279,6 +331,8 @@ class RemoteLLMClient:
             payload["temperature"] = temperature
         if conversation_id is not None:
             payload["conversation_id"] = conversation_id
+        if lora_name is not None:
+            payload["lora_name"] = lora_name
         payload["keep_context"] = keep_context
 
         last_error = None
@@ -332,6 +386,8 @@ class RemoteLLMClient:
         temperature: Optional[float] = None,
         conversation_id: Optional[str] = None,
         keep_context: bool = False,
+        lora_name: Optional[str] = None,
+        seed: Optional[int] = None,
     ) -> str:
         """Generate text using remote model (convenience method).
 
@@ -345,17 +401,31 @@ class RemoteLLMClient:
             temperature: Sampling temperature
             conversation_id: Optional ID for multi-turn conversations
             keep_context: Whether to keep conversation context
+            lora_name: Optional LoRA adapter name (e.g., "decision-lora")
+            seed: Random seed for deterministic output (default: 42)
 
         Returns:
             Generated text, or fallback response on error
         """
+        # Use fixed seed for deterministic output
+        seed_value = seed if seed is not None else 42
+
+        # Use SiliconFlow API if enabled
+        if self.use_siliconflow:
+            result = self.generate_siliconflow(
+                prompt=prompt,
+                max_new_tokens=max_new_tokens,
+                temperature=temperature,
+            )
         # Use OpenAI mode if available
-        if self.use_openai:
+        elif self.use_openai:
             result = self.generate_openai(
                 model=model,
                 prompt=prompt,
                 max_new_tokens=max_new_tokens,
                 temperature=temperature,
+                lora_name=lora_name,
+                seed=seed_value,
             )
         else:
             result = self.generate_sync(
@@ -365,15 +435,12 @@ class RemoteLLMClient:
                 temperature=temperature,
                 conversation_id=conversation_id,
                 keep_context=keep_context,
+                lora_name=lora_name,
             )
 
         if result.error:
-            self.logger.warning(f"Generation error: {result.error}")
-            # Return fallback response if enabled
-            if self.fallback_enabled:
-                fallback = self._get_fallback_response(model, prompt)
-                self.logger.info(f"Using fallback response for {model}")
-                return fallback
+            # LLM 不可用时直接报错，停止实验
+            raise RuntimeError(f"LLM 服务不可用 [{model}]: {result.error}")
 
         return result.response
 
@@ -398,7 +465,7 @@ class RemoteLLMClient:
         # Decision fallback
         elif "decision" in model or "4b" in model:
             # Default to forward motion
-            return "动作: forward\n理由: 继续探索环境"
+            return '{"reasoning":"LLM 服务不可用，使用默认探索策略","subtask_completed":false,"actions":[{"action":"forward"},{"action":"forward"},{"action":"turn_left"},{"action":"forward"},{"action":"forward"},{"action":"turn_right"},{"action":"forward"},{"action":"forward"},{"action":"turn_left"},{"action":"forward"}]}'
 
         # Evaluation fallback
         elif "evaluation" in model:
@@ -408,15 +475,172 @@ class RemoteLLMClient:
         return "继续执行。"
 
     def _get_model_path(self, model_key: str) -> str:
-        """Get model path for vLLM OpenAI server.
+        """Get model path for vLLM server.
 
         Args:
-            model_key: Model identifier (e.g., qwen-4b-perception)
+            model_key: Model identifier (e.g., qwen-9b-perception)
 
         Returns:
-            Full model path for vLLM server
+            Actual model name for vLLM server (e.g., qwen-9b)
         """
+        # Priority: 1. Dynamic model_path override, 2. Use unified alias
+        if self.model_path:
+            return self.model_path
+        # All qwen-9b-* aliases map to unified qwen-9b (vLLM --served-model-name)
+        if model_key.startswith("qwen-9b"):
+            return "qwen-9b"
         return self.MODEL_PATHS.get(model_key, model_key)
+
+    def generate_siliconflow(
+        self,
+        prompt: str,
+        max_new_tokens: Optional[int] = None,
+        temperature: Optional[float] = None,
+    ) -> GenerateResult:
+        """Generate text using SiliconFlow API.
+
+        This method uses SiliconFlow's OpenAI-compatible API with GLM-5 model.
+
+        Args:
+            prompt: Input prompt
+            max_new_tokens: Maximum tokens to generate
+            temperature: Sampling temperature
+
+        Returns:
+            GenerateResult with response and metadata
+        """
+        if not self.openai_client:
+            return GenerateResult(
+                response="",
+                model=self.siliconflow_model,
+                tokens_generated=0,
+                latency_ms=0,
+                error="SiliconFlow client not initialized"
+            )
+
+        start_time = time.time()
+
+        try:
+            response = self.openai_client.chat.completions.create(
+                model=self.siliconflow_model,
+                messages=[{"role": "user", "content": prompt}],
+                max_tokens=max_new_tokens or 1500,
+                temperature=temperature if temperature is not None else 0.7,
+            )
+
+            latency = (time.time() - start_time) * 1000
+            self.logger.info(f"[SiliconFlow] Generated in {latency:.0f}ms")
+
+            return GenerateResult(
+                response=response.choices[0].message.content or "",
+                model=self.siliconflow_model,
+                tokens_generated=response.usage.completion_tokens if response.usage else 0,
+                latency_ms=latency,
+            )
+
+        except Exception as e:
+            self.logger.error(f"SiliconFlow generation failed: {e}")
+            return GenerateResult(
+                response="",
+                model=self.siliconflow_model,
+                tokens_generated=0,
+                latency_ms=0,
+                error=str(e)
+            )
+
+    def generate_vision_siliconflow(
+        self,
+        image: Any,
+        prompt: str,
+        max_new_tokens: Optional[int] = None,
+        temperature: Optional[float] = None,
+        depth_image: Optional[Any] = None,
+    ) -> GenerateVisionResult:
+        """Generate text from image using SiliconFlow VLM API.
+
+        Args:
+            image: PIL Image or numpy array
+            prompt: Input prompt
+            max_new_tokens: Maximum tokens to generate
+            temperature: Sampling temperature
+            depth_image: Optional depth image (will be added as second image)
+
+        Returns:
+            GenerateVisionResult with response and metadata
+        """
+        if not self.openai_client:
+            return GenerateVisionResult(
+                response="",
+                model=self.siliconflow_model,
+                tokens_generated=0,
+                latency_ms=0,
+                error="SiliconFlow client not initialized"
+            )
+
+        start_time = time.time()
+
+        try:
+            # Convert RGB image to base64 data URL
+            image_base64 = self._image_to_base64(image)
+            image_url = f"data:image/jpeg;base64,{image_base64}"
+
+            # Build content list
+            content = []
+
+            # Add RGB image
+            content.append({
+                "type": "image_url",
+                "image_url": {"url": image_url}
+            })
+
+            # Add depth image if provided
+            if depth_image is not None:
+                depth_colored = self._depth_to_colormap(depth_image)
+                depth_base64 = self._image_to_base64(depth_colored)
+                depth_url = f"data:image/jpeg;base64,{depth_base64}"
+                content.append({
+                    "type": "image_url",
+                    "image_url": {"url": depth_url}
+                })
+
+            # Add text prompt
+            content.append({
+                "type": "text",
+                "text": prompt
+            })
+
+            response = self.openai_client.chat.completions.create(
+                model=self.siliconflow_model,
+                messages=[{
+                    "role": "user",
+                    "content": content
+                }],
+                max_tokens=max_new_tokens or 1500,
+                temperature=temperature if temperature is not None else 0.3,
+            )
+
+            latency = (time.time() - start_time) * 1000
+
+            self.logger.info(f"[SiliconFlow-VLM] Generated in {latency:.0f}ms")
+
+            return GenerateVisionResult(
+                response=response.choices[0].message.content or "",
+                model=self.siliconflow_model,
+                tokens_generated=response.usage.completion_tokens if response.usage else 0,
+                latency_ms=latency,
+            )
+
+        except Exception as e:
+            self.logger.error(f"SiliconFlow VLM generation failed: {e}")
+            import traceback
+            traceback.print_exc()
+            return GenerateVisionResult(
+                response="",
+                model=self.siliconflow_model,
+                tokens_generated=0,
+                latency_ms=0,
+                error=str(e)
+            )
 
     def generate_openai(
         self,
@@ -424,6 +648,8 @@ class RemoteLLMClient:
         prompt: str,
         max_new_tokens: Optional[int] = None,
         temperature: Optional[float] = None,
+        lora_name: Optional[str] = None,
+        seed: Optional[int] = None,
     ) -> GenerateResult:
         """Generate text using OpenAI SDK format.
 
@@ -434,6 +660,7 @@ class RemoteLLMClient:
             prompt: Input prompt
             max_new_tokens: Maximum tokens to generate
             temperature: Sampling temperature
+            lora_name: Optional LoRA adapter name
 
         Returns:
             GenerateResult with response and metadata
@@ -450,13 +677,22 @@ class RemoteLLMClient:
         start_time = time.time()
         model_path = self._get_model_path(model)
 
+        # Build extra_body for vLLM
+        extra_body = {"chat_template_kwargs": {"enable_thinking": False}}
+        if lora_name:
+            # vLLM supports LoRA via extra_body
+            extra_body["lora_name"] = lora_name
+
         try:
+            # Use fixed seed for deterministic output
+            seed_value = seed if seed is not None else 42
             response = self.openai_client.chat.completions.create(
                 model=model_path,
                 messages=[{"role": "user", "content": prompt}],
-                max_tokens=max_new_tokens or 300,
+                max_tokens=max_new_tokens or 1500,
                 temperature=temperature if temperature is not None else 0.2,
-                extra_body={"chat_template_kwargs": {"enable_thinking": False}}  # Disable Qwen3.5 thinking mode
+                seed=seed_value,
+                extra_body=extra_body
             )
 
             latency = (time.time() - start_time) * 1000
@@ -482,10 +718,11 @@ class RemoteLLMClient:
         self,
         image: Any,
         prompt: str,
-        model: str = "qwen-4b-perception",
+        model: str = "qwen-9b-perception",
         max_new_tokens: Optional[int] = None,
         temperature: Optional[float] = None,
         depth_image: Optional[Any] = None,
+        seed: Optional[int] = None,
     ) -> GenerateVisionResult:
         """Generate text from image using OpenAI SDK format.
 
@@ -544,14 +781,18 @@ class RemoteLLMClient:
                 "text": prompt
             })
 
+            # Use dynamic seed based on time to avoid KV-cache collision
+            import random
+            seed_value = seed if seed is not None else random.randint(1, 999999)
             response = self.openai_client.chat.completions.create(
                 model=model_path,
                 messages=[{
                     "role": "user",
                     "content": content
                 }],
-                max_tokens=max_new_tokens or 400,
+                max_tokens=max_new_tokens or 1500,
                 temperature=temperature if temperature is not None else 0.3,
+                seed=seed_value,
                 extra_body={"chat_template_kwargs": {"enable_thinking": False}}  # Disable Qwen3.5 thinking mode
             )
 
@@ -582,13 +823,14 @@ class RemoteLLMClient:
         self,
         image: Any,
         prompt: str,
-        model: str = "qwen-4b-perception",
+        model: str = "qwen-9b-perception",
         max_new_tokens: Optional[int] = None,
         temperature: Optional[float] = None,
+        seed: Optional[int] = None,
     ) -> GenerateVisionResult:
         """Generate text from image using VLM (sync).
 
-        Automatically uses OpenAI mode if available, otherwise falls back to HTTP.
+        Automatically uses SiliconFlow or OpenAI mode if available, otherwise falls back to HTTP.
 
         Args:
             image: PIL Image or numpy array
@@ -596,10 +838,23 @@ class RemoteLLMClient:
             model: VLM model identifier
             max_new_tokens: Maximum tokens to generate
             temperature: Sampling temperature
+            seed: Random seed for deterministic output (default: 42)
 
         Returns:
             GenerateVisionResult with response and metadata
         """
+        # Use fixed seed for deterministic output
+        seed_value = seed if seed is not None else 42
+
+        # Use SiliconFlow mode if enabled
+        if self.use_siliconflow:
+            return self.generate_vision_siliconflow(
+                image=image,
+                prompt=prompt,
+                max_new_tokens=max_new_tokens,
+                temperature=temperature,
+            )
+
         # Use OpenAI mode if available
         if self.use_openai:
             return self.generate_vision_openai(
@@ -608,6 +863,7 @@ class RemoteLLMClient:
                 model=model,
                 max_new_tokens=max_new_tokens,
                 temperature=temperature,
+                seed=seed_value,
             )
 
         # Fallback to HTTP mode
@@ -616,6 +872,7 @@ class RemoteLLMClient:
 
         # Convert image to base64
         image_base64 = self._image_to_base64(image)
+
 
         payload = {
             "model": model,
@@ -675,9 +932,10 @@ class RemoteLLMClient:
         rgb_image: Any,
         depth_image: Any,
         prompt: str,
-        model: str = "qwen-4b-perception",
+        model: str = "qwen-9b-perception",
         max_new_tokens: Optional[int] = None,
         temperature: Optional[float] = None,
+        seed: Optional[int] = None,
     ) -> GenerateVisionResult:
         """Generate text from RGB + Depth images using VLM (sync).
 
@@ -692,12 +950,30 @@ class RemoteLLMClient:
             model: VLM model identifier
             max_new_tokens: Maximum tokens to generate
             temperature: Sampling temperature
+            seed: Random seed for deterministic output (default: 42)
 
         Returns:
             GenerateVisionResult with response and metadata
         """
+        self.logger.debug(f"[generate_vision_dual] Called: model={model}, max_tokens={max_new_tokens}, temp={temperature}, use_openai={self.use_openai}, use_siliconflow={self.use_siliconflow}")
+
+        # Use fixed seed for deterministic output
+        seed_value = seed if seed is not None else 42
+
+        # Use SiliconFlow mode if enabled
+        if self.use_siliconflow:
+            self.logger.debug("[generate_vision_dual] Using SiliconFlow mode")
+            return self.generate_vision_siliconflow(
+                image=rgb_image,
+                prompt=prompt,
+                max_new_tokens=max_new_tokens,
+                temperature=temperature,
+                depth_image=depth_image,
+            )
+
         # Use OpenAI mode if available
         if self.use_openai:
+            self.logger.debug("[generate_vision_dual] Using OpenAI mode")
             return self.generate_vision_openai(
                 image=rgb_image,
                 prompt=prompt,
@@ -705,9 +981,11 @@ class RemoteLLMClient:
                 max_new_tokens=max_new_tokens,
                 temperature=temperature,
                 depth_image=depth_image,
+                seed=seed_value,
             )
 
         # Fallback to HTTP mode
+        self.logger.debug("[generate_vision_dual] Using HTTP mode")
         if not REQUESTS_AVAILABLE:
             raise ImportError("requests is not installed. Install with: pip install requests")
 
@@ -730,6 +1008,8 @@ class RemoteLLMClient:
         if temperature is not None:
             payload["temperature"] = temperature
 
+        self.logger.debug(f"[generate_vision_dual] Sending request to {self.server_url}/generate_vision")
+
         last_error = None
 
         for attempt in range(self.max_retries):
@@ -742,6 +1022,8 @@ class RemoteLLMClient:
 
                 if response.status_code == 200:
                     data = response.json()
+                    self.logger.debug(f"[generate_vision_dual] Response received: latency={data.get('latency_ms', 0)}ms, tokens={data.get('tokens_generated', 0)}")
+                    self.logger.debug(f"[generate_vision_dual] Response text: {str(data.get('response', ''))[:200]}...")
                     return GenerateVisionResult(
                         response=data.get("response", ""),
                         model=data.get("model", model),
@@ -794,15 +1076,16 @@ class RemoteLLMClient:
         if not hasattr(depth_image, 'shape'):
             depth_image = np.array(depth_image)
 
-        # Normalize depth to 0-255
+        # IMPORTANT: JET colormap 0=blue(far), 255=red(near)
+        # depth值=距离，需要反转：小距离(近处)→大像素值→红色
         valid_mask = depth_image > 0
         normalized = np.zeros_like(depth_image, dtype=np.float32)
         if valid_mask.any():
-            normalized[valid_mask] = np.clip(depth_image[valid_mask] / max_depth, 0, 1)
-        normalized_uint8 = (normalized * 255).astype(np.uint8)
+            # 反转映射：近处(小depth)→255(红色)，远处(大depth)→0(蓝色)
+            normalized[valid_mask] = 255 - np.clip(depth_image[valid_mask] / max_depth, 0, 1) * 255
+        normalized_uint8 = normalized.astype(np.uint8)
 
-        # Apply JET colormap (blue = far, red = near)
-        # OpenCV COLORMAP_JET: 0 (far/blue) -> 255 (near/red)
+        # Apply JET colormap: now 255(near)=red, 0(far)=blue
         try:
             import cv2
             colored = cv2.applyColorMap(normalized_uint8, cv2.COLORMAP_JET)
@@ -900,7 +1183,7 @@ class RemoteLLMClient:
             return {"status": "error", "error": "requests not installed"}
 
         try:
-            # For vLLM OpenAI server, use /v1/models endpoint
+            # Use /v1/models endpoint for vLLM OpenAI-compatible server
             response = requests.get(
                 f"{self.server_url}/v1/models",
                 timeout=5.0
@@ -909,10 +1192,11 @@ class RemoteLLMClient:
                 self._healthy = True
                 self._last_health_check = time.time()
                 data = response.json()
-                models = [m["id"] for m in data.get("data", [])]
+                models = data.get("data", [])
+                model_ids = [m.get("id", "") for m in models]
                 return {
                     "status": "healthy",
-                    "models_loaded": models,
+                    "models_loaded": model_ids,
                 }
             else:
                 self._healthy = False
@@ -993,7 +1277,7 @@ class RemoteLLMClient:
 # Convenience function for quick usage
 def generate(
     prompt: str,
-    model: str = "qwen-4b",
+    model: str = "qwen-9b",
     server_url: str = "http://localhost:8000",
     **kwargs
 ) -> str:

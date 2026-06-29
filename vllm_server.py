@@ -79,7 +79,9 @@ def process_depth_image(depth_image: "Image.Image", max_depth: float = 10.0) -> 
         depth_normalized = (depth_array / 255.0 * max_depth).clip(0, max_depth)
 
     # 归一化到 0-255
-    depth_uint8 = (depth_normalized / max_depth * 255).astype(np.uint8)
+    # IMPORTANT: JET colormap 0=blue(far), 255=red(near)
+    # depth值=距离，需要反转：小距离(近处)→大像素值→红色
+    depth_uint8 = (255 - depth_normalized / max_depth * 255).astype(np.uint8)
 
     # 应用 JET colormap
     depth_colored = cv2.applyColorMap(depth_uint8, cv2.COLORMAP_JET)
@@ -89,68 +91,92 @@ def process_depth_image(depth_image: "Image.Image", max_depth: float = 10.0) -> 
 
 
 def get_model_configs() -> Dict[str, Dict]:
-    """Get model configurations.
+    """Get model configurations for multi-tier heterogeneous architecture.
 
-    Model allocation (same as llm_server.py for compatibility):
-    - qwen-9b-perception: Visual perception and scene description
-    - qwen-9b-instruction: Instruction decomposition with semantic analysis
-    - qwen-9b-decision: Navigation decision making
-    - qwen-9b-evaluation: Decision evaluation and feedback
-    - qwen-9b-trajectory: Trajectory summarization (2B for efficiency)
+    Tier 1 - VLM: Qwen3-VL-8B-Instruct (dedicated vision-language model)
+    Tier 2 - Fast: Qwen3.5-9B (latency-sensitive operations)
+    Tier 3 - Strong: Qwen3.6-35B-A3B (complex reasoning: debate/reflection/planning)
 
-    Note: All 9B models share the same physical weights but have independent configurations.
-    Each agent uses a unique model key for isolated conversation contexts.
+    Backward-compatible aliases (qwen-9b-*) map to Tier 2.
 
-    Total VRAM: ~12GB (9B) + Habitat ~2GB = ~14GB (safe for 24GB GPU)
-
-    LoRA Support:
-    - Base model: Qwen3.5-9B (non-AWQ) for LoRA compatibility
-    - DecisionAgent can use LoRA adapter for enhanced decision making
+    Each model key gets isolated conversation context.
     """
     return {
-        # === 9B Models (shared weights, independent configs) ===
+        # === Tier 1: Dedicated VLM ===
+        "qwen3-vl-8b": {
+            "model_name": "/data/WZ/Model/Qwen/Qwen3-VL-8B-Instruct",
+            "max_new_tokens": 400,
+            "default_temperature": 0.2,
+            "description": "Qwen3-VL-8B: Dedicated VLM for structured scene perception",
+            "is_vlm": True,
+        },
+        # === Tier 2: Fast LLM ===
+        "qwen3.5-9b-fast": {
+            "model_name": "/data/WZ/Model/Qwen/Qwen3___5-9B",
+            "max_new_tokens": 256,
+            "default_temperature": 0.2,
+            "description": "Qwen3.5-9B: Fast LLM for decomposition, review, emergency",
+        },
+        # === Tier 3: Strong MoE LLM (separate engine, different GPU) ===
+        "qwen3.6-35b-strong": {
+            "model_name": "/data/WZ/Model/Qwen/Qwen3.6-35B-A3B",
+            "max_new_tokens": 400,
+            "default_temperature": 0.3,
+            "description": "Qwen3.6-35B-A3B: Strong MoE LLM for debate, reflection, planning",
+        },
+        # === Backward-compatible aliases (map to Tier 2) ===
+        "qwen-9b": {
+            "model_name": "/data/WZ/Model/Qwen/Qwen3___5-9B",
+            "max_new_tokens": 200,
+            "default_temperature": 0.2,
+            "description": "Backward compat alias for qwen3.5-9b-fast",
+        },
         "qwen-9b-perception": {
-            "model_name": "/data/WZ/Model/Qwen/Qwen3___5-9B",  # Original model for LoRA support
+            "model_name": "/data/WZ/Model/Qwen/Qwen3___5-9B",
             "max_new_tokens": 200,
             "default_temperature": 0.3,
-            "description": "Visual perception and scene description",
-            "is_vlm": True,  # Qwen3.5-9B is a multimodal VLM
+            "description": "Backward compat: perception (use qwen3-vl-8b for production)",
         },
         "qwen-9b-instruction": {
             "model_name": "/data/WZ/Model/Qwen/Qwen3___5-9B",
             "max_new_tokens": 200,
-            "default_temperature": 0.1,  # Lower temperature for stable JSON output
-            "description": "Instruction decomposition with semantic analysis",
+            "default_temperature": 0.1,
+            "description": "Backward compat alias for instruction decomposition",
         },
         "qwen-9b-decision": {
             "model_name": "/data/WZ/Model/Qwen/Qwen3___5-9B",
             "max_new_tokens": 200,
             "default_temperature": 0.2,
-            "description": "Navigation decision making (with LoRA support)",
-            "use_lora": True,  # This agent can use LoRA
+            "description": "Backward compat alias (with LoRA support)",
+            "use_lora": True,
         },
         "qwen-9b-evaluation": {
             "model_name": "/data/WZ/Model/Qwen/Qwen3___5-9B",
             "max_new_tokens": 200,
             "default_temperature": 0.2,
-            "description": "Decision evaluation and feedback",
+            "description": "Backward compat alias for evaluation",
         },
         "qwen-9b-trajectory": {
             "model_name": "/data/WZ/Model/Qwen/Qwen3___5-9B",
             "max_new_tokens": 200,
             "default_temperature": 0.2,
-            "description": "Trajectory summarization and navigation progress",
+            "description": "Backward compat alias for trajectory",
         },
     }
 
 
-# LoRA configuration
+# LoRA configuration - for emergency-adapted decision making
 LORA_CONFIG = {
     "decision-lora": {
         "path": "outputs/qlora_balanced/decision",
         "target_model": "qwen-9b-decision",
         "rank": 16,
-    }
+    },
+    "emergency-decision-lora": {
+        "path": "outputs/qlora_balanced/decision",
+        "target_model": "qwen3.5-9b-fast",
+        "rank": 16,
+    },
 }
 
 

@@ -51,7 +51,7 @@ class BaseStrategy(ABC):
     """
 
     # Default LLM model for strategies
-    DEFAULT_LLM_MODEL = "qwen-4b-decision"
+    DEFAULT_LLM_MODEL = "qwen-9b-decision"
 
     def __init__(self, config: Dict[str, Any] = None):
         """
@@ -126,7 +126,7 @@ class BaseStrategy(ABC):
 
         Args:
             prompt: Input prompt for the LLM
-            model_key: Model to use (default: qwen-4b-decision)
+            model_key: Model to use (default: qwen-9b-decision)
             max_tokens: Maximum tokens to generate
             temperature: Sampling temperature
 

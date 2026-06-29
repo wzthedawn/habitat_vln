@@ -4,7 +4,7 @@ This version uses rule-based parsing without LLM for subtask decomposition
 and task level classification (简单/中等/困难).
 """
 
-from typing import Dict, Any, Optional, List
+from typing import Dict, Any, Optional, List, Tuple
 import re
 import logging
 
@@ -167,6 +167,8 @@ class InstructionAgent(BaseAgent):
                             "precondition": s.precondition,
                             "completion_condition": s.completion_condition,
                             "spatial_constraint": s.spatial_constraint,
+                            "start_context": s.start_context,
+                            "end_context": s.end_context,
                         } for s in subtasks
                     ],
                     "current_subtask": {
@@ -1127,6 +1129,33 @@ Output reasoning result directly, no JSON format:"""
 
         return subtasks if subtasks else None
 
+    def _extract_action_and_condition(self, description: str) -> Tuple[str, Dict[str, Any]]:
+        """从子任务描述中提取动作和条件。
+
+        Args:
+            description: 子任务描述文本
+
+        Returns:
+            (action, condition) 元组，condition为字典
+        """
+        action_verbs = ["go", "move", "turn", "walk", "proceed", "continue", "find", "avoid", "navigate"]
+
+        # 提取动词作为动作
+        action = "navigate"
+        desc_lower = description.lower()
+        for verb in action_verbs:
+            if verb in desc_lower:
+                action = verb
+                break
+
+        # Use _parse_condition_string_fallback for proper condition parsing
+        # This includes obstacle_detected and obstacle_cleared patterns
+        condition = self._parse_condition_string_fallback(description)
+        if not condition:
+            condition = {"type": "description", "description": description.strip()}
+
+        return action, condition
+
     def _parse_json_format(self, text: str) -> List[SubTask]:
         """Parse JSON format: [{"action":"xxx","level":"easy"}]"""
         import json
@@ -1186,117 +1215,6 @@ Output reasoning result directly, no JSON format:"""
 
         except json.JSONDecodeError:
             return None
-
-    def _extract_action_and_condition_fallback(self, segment: str) -> tuple:
-        """Fallback rule-based action and condition extraction."""
-        segment = segment.strip()
-
-        # Detect key action patterns
-        action = None
-        condition = None
-
-        # Stairs down
-        if any(kw in segment.lower() for kw in ["down the stairs", "下楼", "下楼梯"]):
-            action = "Walk down the stairs"
-            condition = {"type": "y_change", "direction": "down", "min_change": 1.5}
-
-        # Stairs up
-        elif any(kw in segment.lower() for kw in ["up the stairs", "上楼", "上楼梯"]):
-            action = "Walk up the stairs"
-            condition = {"type": "y_change", "direction": "up", "min_change": 1.5}
-
-        # Turn right
-        elif any(kw in segment.lower() for kw in ["turn right", "右转", "向右"]):
-            action = "Turn right"
-            condition = {"type": "rotation", "direction": "right", "min_degrees": 70}
-
-        # Turn left
-        elif any(kw in segment.lower() for kw in ["turn left", "左转", "向左"]):
-            action = "Turn left"
-            condition = {"type": "rotation", "direction": "left", "min_degrees": 70}
-
-        # Walk towards / approach
-        elif any(kw in segment.lower() for kw in ["walk towards", "towards", "走向", "前往"]):
-            # Extract target
-            for target in ["rug", "carpet", "bench", "piano", "door", "room"]:
-                if target in segment.lower():
-                    action = f"Walk towards {target}"
-                    break
-            if not action:
-                action = "Walk towards target"
-            condition = {"type": "distance", "min_meters": 2.0}
-
-        # Wait
-        elif any(kw in segment.lower() for kw in ["wait", "等待", "停下"]):
-            action = "Wait"
-            condition = {"type": "wait", "steps": 3}
-
-        # Generic movement
-        elif any(kw in segment.lower() for kw in ["walk", "走", "move", "前进"]):
-            action = segment[:40] if len(segment) > 40 else segment
-            condition = {"type": "distance", "min_meters": 1.5}
-
-        # Use segment as action if nothing matched but it's meaningful
-        elif len(segment) > 3:
-            action = segment[:50]
-            condition = None
-
-        return action, condition
-
-    def _parse_llm_subtasks(self, response: str, fallback_instruction: str) -> List[SubTask]:
-        """Parse LLM response into SubTask objects.
-
-        Args:
-            response: LLM response text
-            fallback_instruction: Original instruction for fallback
-
-        Returns:
-            List of SubTask objects
-        """
-        try:
-            # Extract JSON array
-            import json
-            json_match = re.search(r'\[.*\]', response, re.DOTALL)
-            if json_match:
-                subtasks_data = json.loads(json_match.group())
-
-                subtasks = []
-                for i, data in enumerate(subtasks_data):
-                    # Support both simplified format (d, p, c, s) and full format
-                    description = data.get("d") or data.get("description", "")
-                    precondition_str = data.get("p") or data.get("precondition", "")
-                    completion_str = data.get("c") or data.get("completion_condition", "")
-                    spatial_str = data.get("s") or data.get("spatial_constraint", "")
-
-                    # Parse condition strings to structured format
-                    precondition = self._parse_condition_string(precondition_str) if precondition_str else None
-                    completion_condition = self._parse_condition_string(completion_str) if completion_str else None
-                    spatial_constraint = {"description": spatial_str} if spatial_str else None
-
-                    subtask = SubTask(
-                        id=i,
-                        description=description,
-                        status="pending" if i > 0 else "in_progress",
-                        level=self._determine_subtask_level(description),
-                        precondition=precondition,
-                        completion_condition=completion_condition,
-                        spatial_constraint=spatial_constraint,
-                        required_agents=self._determine_required_agents(description),
-                    )
-                    subtasks.append(subtask)
-
-                if subtasks:
-                    self.logger.info(f"[Instruction] Created {len(subtasks)} subtasks (with semantic conditions)")
-                    return subtasks
-
-        except json.JSONDecodeError as e:
-            self.logger.warning(f"JSON parsing failed: {e}")
-        except Exception as e:
-            self.logger.warning(f"LLM parsing error: {e}")
-
-        # Fallback to rule-based decomposition
-        self.logger.info("Using rule-based decomposition fallback")
-        return None
 
     def _parse_condition_string_fallback(self, condition_str: str) -> Optional[Dict[str, Any]]:
         """Fallback rule-based condition parsing with enhanced pattern recognition.
@@ -1370,6 +1288,19 @@ Output reasoning result directly, no JSON format:"""
                 distance = float(dist_match.group(1))
                 return {"type": "distance", "min_meters": distance, "description": condition_str}
             return {"type": "distance", "min_meters": 3.0, "description": condition_str}
+
+        # === Obstacle avoidance patterns (NEW) ===
+        # For emergency navigation subtasks
+        obstacle_keywords = ["障碍物", "障碍", "obstacle", "blocked", "阻塞", "路径阻塞", "挡住"]
+        avoidance_keywords = ["避开", "绕行", "绕开", "avoid", "绕过", "alternate route", "替代路线"]
+
+        # Obstacle detection subtask: completed when moved at least 1m (reacted to obstacle)
+        if any(kw in condition_str_lower for kw in obstacle_keywords) and not any(kw in condition_str_lower for kw in avoidance_keywords):
+            return {"type": "obstacle_detected", "min_distance_moved": 1.0, "description": condition_str}
+
+        # Obstacle avoidance subtask: completed when obstacle is cleared (distance > 3m from obstacle position)
+        if any(kw in condition_str_lower for kw in avoidance_keywords):
+            return {"type": "obstacle_cleared", "min_obstacle_distance": 3.0, "description": condition_str}
 
         # === Goal/destination patterns ===
         if any(kw in condition_str_lower for kw in ["at goal", "目标", "目的地", "destination", "end point", "final"]):

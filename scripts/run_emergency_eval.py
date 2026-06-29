@@ -23,6 +23,7 @@ from pathlib import Path
 from datetime import datetime
 from typing import Dict, Any, List, Optional
 from dataclasses import dataclass, field
+import torch.multiprocessing as mp
 
 # Add project root to path
 sys.path.insert(0, str(Path(__file__).parent.parent))
@@ -58,6 +59,82 @@ class EmergencyEvalResult:
     obstacle_type: str = ""
     use_path_replanner: bool = False
     use_lora: bool = False
+
+
+def worker_process(
+    worker_id: int,
+    gpu_id: int,
+    episodes: List[dict],
+    exp_config: Dict[str, Any],
+    config: Dict[str, Any],
+    result_queue,
+    llm_server: str,
+):
+    """Worker process for parallel evaluation.
+
+    Args:
+        worker_id: Worker process ID
+        gpu_id: GPU to use for this worker (physical GPU ID)
+        episodes: List of episode dicts to process
+        exp_config: Experiment configuration
+        config: Base configuration
+        result_queue: Queue to put results
+        llm_server: LLM server URL
+    """
+    import os
+    # Suppress habitat-sim logs
+    os.environ["HABITAT_SIM_LOG"] = "quiet"
+    os.environ["MAGNUM_LOG"] = "quiet"
+
+    import torch
+    torch.cuda.set_device(gpu_id)
+
+    import logging
+    logger = logging.getLogger(f"Worker-{worker_id}")
+    logger.info(f"Worker {worker_id} started on GPU {gpu_id}, processing {len(episodes)} episodes")
+
+    # Create evaluator for this worker
+    worker_config = config.copy()
+    worker_config["device"] = "cuda"
+    worker_config["llm_server"] = llm_server
+    worker_config["gpu_id"] = gpu_id  # Physical GPU ID for Habitat
+
+    evaluator = EmergencyVLNEvaluator(worker_config)
+
+    # Initialize components
+    if not evaluator.initialize_components(exp_config):
+        result_queue.put({"worker_id": worker_id, "error": "Failed to initialize"})
+        return
+
+    results = []
+    for i, ep_dict in enumerate(episodes):
+        # Convert dict to EmergencyEpisode
+        episode = EmergencyEpisode(
+            episode_id=ep_dict["episode_id"],
+            scene_id=ep_dict["scene_id"],
+            original_instruction=ep_dict["original_instruction"],
+            emergency_instruction=ep_dict["emergency_instruction"],
+            start_position=ep_dict["start_position"],
+            goal_position=ep_dict["goal_position"],
+            obstacle_config=ep_dict["obstacle_config"],
+            difficulty=ep_dict.get("difficulty", "medium"),
+            geodesic_distance=ep_dict.get("geodesic_distance", 10.0),
+            scenario_type=ep_dict.get("scenario_type", "emergency"),
+        )
+
+        logger.info(f"Worker {worker_id}: Episode {i+1}/{len(episodes)}")
+        result = evaluator.run_episode(episode, exp_config)
+        results.append(result)
+
+    # Put results in queue
+    result_queue.put({
+        "worker_id": worker_id,
+        "gpu_id": gpu_id,
+        "results": results,
+        "success_count": sum(1 for r in results if r.success),
+    })
+
+    logger.info(f"Worker {worker_id} completed: {sum(1 for r in results if r.success)}/{len(results)} success")
 
 
 class EmergencyVLNEvaluator:
@@ -500,6 +577,124 @@ class EmergencyVLNEvaluator:
             "use_lora_model": self.EXPERIMENTS[exp_name]["use_lora_model"],
         }
 
+    def run_parallel_experiment(
+        self,
+        exp_name: str,
+        num_episodes: int = 10,
+        split: str = "test",
+        num_workers: int = 3,
+        gpu_ids: List[int] = [1, 2, 3],
+        llm_server: str = "http://localhost:8000",
+    ) -> Dict[str, Any]:
+        """Run experiment with parallel workers.
+
+        Args:
+            exp_name: Experiment name
+            num_episodes: Total episodes to run
+            split: Dataset split
+            num_workers: Number of parallel workers
+            gpu_ids: GPU IDs for each worker
+            llm_server: LLM server URL
+
+        Returns:
+            Summary dictionary
+        """
+        if exp_name not in self.EXPERIMENTS:
+            self.logger.error(f"Unknown experiment: {exp_name}")
+            return {}
+
+        exp_config = self.EXPERIMENTS[exp_name]
+
+        # Load episodes
+        if not self.episodes:
+            self.load_emergency_episodes(split)
+
+        episodes_to_run = self.episodes[:num_episodes]
+
+        # Convert episodes to dicts for pickling
+        episode_dicts = [
+            {
+                "episode_id": ep.episode_id,
+                "scene_id": ep.scene_id,
+                "original_instruction": ep.original_instruction,
+                "emergency_instruction": ep.emergency_instruction,
+                "start_position": ep.start_position,
+                "goal_position": ep.goal_position,
+                "obstacle_config": ep.obstacle_config,
+                "difficulty": ep.difficulty,
+                "geodesic_distance": ep.geodesic_distance,
+                "scenario_type": ep.scenario_type,
+            }
+            for ep in episodes_to_run
+        ]
+
+        # Split episodes across workers
+        chunk_size = len(episode_dicts) // num_workers
+        episode_chunks = []
+        for i in range(num_workers):
+            start_idx = i * chunk_size
+            if i == num_workers - 1:
+                # Last worker takes remaining episodes
+                end_idx = len(episode_dicts)
+            else:
+                end_idx = start_idx + chunk_size
+            episode_chunks.append(episode_dicts[start_idx:end_idx])
+
+        self.logger.info(f"\n{'='*60}")
+        self.logger.info(f"Parallel Experiment: {exp_name}")
+        self.logger.info(f"Workers: {num_workers}, GPUs: {gpu_ids}")
+        self.logger.info(f"Total episodes: {num_episodes}")
+        for i, chunk in enumerate(episode_chunks):
+            self.logger.info(f"  Worker {i} (GPU {gpu_ids[i]}): {len(chunk)} episodes")
+        self.logger.info(f"{'='*60}\n")
+
+        # Create result queue
+        mp.set_start_method('spawn', force=True)
+        result_queue = mp.Queue()
+
+        # Start workers
+        processes = []
+        for worker_id in range(num_workers):
+            p = mp.Process(
+                target=worker_process,
+                args=(
+                    worker_id,
+                    gpu_ids[worker_id],
+                    episode_chunks[worker_id],
+                    exp_config,
+                    self.config,
+                    result_queue,
+                    llm_server,
+                ),
+            )
+            p.start()
+            processes.append(p)
+
+        # Collect results
+        all_results = []
+        worker_stats = []
+        for _ in range(num_workers):
+            worker_result = result_queue.get()
+            if "error" in worker_result:
+                self.logger.error(f"Worker {worker_result['worker_id']} failed: {worker_result['error']}")
+            else:
+                all_results.extend(worker_result["results"])
+                worker_stats.append(worker_result)
+
+        # Wait for all processes to complete
+        for p in processes:
+            p.join()
+
+        # Calculate summary
+        summary = self._calculate_summary(all_results, exp_name)
+
+        # Add parallel stats
+        summary["parallel_workers"] = num_workers
+        summary["gpu_ids"] = gpu_ids
+        summary["worker_stats"] = worker_stats
+
+        return summary
+
     def run_all_experiments(
         self,
         num_episodes: int = 10,
@@ -593,6 +788,10 @@ def main():
                        help="Disable video generation for faster evaluation")
     parser.add_argument("--no-trajectory", action="store_true", default=False,
                        help="Disable trajectory plot generation")
+    parser.add_argument("--parallel", type=int, default=1,
+                       help="Number of parallel processes (default: 1, serial)")
+    parser.add_argument("--gpus", type=str, default="1,2,3",
+                       help="GPU IDs to use for parallel processes (comma-separated, e.g., '1,2,3')")
 
     args = parser.parse_args()
 
@@ -615,26 +814,66 @@ def main():
     # Create evaluator
     evaluator = EmergencyVLNEvaluator(config)
 
-    # Run experiments
-    if args.exp == "all":
-        evaluator.run_all_experiments(
-            num_episodes=args.episodes,
-            split=args.split,
-            output_dir=args.output
-        )
-    else:
-        summary = evaluator.run_experiment(
-            exp_name=args.exp,
-            num_episodes=args.episodes,
-            split=args.split
-        )
+    # Parse GPU IDs
+    gpu_ids = [int(g) for g in args.gpus.split(",")]
 
-        # Print summary
-        if summary:
-            print(f"\n{args.exp.upper()} Summary:")
-            print(f"  Success Rate: {summary['success_rate']*100:.1f}%")
-            print(f"  SPL: {summary['avg_spl']:.3f}")
-            print(f"  Obstacle Avoidance: {summary['obstacle_avoidance_rate']*100:.1f}%")
+    # Run experiments
+    if args.parallel > 1:
+        # Parallel mode
+        if args.exp == "all":
+            # Run all experiments sequentially, but each with parallel workers
+            all_summaries = {}
+            for exp_name in evaluator.EXPERIMENTS.keys():
+                evaluator.episodes = []
+                evaluator.results = []
+                summary = evaluator.run_parallel_experiment(
+                    exp_name=exp_name,
+                    num_episodes=args.episodes,
+                    split=args.split,
+                    num_workers=args.parallel,
+                    gpu_ids=gpu_ids,
+                    llm_server=args.llm_server,
+                )
+                all_summaries[exp_name] = summary
+            evaluator._print_comparison(all_summaries)
+        else:
+            summary = evaluator.run_parallel_experiment(
+                exp_name=args.exp,
+                num_episodes=args.episodes,
+                split=args.split,
+                num_workers=args.parallel,
+                gpu_ids=gpu_ids,
+                llm_server=args.llm_server,
+            )
+
+            # Print summary
+            if summary:
+                print(f"\n{args.exp.upper()} Summary:")
+                print(f"  Success Rate: {summary['success_rate']*100:.1f}%")
+                print(f"  SPL: {summary['avg_spl']:.3f}")
+                print(f"  Obstacle Avoidance: {summary['obstacle_avoidance_rate']*100:.1f}%")
+                print(f"  Parallel Workers: {summary.get('parallel_workers', 1)}")
+    else:
+        # Serial mode (existing logic)
+        if args.exp == "all":
+            evaluator.run_all_experiments(
+                num_episodes=args.episodes,
+                split=args.split,
+                output_dir=args.output
+            )
+        else:
+            summary = evaluator.run_experiment(
+                exp_name=args.exp,
+                num_episodes=args.episodes,
+                split=args.split
+            )
+
+            # Print summary
+            if summary:
+                print(f"\n{args.exp.upper()} Summary:")
+                print(f"  Success Rate: {summary['success_rate']*100:.1f}%")
+                print(f"  SPL: {summary['avg_spl']:.3f}")
+                print(f"  Obstacle Avoidance: {summary['obstacle_avoidance_rate']*100:.1f}%")
 
 
 if __name__ == "__main__":

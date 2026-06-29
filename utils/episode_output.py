@@ -195,10 +195,10 @@ class EpisodeOutputManager:
             import cv2
             if depth_image is not None and depth_image.size > 0:
                 # Normalize depth for visualization
-                depth_normalized = depth_image.copy()
-                # Clip to reasonable range and normalize
-                depth_clipped = np.clip(depth_normalized, 0, 10)  # 10 meters max
-                depth_normalized = (depth_clipped / 10.0 * 255).astype(np.uint8)
+                # IMPORTANT: JET colormap 0=blue(far), 255=red(near)
+                # depth值=距离，需要反转：小距离(近处)→大像素值→红色
+                depth_clipped = np.clip(depth_image, 0, 10)  # 10 meters max
+                depth_normalized = (255 - depth_clipped / 10.0 * 255).astype(np.uint8)
                 # Apply colormap for better visualization
                 depth_colored = cv2.applyColorMap(depth_normalized, cv2.COLORMAP_JET)
                 cv2.imwrite(str(image_path), depth_colored)

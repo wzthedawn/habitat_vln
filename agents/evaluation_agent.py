@@ -32,9 +32,9 @@ class EvaluationAgent(BaseAgent):
     3. Trigger re-planning when needed
 
     Called based on task level:
-    - 简单: Not called
-    - 中等: Every 5 steps
-    - 困难: Every step
+    - easy: Not called
+    - medium: Every 5 steps
+    - hard: Every step
     """
 
     def __init__(self, config: Dict[str, Any] = None):
@@ -75,6 +75,14 @@ class EvaluationAgent(BaseAgent):
             return
 
         try:
+            # First, try to use model_manager from config (passed by experiment)
+            if self.config.get("model_manager"):
+                self._model_manager = self.config["model_manager"]
+                self._initialized = True
+                self.logger.info("EvaluationAgent: using provided model_manager (remote mode)")
+                return
+
+            # Fallback: create new model manager (for standalone usage)
             from models.model_manager import get_model_manager
             self._model_manager = get_model_manager(self.config)
 
@@ -89,7 +97,7 @@ class EvaluationAgent(BaseAgent):
 
                 # Load Qwen3.5-4B for evaluation (uses dedicated model config)
                 self.logger.info("Loading Qwen3.5-4B for evaluation...")
-                if self._model_manager.load_llm("qwen-4b-evaluation"):
+                if self._model_manager.load_llm("qwen-9b-evaluation"):
                     self.logger.info("Qwen3.5-4B loaded successfully for evaluation")
                 else:
                     self.logger.warning("Failed to load Qwen3.5-4B, using fallback evaluation")
@@ -157,7 +165,11 @@ class EvaluationAgent(BaseAgent):
                 "vertical_nav_ok": vertical_nav_ok,  # NEW
             }
             context.metadata["last_evaluation_score"] = score
-            self.logger.info(f"[Evaluation] 评分:{score:.2f}, 反馈:{feedback[:30]}...")
+            self.logger.info(f"[Evaluation] score: {score:.2f}, feedback: {feedback[:30]}...")
+
+            # Print to console
+            print(f"\n[EvaluationAgent] Score: {score:.2f}")
+            print(f"[EvaluationAgent] Feedback: {feedback[:100]}{'...' if len(feedback) > 100 else ''}")
 
             return AgentOutput.success_output(
                 data={
@@ -184,7 +196,7 @@ class EvaluationAgent(BaseAgent):
             )
 
         except Exception as e:
-            self.logger.error(f"[Evaluation] 错误: {e}")
+            self.logger.error(f"[Evaluation] error: {e}")
             return AgentOutput.failure_output([str(e)], "Evaluation failed")
 
     def _evaluate_decision(
@@ -203,7 +215,7 @@ class EvaluationAgent(BaseAgent):
                 conversation_id = f"evaluation_ep{episode_id}"
 
                 response = self._model_manager.generate(
-                    "qwen-4b-evaluation",  # Use dedicated evaluation model config
+                    "qwen-9b-evaluation",  # Use dedicated evaluation model config
                     prompt,
                     max_new_tokens=200,  # Reduced from 400 for efficiency
                     temperature=0.3,  # Lower temperature for more consistent evaluation
@@ -215,7 +227,7 @@ class EvaluationAgent(BaseAgent):
                 return self._fallback_evaluation(context, decision)
 
         except Exception as e:
-            self.logger.warning(f"[Evaluation] LLM失败: {e}")
+            self.logger.warning(f"[Evaluation] LLM failed: {e}")
             return self._fallback_evaluation(context, decision)
 
     def _build_evaluation_prompt(
@@ -226,26 +238,26 @@ class EvaluationAgent(BaseAgent):
         """Build prompt for evaluation with vertical navigation awareness."""
         # Get instruction info
         instruction = context.instruction
-        task_level = context.metadata.get("task_level", "中等")
+        task_level = context.metadata.get("task_level", "medium")
 
         # Get current subtask
         current_subtask = context.get_current_subtask()
-        subtask_desc = current_subtask.description if current_subtask else "无"
+        subtask_desc = current_subtask.description if current_subtask else "none"
 
         # Get perception info
         perception = context.metadata.get("perception_output", {})
-        room_type = perception.get("room_type", "未知")
+        room_type = perception.get("room_type", "unknown")
         objects = perception.get("objects", [])[:3]
         landmarks = perception.get("landmarks", [])
 
         # Get trajectory info
         trajectory = context.metadata.get("trajectory", {})
-        heading = trajectory.get("heading", "未知")
+        heading = trajectory.get("heading", "unknown")
         distance = trajectory.get("distance_traveled", 0)
         visited = trajectory.get("visited", False)
         corrections = trajectory.get("corrections", [])
         y_change = trajectory.get("y_change", 0.0)
-        y_direction = trajectory.get("y_direction", "稳定")
+        y_direction = trajectory.get("y_direction", "stable")
 
         # Get decision info
         action = decision.get("action", "unknown")
@@ -262,78 +274,78 @@ class EvaluationAgent(BaseAgent):
         if goal_pos:
             vert_dist = goal_pos[1] - current_pos[1]
             horiz_dist = math.sqrt((goal_pos[0]-current_pos[0])**2 + (goal_pos[2]-current_pos[2])**2)
-            floor_relation = "目标在下层" if vert_dist < -0.5 else "目标在上层" if vert_dist > 0.5 else "同层"
+            floor_relation = "target below" if vert_dist < -0.5 else "target above" if vert_dist > 0.5 else "same floor"
         else:
             vert_dist = 0
             horiz_dist = 0
-            floor_relation = "未知"
+            floor_relation = "unknown"
 
         # Height change trend evaluation
-        y_trend = "稳定"
+        y_trend = "stable"
         if len(context.trajectory) >= 3:
             recent_y = [p[1] for p in context.trajectory[-3:]]
             y_change_recent = recent_y[-1] - recent_y[0]
             if abs(y_change_recent) > 0.1:
-                y_trend = f"最近{'上升' if y_change_recent > 0 else '下降'}{abs(y_change_recent):.2f}米"
+                y_trend = f"recently {'ascending' if y_change_recent > 0 else 'descending'} {abs(y_change_recent):.2f}m"
 
         # === NEW: Enhanced prompt template ===
         prompt = f"""/no_think
-你是导航决策评估专家。评估决策合理性。
+You are a navigation decision evaluation expert. Evaluate the decision rationality.
 
-## 导航目标
-- 指令: {instruction[:80]}
-- 子任务: {subtask_desc[:60] if subtask_desc else "无"}
+## Navigation Goal
+- Instruction: {instruction[:80]}
+- Subtask: {subtask_desc[:60] if subtask_desc else "none"}
 
-## 空间关系 (关键评估维度)
-- 高度差: {vert_dist:+.2f}米
-- 楼层关系: {floor_relation}
-- 水平距离: {horiz_dist:.1f}米
-- 高度趋势: {y_trend}
-- 总高度变化: {y_change:+.2f}米 ({y_direction})
+## Spatial Relations (Key Evaluation Dimension)
+- Height diff: {vert_dist:+.2f}m
+- Floor relation: {floor_relation}
+- Horizontal distance: {horiz_dist:.1f}m
+- Height trend: {y_trend}
+- Total height change: {y_change:+.2f}m ({y_direction})
 
-## 视觉感知
-- 房间: {room_type}
-- 物体: {', '.join([o.get('name', '') for o in objects]) if objects else '无'}
-- 地标: {', '.join([lm.get('name', '') for lm in landmarks]) if landmarks else '无'}
+## Visual Perception
+- Room: {room_type}
+- Objects: {', '.join([o.get('name', '') for o in objects]) if objects else 'none'}
+- Landmarks: {', '.join([lm.get('name', '') for lm in landmarks]) if landmarks else 'none'}
 
-## 轨迹状态
-- 朝向: {heading}
-- 已走: {distance:.1f}米
-- 重复访问: {"是" if visited else "否"}
-- 路径问题: {len(corrections)} 个
+## Trajectory State
+- Heading: {heading}
+- Traveled: {distance:.1f}m
+- Repeated visit: {"yes" if visited else "no"}
+- Path issues: {len(corrections)}
 
-## 当前决策
-- 动作: {action}
-- 理由: {decision_reasoning[:80] if decision_reasoning else "无"}
+## Current Decision
+- Action: {action}
+- Reasoning: {decision_reasoning[:80] if decision_reasoning else "none"}
 
-## 历史评估
+## Evaluation History
 {history_summary}
 
-## 评估要点
-1. 如果需要垂直导航（高度差>0.5m），决策是否在寻找楼梯？
-2. 高度变化方向是否与目标方向一致？
-   - 目标在下层 + 高度下降 = 正确
-   - 目标在上层 + 高度上升 = 正确
-   - 目标在下层 + 高度上升 = 错误，需要转向
-   - 目标在上层 + 高度下降 = 错误，需要转向
-3. 动作是否合理推进子任务？
+## Evaluation Points
+1. If vertical navigation is needed (height diff > 0.5m), is the decision looking for stairs?
+2. Is the height change direction consistent with the target direction?
+   - Target below + descending = correct
+   - Target above + ascending = correct
+   - Target below + ascending = wrong, need to turn
+   - Target above + descending = wrong, need to turn
+3. Does the action reasonably advance the subtask?
 
-输出JSON:
+Output JSON:
 {{
   "score": 0.0-1.0,
-  "feedback": "评估反馈",
+  "feedback": "evaluation feedback",
   "vertical_nav_ok": true/false,
-  "suggestions": ["建议1", "建议2"]
+  "suggestions": ["suggestion1", "suggestion2"]
 }}
 
-只输出JSON。"""
+Output JSON only."""
 
         return prompt
 
     def _build_history_summary(self, context: NavContext) -> str:
         """Build summary of recent evaluation history."""
         if not self._evaluation_history:
-            return "无历史评估"
+            return "No evaluation history"
 
         recent = self._evaluation_history[-5:]
         lines = []
@@ -341,7 +353,7 @@ class EvaluationAgent(BaseAgent):
         for eval_record in recent:
             step = eval_record.get("step", "?")
             score = eval_record.get("score", 0)
-            lines.append(f"步骤{step}: {score:.2f}分")
+            lines.append(f"Step {step}: {score:.2f}")
 
         return "\n".join(lines)
 
@@ -359,7 +371,7 @@ class EvaluationAgent(BaseAgent):
                     "suggestions": evaluation.get("suggestions", []),
                 }
         except (json.JSONDecodeError, ValueError) as e:
-            self.logger.warning(f"[Evaluation] JSON解析失败: {e}")
+            self.logger.warning(f"[Evaluation] JSON parse failed: {e}")
 
         # Fallback: extract score from text
         score_match = re.search(r'(\d+\.?\d*)', response)
@@ -376,7 +388,7 @@ class EvaluationAgent(BaseAgent):
 
         return {
             "score": 0.5,
-            "feedback": "无法解析评估结果",
+            "feedback": "Unable to parse evaluation result",
             "vertical_nav_ok": True,  # Default
             "suggestions": [],
         }
@@ -404,16 +416,16 @@ class EvaluationAgent(BaseAgent):
 
             if dist < 2.0:
                 score += 0.2
-                feedback = f"接近目标地标: {closest.get('name')}"
+                feedback = f"Approaching target landmark: {closest.get('name')}"
             elif dist < 5.0:
                 score += 0.1
-                feedback = f"正在接近地标: {closest.get('name')}"
+                feedback = f"Moving towards landmark: {closest.get('name')}"
 
         # Check for repeated visits
         if trajectory.get("visited", False):
             score -= 0.2
-            feedback = "重复访问相同区域"
-            suggestions.append("尝试不同方向")
+            feedback = "Repeated visit to same area"
+            suggestions.append("Try different direction")
 
         # Check for corrections
         corrections = trajectory.get("corrections", [])
@@ -425,15 +437,15 @@ class EvaluationAgent(BaseAgent):
         # Check for stuck
         if any(c.get("type") == "stuck" for c in corrections):
             score -= 0.3
-            feedback = "导航似乎卡住了"
-            suggestions.append("考虑回头或转向")
+            feedback = "Navigation seems stuck"
+            suggestions.append("Consider turning back or changing direction")
 
         # Normalize score
         score = max(0.0, min(1.0, score))
 
         return {
             "score": score,
-            "feedback": feedback or "评估完成",
+            "feedback": feedback or "Evaluation completed",
             "suggestions": suggestions,
         }
 
@@ -481,13 +493,13 @@ class EvaluationAgent(BaseAgent):
         Returns:
             True if evaluation should be called
         """
-        if task_level == "简单":
+        if task_level == "easy":
             return False  # Never call for simple tasks
 
-        elif task_level == "中等":
+        elif task_level == "medium":
             return step_count % 5 == 0  # Every 5 steps
 
-        elif task_level == "困难":
+        elif task_level == "hard":
             return True  # Every step
 
         return False
@@ -565,13 +577,13 @@ class EvaluationAgent(BaseAgent):
         opinion = {
             "direction": "right",
             "confidence": 0.5,
-            "reason": "默认建议",
+            "reason": "Default suggestion",
             "stop_condition": "",
             "agent_source": "evaluation",
         }
 
         if not decision_history or not evaluation_history:
-            opinion["reason"] = "决策历史不足"
+            opinion["reason"] = "Insufficient decision history"
             return opinion
 
         # Analyze recent decisions and their scores
@@ -611,30 +623,30 @@ class EvaluationAgent(BaseAgent):
         if good_forward > bad_forward and good_forward > 0:
             opinion["direction"] = "forward"
             opinion["confidence"] = 0.7 + (good_forward - bad_forward) * 0.05
-            opinion["reason"] = f"前进决策成功率较高({good_forward}/{good_forward + bad_forward})"
+            opinion["reason"] = f"Forward decision has higher success rate ({good_forward}/{good_forward + bad_forward})"
         elif good_left > bad_left and good_left > good_right:
             opinion["direction"] = "left"
             opinion["confidence"] = 0.65 + (good_left - bad_left) * 0.05
-            opinion["reason"] = f"左转决策成功率较高({good_left}/{good_left + bad_left})"
+            opinion["reason"] = f"Left turn decision has higher success rate ({good_left}/{good_left + bad_left})"
         elif good_right > bad_right and good_right > good_left:
             opinion["direction"] = "right"
             opinion["confidence"] = 0.65 + (good_right - bad_right) * 0.05
-            opinion["reason"] = f"右转决策成功率较高({good_right}/{good_right + bad_right})"
+            opinion["reason"] = f"Right turn decision has higher success rate ({good_right}/{good_right + bad_right})"
         else:
             # No clear pattern - suggest trying different direction
-            opinion["reason"] = "决策历史无明显模式，建议探索"
+            opinion["reason"] = "No clear pattern in decision history, suggest exploring"
 
             # Avoid recently failed directions
             if failed_actions:
                 recent_failed = [a for a in failed_actions[-3:]]
                 if "turn_left" in recent_failed or "left" in recent_failed:
                     opinion["direction"] = "right"
-                    opinion["reason"] += "，避免最近失败的左转"
+                    opinion["reason"] += ", avoid recently failed left turn"
                 elif "turn_right" in recent_failed or "right" in recent_failed:
                     opinion["direction"] = "left"
-                    opinion["reason"] += "，避免最近失败的右转"
+                    opinion["reason"] += ", avoid recently failed right turn"
 
-        opinion["stop_condition"] = "决策得分>0.6或移动2米"
+        opinion["stop_condition"] = "score>0.6 or moved 2m"
 
         return opinion
 
@@ -705,7 +717,7 @@ class EvaluationAgent(BaseAgent):
                 constraints["hard"].append(ActionConstraint(
                     action=action,
                     blocked=True,
-                    reason="评估结果禁止"
+                    reason="Blocked by evaluation"
                 ))
 
         # Add soft constraints for weight adjustments
@@ -714,7 +726,7 @@ class EvaluationAgent(BaseAgent):
                 constraints["soft"].append(ActionConstraint(
                     action=action,
                     weight_multiplier=multiplier,
-                    reason="评估权重调整"
+                    reason="Weight adjustment by evaluation"
                 ))
 
         # Store evaluation result in context
@@ -734,7 +746,7 @@ class EvaluationAgent(BaseAgent):
                 "weights": weights,
                 "conflicts": conflicts,
             },
-            reasoning=arbitration.get("reasoning", "评估完成"),
+            reasoning=arbitration.get("reasoning", "Evaluation completed"),
             constraints=constraints,
         )
 
@@ -781,7 +793,7 @@ class EvaluationAgent(BaseAgent):
                 score += 0.2
             if evidence.get("landmarks"):
                 score += 0.1
-            if evidence.get("nav_hint"):
+            if evidence.get("scene_description") and len(evidence.get("scene_description", "")) > 20:
                 score += 0.1
 
         # Trajectory opinion quality
@@ -836,7 +848,7 @@ class EvaluationAgent(BaseAgent):
             conflicts.append({
                 "type": "action_conflict",
                 "agents": [k for k, v in actions.items() if v in ["forward", "stop"]],
-                "description": "前进与停止建议冲突",
+                "description": "Forward vs stop recommendation conflict",
             })
 
         # Turn left vs Turn right conflict
@@ -844,7 +856,7 @@ class EvaluationAgent(BaseAgent):
             conflicts.append({
                 "type": "direction_conflict",
                 "agents": [k for k, v in actions.items() if v in ["turn_left", "turn_right"]],
-                "description": "左右转向建议冲突",
+                "description": "Left vs right turn recommendation conflict",
             })
 
         return conflicts
@@ -910,9 +922,9 @@ class EvaluationAgent(BaseAgent):
         # Generate reasoning
         conflict_str = ""
         if conflicts:
-            conflict_str = f"，解决{len(conflicts)}个冲突"
+            conflict_str = f", resolved {len(conflicts)} conflicts"
 
-        reasoning = f"综合{len(opinions)}个意见{conflict_str}，推荐{best_action}"
+        reasoning = f"Synthesized {len(opinions)} opinions{conflict_str}, recommend {best_action}"
 
         return {
             "recommended_action": best_action,
@@ -1038,9 +1050,9 @@ class PerformanceTracker:
                         episode_correct=0,
                         episode_critical=0,
                     )
-                self.logger.info(f"[Evaluation] 加载性能数据: {len(self.agents)}个agent")
+                self.logger.info(f"[Evaluation] Loaded performance data: {len(self.agents)} agents")
             except Exception as e:
-                self.logger.warning(f"[Evaluation] 加载失败: {e}")
+                self.logger.warning(f"[Evaluation] Load failed: {e}")
 
     def save(self) -> None:
         """Save historical performance to file."""
@@ -1053,7 +1065,7 @@ class PerformanceTracker:
                 )
             self.logger.debug(f"Saved performance data to {self.performance_file}")
         except Exception as e:
-            self.logger.warning(f"[Evaluation] 保存失败: {e}")
+            self.logger.warning(f"[Evaluation] Save failed: {e}")
 
     def record_opinion(
         self,
@@ -1299,9 +1311,9 @@ class DynamicScorer:
                 supporting.append(f"{opinion.agent}: {opinion.reasoning[:50]}")
 
         if supporting:
-            return f"选择{best_action} - " + "; ".join(supporting[:2])
+            return f"Selected {best_action} - " + "; ".join(supporting[:2])
 
-        return f"选择{best_action} (得分: {action_scores[best_action]:.2f})"
+        return f"Selected {best_action} (score: {action_scores[best_action]:.2f})"
 
 
 def get_performance_tracker(config: Dict[str, Any] = None) -> PerformanceTracker:

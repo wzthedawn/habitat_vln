@@ -118,7 +118,6 @@ class ReflectionStrategy(BaseStrategy):
             "scene_description": perception_output.get("scene_description", ""),
             "objects": perception_output.get("objects", [])[:5],
             "landmarks": perception_output.get("landmarks", []),
-            "nav_hint": perception_output.get("nav_hint", ""),
             "walkable_analysis": perception_output.get("walkable_analysis", {}),
             "obstacle_ahead": perception_output.get("obstacle_ahead", {}),
         }
@@ -147,8 +146,8 @@ class ReflectionStrategy(BaseStrategy):
         return {
             "full_instruction": context.instruction,
             "current_subtask": subtask_desc,
-            "subtask_level": current_subtask.level if current_subtask else "中等",
-            # 语义推理信息
+            "subtask_level": current_subtask.level if current_subtask else "medium",
+            # Semantic reasoning info
             "directions": instruction_output.get("directions", []),
             "complexity": instruction_output.get("complexity", 0.0),
             "instruction_analysis": instruction_output.get("instruction_analysis", {}),
@@ -157,7 +156,7 @@ class ReflectionStrategy(BaseStrategy):
     def _review_recent_actions(self, context: NavContext) -> str:
         """Review recent navigation actions."""
         if not context.action_history:
-            return "无历史动作"
+            return "No action history"
 
         recent = context.action_history[-self.history_window:]
 
@@ -167,7 +166,7 @@ class ReflectionStrategy(BaseStrategy):
             action_type = action.action_type.name
             action_counts[action_type] = action_counts.get(action_type, 0) + 1
 
-        summary = f"最近{len(recent)}个动作: "
+        summary = f"Recent {len(recent)} actions: "
         summary += ", ".join(f"{k}({v})" for k, v in action_counts.items())
 
         return summary
@@ -210,46 +209,46 @@ class ReflectionStrategy(BaseStrategy):
     ) -> str:
         """Build the reflection prompt for LLM."""
         # Format lessons
-        lessons_str = "暂无历史经验"
+        lessons_str = "No historical experience"
         if self._lessons_learned:
             recent = self._lessons_learned[-3:]
             lessons_str = "\n".join([
-                f"{i+1}. {l.get('context', '未知')}: {l.get('insight', '')[:50]}"
+                f"{i+1}. {l.get('context', 'unknown')}: {l.get('insight', '')[:50]}"
                 for i, l in enumerate(recent)
             ])
 
         prompt = f"""/no_think
-你是一个导航反思专家。请分析当前状态，反思历史动作，并提出改进建议。
+You are a navigation reflection expert. Analyze current state, reflect on action history, and provide improvement suggestions.
 
-## 导航指令
+## Navigation Instruction
 {instruction_info['full_instruction']}
 
-## 当前子任务
-{instruction_info['current_subtask']} (难度: {instruction_info['subtask_level']})
+## Current Subtask
+{instruction_info['current_subtask']} (level: {instruction_info['subtask_level']})
 
-## 感知信息
-- 房间类型: {perception_info['room_type']}
-- 场景描述: {perception_info['scene_description'][:100]}
-- 可见物体: {[o.get('物体', o.get('name', '')) for o in perception_info['objects'][:3]]}
+## Perception Info
+- Room type: {perception_info['room_type']}
+- Scene description: {perception_info['scene_description'][:100]}
+- Visible objects: {[o.get('object', o.get('物体', o.get('name', ''))) for o in perception_info['objects'][:3]]}
 
-## 轨迹状态
-- 已走距离: {trajectory_info['distance_traveled']:.1f}m
-- 步数: {trajectory_info['step_count']}
-- 位置: ({trajectory_info['position'][0]:.1f}, {trajectory_info['position'][1]:.1f}, {trajectory_info['position'][2]:.1f})
+## Trajectory State
+- Distance traveled: {trajectory_info['distance_traveled']:.1f}m
+- Steps: {trajectory_info['step_count']}
+- Position: ({trajectory_info['position'][0]:.1f}, {trajectory_info['position'][1]:.1f}, {trajectory_info['position'][2]:.1f})
 
-## 动作回顾
+## Action Review
 {action_review}
 
-## 历史经验
+## Historical Experience
 {lessons_str}
 
-## 分析要求
-1. 分析当前策略是否正确
-2. 识别潜在问题（如重复动作、低效路径）
-3. 提出具体的改进建议
-4. 给出下一步导航重点（30字以内）
+## Analysis Requirements
+1. Analyze whether current strategy is correct
+2. Identify potential issues (e.g., repeated actions, inefficient paths)
+3. Provide concrete improvement suggestions
+4. Give next step navigation focus (within 30 words)
 
-直接输出反思结果，不要JSON格式："""
+Output reflection result directly, no JSON format:"""
 
         return prompt
 

@@ -14,7 +14,7 @@ import os
 import numpy as np
 
 # 设置数据路径
-DATA_PATH = "/root/habitat_vln/data/scene_datasets/habitat-test-scenes"
+DATA_PATH = "/home/WZ/MA_VLN/habitat_vln/data/scene_datasets/habitat-test-scenes"
 
 def test_habitat_sim():
     """测试 Habitat-sim 基本功能"""

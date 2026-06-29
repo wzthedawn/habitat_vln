@@ -15,14 +15,14 @@ import sys
 import yaml
 import numpy as np
 
-sys.path.insert(0, '/root/habitat_vln')
+sys.path.insert(0, '/home/WZ/MA_VLN/habitat_vln')
 
 # 数据路径
-DATA_PATH = '/root/habitat_vln/data/scene_datasets/habitat-test-scenes'
+DATA_PATH = '/home/WZ/MA_VLN/habitat_vln/data/scene_datasets/habitat-test-scenes'
 
 def load_config():
     """加载配置"""
-    with open('/root/habitat_vln/configs/model_config.yaml', 'r') as f:
+    with open('/home/WZ/MA_VLN/habitat_vln/configs/model_config.yaml', 'r') as f:
         return yaml.safe_load(f)
 
 def test_habitat_navigation():

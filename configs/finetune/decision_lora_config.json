@@ -1,0 +1,51 @@
+{
+  "task_name": "emergency_decision",
+  "model_name": "Qwen/Qwen2.5-7B-Instruct",
+  "input_fields": [
+    "instruction",
+    "perception_info",
+    "trajectory_info",
+    "emergency_signal"
+  ],
+  "output_fields": [
+    "risk_score",
+    "reasoning",
+    "action_sequence"
+  ],
+  "max_samples": 600,
+  "max_text_length": 1024,
+  "lora": {
+    "r": 16,
+    "lora_alpha": 32,
+    "lora_dropout": 0.05,
+    "target_modules": [
+      "q_proj",
+      "v_proj",
+      "k_proj",
+      "o_proj"
+    ]
+  },
+  "training": {
+    "learning_rate": 0.0002,
+    "num_train_epochs": 3,
+    "per_device_train_batch_size": 4,
+    "gradient_accumulation_steps": 4,
+    "warmup_steps": 100,
+    "max_grad_norm": 1.0,
+    "weight_decay": 0.01,
+    "lr_scheduler_type": "cosine"
+  },
+  "optimization": {
+    "use_8bit_optimizer": true,
+    "use_gradient_checkpointing": true,
+    "mixed_precision": "bf16"
+  },
+  "logging": {
+    "logging_steps": 10,
+    "save_steps": 500,
+    "eval_steps": 100,
+    "output_dir": "outputs/lora_finetune",
+    "logging_dir": "outputs/logs"
+  },
+  "estimated_memory_gb": 8.0
+}

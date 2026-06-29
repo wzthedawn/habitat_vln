@@ -45,85 +45,114 @@ class ModelManager:
 
     Manages model lifecycle:
     - YOLOv5s: Object detection (~0.5GB) - compatible with numpy 2.x
-    - Qwen3.5-4B (perception): Visual descriptions (~4GB INT8)
+    - Qwen3.5-9B-AWQ (perception): Visual descriptions (~9GB AWQ)
     - Qwen3.5-2B (trajectory): Path summarization (~2.1GB INT8)
-    - Qwen3.5-4B: Navigation decisions (~4GB INT8)
-    - Qwen3.5-4B (evaluation): Decision evaluation (~4GB INT8)
+    - Qwen3.5-9B-AWQ: Navigation decisions (~9GB AWQ)
+    - Qwen3.5-9B-AWQ (evaluation): Decision evaluation (~9GB AWQ)
 
-    Total VRAM: ~14.1GB with INT8 quantization (方案二)
+    Total VRAM: ~18GB with AWQ quantization
     """
 
     _instance = None
     _lock = threading.Lock()
 
-    # Model configurations with INT8 quantization
-    # 方案二: 4B perception + 2B trajectory + 4B decision + 4B evaluation + VLM
-    # Total VRAM: ~16GB + Habitat ~2GB = ~18GB (safe for 24GB GPU)
+    # Multi-tier model configuration for heterogeneous agent allocation.
+    # Tier 1 (VLM):  Qwen3-VL-8B-Instruct - dedicated vision-language model for perception
+    # Tier 2 (Fast): Qwen3.5-9B-AWQ - lightweight LLM for latency-sensitive operations
+    # Tier 3 (Strong): Qwen3.6-35B-A3B - MoE LLM for complex reasoning (debate/reflection/planning)
     MODEL_CONFIGS = {
-        "qwen-4b-perception": {
+        # === Tier 1: Dedicated VLM for perception ===
+        "qwen3-vl-8b": {
+            "type": "vlm",
+            "model_name": "/data/WZ/Model/Qwen/Qwen3-VL-8B-Instruct",
+            "vram_gb": 16.0,
+            "load_time": 20.0,
+            "max_new_tokens": 400,
+            "temperature": 0.2,
+            "description": "Qwen3-VL-8B: dedicated VLM for structured scene perception",
+        },
+        # === Tier 2: Fast LLM for simple/low-latency operations ===
+        "qwen3.5-9b-fast": {
             "type": "llm",
-            "model_name": "/root/.cache/modelscope/hub/models/Qwen/Qwen3___5-4B",
-            "vram_gb": 4.0,
+            "model_name": "/data/WZ/Model/Qwen/Qwen3___5-9b_AWQ",
+            "vram_gb": 8.0,
+            "load_time": 15.0,
+            "max_new_tokens": 256,
+            "temperature": 0.2,
+            "description": "Qwen3.5-9B: fast LLM for subtask decomposition, emergency, review",
+        },
+        # === Tier 3: Strong MoE LLM for complex reasoning ===
+        "qwen3.6-35b-strong": {
+            "type": "llm",
+            "model_name": "/data/WZ/Model/Qwen/Qwen3.6-35B-A3B",
+            "vram_gb": 20.0,
+            "load_time": 25.0,
+            "max_new_tokens": 400,
+            "temperature": 0.3,
+            "description": "Qwen3.6-35B-A3B: strong MoE LLM for debate, reflection, planning",
+        },
+        # === Backward-compatible aliases (map to new tier-2 model) ===
+        "qwen-9b-perception": {
+            "type": "llm",
+            "model_name": "/data/WZ/Model/Qwen/Qwen3___5-9b_AWQ",
+            "vram_gb": 8.0,
             "load_time": 15.0,
             "max_new_tokens": 256,
             "temperature": 0.3,
+            "description": "Backward compat: maps to qwen3.5-9b-fast",
         },
-        "qwen-2b-trajectory": {
+        "qwen-9b": {
             "type": "llm",
-            "model_name": "/root/.cache/modelscope/hub/models/Qwen/Qwen3___5-2B",
-            "vram_gb": 2.1,
-            "load_time": 10.0,
-            "max_new_tokens": 200,
-            "temperature": 0.2,
-        },
-        "qwen-2b-instruction": {
-            "type": "llm",
-            "model_name": "/root/.cache/modelscope/hub/models/Qwen/Qwen3___5-2B",
-            "vram_gb": 2.1,  # Shares physical model with qwen-2b-trajectory
-            "load_time": 10.0,
-            "max_new_tokens": 500,
-            "temperature": 0.1,  # Lower temperature for stable JSON output
-        },
-        "qwen-4b": {
-            "type": "llm",
-            "model_name": "/root/.cache/modelscope/hub/models/Qwen/Qwen3___5-4B",
-            "vram_gb": 4.0,
+            "model_name": "/data/WZ/Model/Qwen/Qwen3___5-9b_AWQ",
+            "vram_gb": 8.0,
             "load_time": 15.0,
             "max_new_tokens": 150,
             "temperature": 0.1,
+            "description": "Backward compat: default pipeline model",
         },
-        "qwen-4b-decision": {
+        "qwen-9b-decision": {
             "type": "llm",
-            "model_name": "/root/.cache/modelscope/hub/models/Qwen/Qwen3___5-4B",
-            "vram_gb": 4.0,  # Shares physical model with qwen-4b
+            "model_name": "/data/WZ/Model/Qwen/Qwen3___5-9b_AWQ",
+            "vram_gb": 8.0,
             "load_time": 15.0,
             "max_new_tokens": 300,
             "temperature": 0.1,
+            "description": "Backward compat: maps to qwen3.5-9b-fast",
         },
-        "qwen-4b-instruction": {
+        "qwen-9b-instruction": {
             "type": "llm",
-            "model_name": "/root/.cache/modelscope/hub/models/Qwen/Qwen3___5-4B",
-            "vram_gb": 4.0,  # Shares physical model with qwen-4b
+            "model_name": "/data/WZ/Model/Qwen/Qwen3___5-9b_AWQ",
+            "vram_gb": 8.0,
             "load_time": 15.0,
             "max_new_tokens": 500,
             "temperature": 0.1,
+            "description": "Backward compat: maps to qwen3.5-9b-fast",
         },
-        "qwen-4b-evaluation": {
+        "qwen-9b-evaluation": {
             "type": "llm",
-            "model_name": "/root/.cache/modelscope/hub/models/Qwen/Qwen3___5-4B",
-            "vram_gb": 4.0,
+            "model_name": "/data/WZ/Model/Qwen/Qwen3___5-9b_AWQ",
+            "vram_gb": 8.0,
             "load_time": 15.0,
             "max_new_tokens": 150,
             "temperature": 0.2,
+            "description": "Backward compat: maps to qwen3.5-9b-fast",
+        },
+        "qwen-9b-trajectory": {
+            "type": "llm",
+            "model_name": "/data/WZ/Model/Qwen/Qwen3___5-9b_AWQ",
+            "vram_gb": 8.0,
+            "max_new_tokens": 200,
+            "temperature": 0.2,
+            "description": "Backward compat: maps to qwen3.5-9b-fast",
         },
         "qwen2-vl-2b": {
             "type": "vlm",
-            "model_name": "/root/.cache/modelscope/hub/models/Qwen/Qwen2-VL-2B-Instruct",
+            "model_name": "/data/WZ/Model/Qwen/Qwen2-VL-2B-Instruct",
             "vram_gb": 4.0,
             "load_time": 15.0,
             "max_new_tokens": 256,
             "temperature": 0.3,
-            "optional": True,  # VLM is optional, won't fail if not available
+            "optional": True,
         },
     }
 
@@ -150,7 +179,17 @@ class ModelManager:
         # Remote LLM configuration (for dual-environment IPC)
         self.use_remote = self.config.get("use_remote", self.config.get("use_remote_llm", False))
         self.remote_server_url = self.config.get("remote_server_url", self.config.get("llm_server_url", "http://localhost:8000"))
+        self.model_path = self.config.get("model_path", None)  # Dynamic model path for vLLM
+
+        # SiliconFlow API configuration
+        self.use_siliconflow = self.config.get("use_siliconflow", False)
+        self.siliconflow_api_key = self.config.get("siliconflow_api_key")
+        self.siliconflow_model = self.config.get("siliconflow_model")
+        # Local VLM server for vision tasks (can be different from SiliconFlow)
+        self.vlm_server_url = self.config.get("vlm_server_url", "http://localhost:8000")
+
         self._remote_client = None
+        self._vlm_client = None  # Separate client for VLM
         self._remote_healthy = False
 
         # Model storage
@@ -163,21 +202,57 @@ class ModelManager:
         self._llm_loaded = False
 
         # Initialize remote client if needed
-        if self.use_remote:
+        if self.use_remote or self.use_siliconflow:
             self._init_remote_client()
 
-        mode = "remote" if self.use_remote else "local"
+        if self.use_siliconflow:
+            mode = "siliconflow+local_vlm"
+        elif self.use_remote:
+            mode = "remote"
+        else:
+            mode = "local"
         self.logger.info(f"ModelManager initialized (device={self.device}, int8={self.use_int8}, mode={mode})")
 
     def _init_remote_client(self) -> bool:
         """Initialize remote LLM client."""
         try:
             from models.remote_client import RemoteLLMClient
-            self._remote_client = RemoteLLMClient(
-                server_url=self.remote_server_url,
-                timeout=self.config.get("remote_timeout", 60.0),
-                use_openai=True,  # 启用 OpenAI SDK 模式，使用 vLLM OpenAI 兼容服务器
-            )
+
+            # Initialize SiliconFlow client for text LLM if enabled
+            if self.use_siliconflow:
+                # SiliconFlow needs longer timeout for large models
+                siliconflow_timeout = self.config.get("remote_timeout", 180.0)
+                self._remote_client = RemoteLLMClient(
+                    server_url="https://api.siliconflow.cn",
+                    timeout=siliconflow_timeout,
+                    use_openai=False,
+                    use_siliconflow=True,
+                    siliconflow_api_key=self.siliconflow_api_key,
+                    siliconflow_model=self.siliconflow_model,
+                )
+                self.logger.info(f"Using SiliconFlow API for text LLM (timeout={siliconflow_timeout}s)")
+                self._remote_healthy = True
+
+                # Initialize separate VLM client for local vLLM server (HTTP mode, not OpenAI mode)
+                vlm_timeout = self.config.get("vlm_timeout", 60.0)
+                self._vlm_client = RemoteLLMClient(
+                    server_url=self.vlm_server_url,
+                    timeout=vlm_timeout,
+                    use_openai=False,  # Use HTTP mode for custom vllm_server.py
+                    use_siliconflow=False,
+                    model_path=self.model_path,  # Dynamic model path override
+                )
+                self.logger.info(f"Using local VLM server (HTTP mode): {self.vlm_server_url}")
+                return True
+            else:
+                # Use vLLM server for all LLM (text + VLM)
+                # use_openai=True: use vLLM's native OpenAI-compatible API (/v1/chat/completions)
+                self._remote_client = RemoteLLMClient(
+                    server_url=self.remote_server_url,
+                    timeout=self.config.get("remote_timeout", 60.0),
+                    use_openai=True,  # Use vLLM's OpenAI-compatible API
+                    model_path=self.model_path,  # Dynamic model path override
+                )
 
             # Check server health
             self._remote_healthy = self._remote_client.health_check()
@@ -244,10 +319,10 @@ class ModelManager:
         Load a Qwen LLM model with INT8 quantization.
 
         Models with the same model_path are shared to save VRAM.
-        For example: qwen-2b-instruction and qwen-2b-trajectory share the same Qwen3.5-2B model.
+        For example: qwen-9b-instruction and qwen-9b-trajectory share the same Qwen3.5-2B model.
 
         Args:
-            model_key: Model identifier (qwen-2b-instruction, qwen-2b-trajectory, qwen-4b, etc.)
+            model_key: Model identifier (qwen-9b-instruction, qwen-9b-trajectory, qwen-9b, etc.)
 
         Returns:
             True if loaded successfully
@@ -348,8 +423,8 @@ class ModelManager:
 
         self.logger.info("Loading all LLM models...")
 
-        # 方案二: 4B perception + 2B trajectory + 4B decision + 4B instruction + 4B evaluation
-        llm_keys = ["qwen-4b-perception", "qwen-2b-trajectory", "qwen-4b-decision", "qwen-4b-instruction", "qwen-4b-evaluation"]
+        # 方案二: 9B AWQ perception + 2B trajectory + 9B AWQ decision + 4B instruction + 9B AWQ evaluation
+        llm_keys = ["qwen-9b-perception", "qwen-9b-trajectory", "qwen-9b-decision", "qwen-9b-instruction", "qwen-9b-evaluation"]
         success = True
 
         for key in llm_keys:
@@ -366,6 +441,8 @@ class ModelManager:
         prompt: str,
         max_new_tokens: int = None,
         temperature: float = None,
+        lora_name: Optional[str] = None,
+        seed: Optional[int] = None,
         **kwargs
     ) -> str:
         """
@@ -380,11 +457,16 @@ class ModelManager:
             prompt: Input prompt
             max_new_tokens: Maximum tokens to generate
             temperature: Sampling temperature
+            lora_name: Optional LoRA adapter name (e.g., "decision-lora")
+            seed: Random seed for deterministic output (default: 42)
             **kwargs: Additional generation kwargs
 
         Returns:
             Generated text
         """
+        # Use fixed seed for deterministic output
+        seed_value = seed if seed is not None else 42
+
         # Use remote generation if configured
         if self.use_remote and self._remote_client:
             return self._generate_remote(
@@ -392,10 +474,12 @@ class ModelManager:
                 prompt=prompt,
                 max_new_tokens=max_new_tokens,
                 temperature=temperature,
+                lora_name=lora_name,
+                seed=seed_value,
                 **kwargs
             )
 
-        # Local generation
+        # Local generation (LoRA not supported in local mode yet)
         return self._generate_local(
             model_key=model_key,
             prompt=prompt,
@@ -404,13 +488,77 @@ class ModelManager:
             **kwargs
         )
 
+    def generate_sync(
+        self,
+        model_key: str,
+        prompt: str,
+        max_new_tokens: int = None,
+        temperature: float = None,
+        lora_name: Optional[str] = None,
+        seed: Optional[int] = None,
+        **kwargs
+    ) -> str:
+        """
+        Synchronous generation using remote LLM server.
+
+        This is a convenience method that wraps the remote client's generate_sync.
+        Primarily used by pipeline agents for synchronous LLM calls.
+
+        Args:
+            model_key: Model identifier
+            prompt: Input prompt
+            max_new_tokens: Maximum tokens to generate
+            temperature: Sampling temperature
+            lora_name: Optional LoRA adapter name
+            seed: Random seed for deterministic output (default: 42)
+            **kwargs: Additional generation kwargs
+
+        Returns:
+            Generated text string (empty string on failure)
+        """
+        # Use fixed seed for deterministic output
+        seed_value = seed if seed is not None else 42
+
+        if not self.use_remote or not self._remote_client:
+            self.logger.warning("generate_sync requires remote LLM mode")
+            # Fall back to regular generate for local mode
+            return self.generate(
+                model_key=model_key,
+                prompt=prompt,
+                max_new_tokens=max_new_tokens,
+                temperature=temperature,
+                lora_name=lora_name,
+                seed=seed_value,
+                **kwargs
+            )
+
+        config = self.MODEL_CONFIGS.get(model_key, {})
+        if max_new_tokens is None:
+            max_new_tokens = config.get("max_new_tokens", 256)
+        if temperature is None:
+            temperature = config.get("temperature", 0.3)
+
+        try:
+            result = self._remote_client.generate_sync(
+                model=model_key,
+                prompt=prompt,
+                max_new_tokens=max_new_tokens,
+                temperature=temperature,
+                lora_name=lora_name,
+            )
+            return result.response if result and hasattr(result, 'response') else ""
+        except Exception as e:
+            self.logger.error(f"generate_sync failed: {e}")
+            return ""
+
     def generate_vision(
         self,
         image: Any,
         prompt: str,
-        model_key: str = "qwen-4b-perception",
+        model_key: str = "qwen-9b-perception",
         max_new_tokens: int = None,
         temperature: float = None,
+        seed: Optional[int] = None,
     ) -> Dict[str, Any]:
         """Generate text from image using VLM.
 
@@ -422,12 +570,15 @@ class ModelManager:
             model_key: VLM model identifier
             max_new_tokens: Maximum tokens to generate
             temperature: Sampling temperature
+            seed: Random seed for deterministic output (default: 42)
 
         Returns:
             Dictionary with 'response', 'objects', 'scene_description', 'nav_hint'
         """
-        if not self.use_remote or not self._remote_client:
-            self.logger.warning("VLM requires remote server mode")
+        # For VLM, use local vLLM server (not SiliconFlow)
+        vlm_client = self._vlm_client if self.use_siliconflow else self._remote_client
+        if not (self.use_remote or self.use_siliconflow) or not vlm_client:
+            self.logger.warning("VLM requires remote server mode or local VLM server")
             return self._get_vlm_fallback(prompt)
 
         config = self.MODEL_CONFIGS.get(model_key, {})
@@ -436,13 +587,17 @@ class ModelManager:
         if temperature is None:
             temperature = config.get("temperature", 0.3)
 
+        # Use fixed seed for deterministic output
+        seed_value = seed if seed is not None else 42
+
         try:
-            result = self._remote_client.generate_vision(
+            result = vlm_client.generate_vision(
                 image=image,
                 prompt=prompt,
                 model=model_key,
                 max_new_tokens=max_new_tokens,
                 temperature=temperature,
+                seed=seed_value,
             )
 
             if result.error:
@@ -461,9 +616,10 @@ class ModelManager:
         rgb_image: Any,
         depth_image: Any,
         prompt: str,
-        model_key: str = "qwen-4b-perception",
+        model_key: str = "qwen-9b-perception",
         max_new_tokens: int = None,
         temperature: float = None,
+        seed: Optional[int] = None,
     ) -> Dict[str, Any]:
         """Generate text from RGB + Depth images using VLM.
 
@@ -477,12 +633,18 @@ class ModelManager:
             model_key: VLM model identifier
             max_new_tokens: Maximum tokens to generate
             temperature: Sampling temperature
+            seed: Random seed for deterministic output (default: 42)
 
         Returns:
             Dictionary with 'response', 'objects', 'scene_description', 'nav_hint'
         """
-        if not self.use_remote or not self._remote_client:
-            self.logger.warning("VLM requires remote server mode")
+        self.logger.debug(f"[generate_vision_dual] Called with model_key={model_key}, max_tokens={max_new_tokens}, temp={temperature}")
+        self.logger.debug(f"[generate_vision_dual] Prompt: {prompt[:200]}..." if len(prompt) > 200 else f"[generate_vision_dual] Prompt: {prompt}")
+
+        # For VLM, use local vLLM server (not SiliconFlow)
+        vlm_client = self._vlm_client if self.use_siliconflow else self._remote_client
+        if not (self.use_remote or self.use_siliconflow) or not vlm_client:
+            self.logger.warning("VLM requires remote server mode or local VLM server")
             return self._get_vlm_fallback(prompt)
 
         config = self.MODEL_CONFIGS.get(model_key, {})
@@ -491,22 +653,32 @@ class ModelManager:
         if temperature is None:
             temperature = config.get("temperature", 0.3)
 
+        # Use fixed seed for deterministic output
+        seed_value = seed if seed is not None else 42
+
         try:
-            result = self._remote_client.generate_vision_dual(
+            self.logger.debug(f"[generate_vision_dual] Calling VLM client...")
+            result = vlm_client.generate_vision_dual(
                 rgb_image=rgb_image,
                 depth_image=depth_image,
                 prompt=prompt,
                 model=model_key,
                 max_new_tokens=max_new_tokens,
                 temperature=temperature,
+                seed=seed_value,
             )
 
             if result.error:
                 self.logger.warning(f"VLM dual-vision generation error: {result.error}")
                 return self._get_vlm_fallback(prompt)
 
+            self.logger.debug(f"[generate_vision_dual] Raw response length: {len(result.response) if result.response else 0}")
+            self.logger.debug(f"[generate_vision_dual] Response preview: {result.response[:300] if result.response else 'None'}...")
+
             # Parse VLM response
-            return self._parse_vlm_response(result.response)
+            parsed = self._parse_vlm_response(result.response)
+            self.logger.debug(f"[generate_vision_dual] Parsed: room_type={parsed.get('room_type')}, objects={len(parsed.get('objects', []))}, nav_hint={parsed.get('nav_hint', '')[:50]}")
+            return parsed
 
         except Exception as e:
             self.logger.error(f"VLM dual-vision generation failed: {e}")
@@ -515,12 +687,17 @@ class ModelManager:
     def _parse_vlm_response(self, response: str) -> Dict[str, Any]:
         """Parse VLM response into structured format.
 
+        Supports both JSON-formatted responses (preferred) and plain text.
+
         Args:
             response: Raw VLM response text
 
         Returns:
             Dictionary with parsed fields
         """
+        import json
+        import re
+
         result = {
             "response": response,
             "objects": [],
@@ -528,7 +705,81 @@ class ModelManager:
             "nav_hint": "",
         }
 
-        # Try to extract structured information
+        if not response:
+            return result
+
+        # Try to extract JSON from response
+        json_str = response
+        if '```json' in response:
+            json_match = re.search(r'```json\s*([\s\S]*?)\s*```', response)
+            if json_match:
+                json_str = json_match.group(1).strip()
+        elif '```' in response:
+            json_match = re.search(r'```\s*([\s\S]*?)\s*```', response)
+            if json_match:
+                json_str = json_match.group(1).strip()
+
+        # Try to parse JSON - handle multiple JSON objects in response
+        # Strategy: find the first complete valid JSON object
+        start = json_str.find('{')
+        if start != -1:
+            # Try to find matching closing brace using stack
+            brace_count = 0
+            end = -1
+            for i in range(start, len(json_str)):
+                if json_str[i] == '{':
+                    brace_count += 1
+                elif json_str[i] == '}':
+                    brace_count -= 1
+                    if brace_count == 0:
+                        end = i
+                        break
+
+            if end != -1:
+                json_candidate = json_str[start:end+1]
+                self.logger.debug(f"JSON candidate length: {len(json_candidate)}")
+                try:
+                    data = json.loads(json_candidate)
+                    self.logger.debug(f"JSON parsed: room_type={data.get('room_type')}, objects={len(data.get('objects', []))}")
+
+                    # Extract room_type for scene_description
+                    room_type = data.get("room_type", "")
+                    scene_brief = data.get("scene_brief", data.get("scene_description", ""))
+                    if room_type and scene_brief:
+                        result["scene_description"] = f"{room_type}: {scene_brief}"
+                    elif scene_brief:
+                        result["scene_description"] = scene_brief
+                    elif room_type:
+                        result["scene_description"] = room_type
+
+                    # Extract nav_hint
+                    result["nav_hint"] = data.get("nav_hint", "")
+
+                    # Extract objects - normalize field names to "name"
+                    # VLM may output objects with different field names
+                    if "objects" in data and isinstance(data["objects"], list):
+                        for obj in data["objects"]:
+                            if isinstance(obj, dict):
+                                # Try multiple possible field names for object name
+                                name = (obj.get("name") or
+                                        obj.get("object") or
+                                        obj.get("object_name") or
+                                        obj.get("type") or "")
+                                if name:
+                                    # Output unified format: {"name": "object_name"}
+                                    # Optionally preserve distance if present
+                                    normalized_obj = {"name": name}
+                                    if "distance" in obj:
+                                        normalized_obj["distance"] = obj["distance"]
+                                    result["objects"].append(normalized_obj)
+                                    self.logger.debug(f"[VLM parse] Normalized object: {normalized_obj}")
+                        self.logger.debug(f"[VLM parse] Objects count: {len(result['objects'])}, format: List[Dict] with 'name' field")
+
+                    return result
+                except (json.JSONDecodeError, ValueError) as e:
+                    self.logger.debug(f"JSON parsing failed: {e}")
+
+        # Fallback: line-by-line parsing for non-JSON responses
         lines = response.strip().split('\n')
 
         for line in lines:
@@ -536,16 +787,17 @@ class ModelManager:
             if not line:
                 continue
 
-            # Look for object mentions
-            if '物体' in line or 'object' in line.lower() or '检测到' in line:
-                result["objects"].append(line)
+            # Look for object mentions - output unified dict format
+            if '物体' in line or 'object' in line.lower() or '检测到' in line or 'detected' in line.lower():
+                result["objects"].append({"name": line})
 
             # Look for navigation hints
-            if '导航' in line or '建议' in line or '方向' in line:
-                result["nav_hint"] = line
+            if '导航' in line or '建议' in line or '方向' in line or 'navigation' in line.lower() or 'suggest' in line.lower() or 'direction' in line.lower():
+                if not result["nav_hint"]:  # Only set if not already set from JSON
+                    result["nav_hint"] = line
 
         # First meaningful line as scene description
-        if lines:
+        if not result["scene_description"] and lines:
             result["scene_description"] = lines[0].strip()
 
         return result
@@ -572,50 +824,40 @@ class ModelManager:
         prompt: str,
         max_new_tokens: int = None,
         temperature: float = None,
+        lora_name: Optional[str] = None,
+        seed: Optional[int] = None,
         **kwargs
     ) -> str:
-        """Generate text using remote LLM server."""
+        """Generate text using remote LLM server.
+
+        Args:
+            model_key: Model identifier
+            prompt: Input prompt
+            max_new_tokens: Maximum tokens to generate
+            temperature: Sampling temperature
+            lora_name: Optional LoRA adapter name
+            seed: Random seed for deterministic output
+            **kwargs: Additional arguments
+
+        Returns:
+            Generated text
+        """
         if not self._remote_client:
             self.logger.error("Remote client not initialized")
             return ""
 
-        # Map model keys to available remote models
-        # If the requested model is not available, fallback to 4B model
+        # For unified model server, use model_key directly
+        # Server has all qwen-9b-* aliases registered to the same engine
         remote_model_key = model_key
-        available_models = self._get_available_remote_models()
-
-        # For vLLM OpenAI server, models are returned as full paths
-        # e.g., "/root/.cache/modelscope/hub/models/Qwen/Qwen3___5-4B"
-        model_path_4b = self.MODEL_CONFIGS["qwen-4b-perception"]["model_name"]
-        model_path_2b = self.MODEL_CONFIGS["qwen-2b-trajectory"]["model_name"]
-
-        if model_key not in available_models:
-            # Check if this is a 2B model request
-            if model_key in ["qwen-2b-trajectory", "qwen-2b-instruction"]:
-                # First try 2B model
-                if model_path_2b in available_models:
-                    remote_model_key = model_path_2b
-                    self.logger.debug(f"Model {model_key} using 2B path: {model_path_2b}")
-                # Fall back to 4B model
-                elif model_path_4b in available_models:
-                    remote_model_key = model_path_4b
-                    self.logger.info(f"Model {model_key} not available, using 4B model")
-                elif available_models:
-                    remote_model_key = available_models[0]
-                    self.logger.info(f"Model {model_key} not available, using {available_models[0]}")
-            else:
-                # For 4B models, use the full path
-                if model_path_4b in available_models:
-                    remote_model_key = model_path_4b
-                elif available_models:
-                    remote_model_key = available_models[0]
-                    self.logger.debug(f"Model {model_key} not available, using {remote_model_key}")
 
         config = self.MODEL_CONFIGS.get(model_key, {})
         if max_new_tokens is None:
             max_new_tokens = config.get("max_new_tokens", 256)
         if temperature is None:
             temperature = config.get("temperature", 0.3)
+
+        # Use fixed seed for deterministic output
+        seed_value = seed if seed is not None else 42
 
         try:
             result = self._remote_client.generate(
@@ -625,6 +867,8 @@ class ModelManager:
                 temperature=temperature,
                 conversation_id=kwargs.get("conversation_id"),
                 keep_context=kwargs.get("keep_context", False),
+                lora_name=lora_name,
+                seed=seed_value,
             )
             return result
         except Exception as e:
@@ -645,7 +889,7 @@ class ModelManager:
             self.logger.debug(f"Failed to get available models: {e}")
 
         # Return default 4B path as fallback
-        return [self.MODEL_CONFIGS["qwen-4b-perception"]["model_name"]]
+        return [self.MODEL_CONFIGS["qwen-9b-perception"]["model_name"]]
 
     def _generate_local(
         self,
@@ -726,7 +970,7 @@ class ModelManager:
         Get model by key.
 
         Args:
-            model_key: Model identifier (yolov5s, qwen-2b-perception, qwen-2b-trajectory, qwen-4b, qwen-9b)
+            model_key: Model identifier (yolov5s, qwen-9b-perception, qwen-9b-trajectory, qwen-9b, qwen-9b)
 
         Returns:
             Model instance or None

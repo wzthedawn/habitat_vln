@@ -48,6 +48,11 @@ from concurrent.futures import ThreadPoolExecutor, as_completed
 # Add project root to path
 sys.path.insert(0, str(Path(__file__).parent))
 
+# Constants for mid-sequence completion check
+MID_SEQUENCE_CHECK_INTERVAL = 3  # Check completion every N steps
+HIGH_CONFIDENCE_THRESHOLD = 0.9  # Confidence for early termination
+TOPOLOGY_UPDATE_INTERVAL = 3  # Update topology every N steps (balances responsiveness with performance)
+
 from utils.logger import setup_logger
 from utils.token_tracker import get_token_tracker
 from utils.timeout_fallback import TimeoutError, timeout, StepTimeout, DEFAULT_TIMEOUTS
@@ -58,6 +63,219 @@ from strategies.cot import CoTStrategy
 from strategies.reflection import ReflectionStrategy
 from strategies.debate import DebateStrategy
 from strategies.base_strategy import StrategyResult
+from core.context import NavContext
+
+
+# Global status file path for realtime monitoring
+REALTIME_STATUS_FILE = "realtime.status.json"
+
+
+def update_realtime_status(status_data: Dict[str, Any]) -> None:
+    """Update realtime.status.json with current agent outputs.
+
+    Args:
+        status_data: Dictionary containing step, episode, and agent outputs
+    """
+    try:
+        # Read existing status if file exists
+        existing = {}
+        if os.path.exists(REALTIME_STATUS_FILE):
+            with open(REALTIME_STATUS_FILE, 'r') as f:
+                existing = json.load(f)
+
+        # Merge new data
+        for key, value in status_data.items():
+            existing[key] = value
+
+        # Add timestamp
+        existing["timestamp"] = datetime.now().isoformat()
+
+        # Write updated status
+        with open(REALTIME_STATUS_FILE, 'w') as f:
+            json.dump(existing, f, indent=2, ensure_ascii=False)
+    except Exception as e:
+        # Silent fail - don't interrupt experiment
+        pass
+
+
+def check_completion_condition(
+    context: NavContext,
+    condition: Dict[str, Any]
+) -> Dict[str, Any]:
+    """检查子任务完成条件是否满足。
+
+    Args:
+        context: 导航上下文
+        condition: 完成条件定义
+
+    Returns:
+        {
+            "completed": bool,
+            "progress": float (0.0-1.0),
+            "confidence": float,
+            "reason": str,
+            "current_value": float,
+            "threshold": float
+        }
+    """
+    import math
+
+    if not condition:
+        return {"completed": False, "progress": 0, "confidence": 0, "reason": "无条件", "current_value": 0, "threshold": 0}
+
+    cc_type = condition.get("type", "unknown")
+
+    # 获取当前子任务
+    current_subtask = context.get_current_subtask()
+    if not current_subtask:
+        return {"completed": False, "progress": 0, "confidence": 0, "reason": "无子任务", "current_value": 0, "threshold": 0}
+
+    # 直接从context计算位置变化
+    current_pos = context.position
+    start_context = current_subtask.start_context or {}
+    start_pos = start_context.get("position", current_pos)
+    start_rot = start_context.get("rotation", context.rotation)
+
+    # 计算位置delta
+    dx = current_pos[0] - start_pos[0]
+    dy = current_pos[1] - start_pos[1]
+    dz = current_pos[2] - start_pos[2]
+    horizontal_dist = math.sqrt(dx*dx + dz*dz)
+
+    # 计算rotation变化（处理-180/180边界）
+    current_deg = math.degrees(context.rotation)
+    start_deg = math.degrees(start_rot)
+    delta_deg = current_deg - start_deg
+    if delta_deg > 180:
+        delta_deg -= 360
+    elif delta_deg < -180:
+        delta_deg += 360
+    abs_delta_deg = abs(delta_deg)
+
+    # 处理不同条件类型
+    if cc_type == "y_change":
+        threshold = condition.get("min_meters", condition.get("min_change", 1.5))
+        direction = condition.get("direction", "")
+
+        if direction == "down":
+            # 下楼需要 dy 为负（y 减小）
+            completed = dy <= -threshold
+            current_value = -dy if dy < 0 else 0  # Clamped: only count downward movement
+            reason = f"dy={dy:.2f}m (down), need <=-{threshold}m"
+        elif direction == "up":
+            # 上楼需要 dy 为正（y 增加）
+            completed = dy >= threshold
+            current_value = dy if dy > 0 else 0  # Clamped: only count upward movement
+            reason = f"dy={dy:.2f}m (up), need >={threshold}m"
+        else:
+            # 无方向要求，用绝对值
+            completed = abs(dy) >= threshold
+            current_value = abs(dy)
+            reason = f"|dy|={abs(dy):.2f}m >={threshold}m"
+
+        progress = min(1.0, current_value / threshold) if threshold > 0 else 0
+        confidence = 1.0 if completed else 0.7 + 0.3 * progress
+        return {
+            "completed": completed,
+            "progress": progress,
+            "confidence": confidence,
+            "reason": reason,
+            "current_value": current_value,
+            "threshold": threshold
+        }
+
+    elif cc_type == "rotation":
+        threshold = condition.get("min_degrees", 70)
+        direction = condition.get("direction", "")
+
+        if direction == "left":
+            # 左转需要 delta_deg 为正（角度增加）
+            completed = delta_deg >= threshold
+            current_value = delta_deg if delta_deg > 0 else 0
+            reason = f"rotation={delta_deg:.0f}° (left), need >= {threshold}°"
+        elif direction == "right":
+            # 右转需要 delta_deg 为负（角度减少）
+            completed = delta_deg <= -threshold
+            current_value = -delta_deg if delta_deg < 0 else 0
+            reason = f"rotation={delta_deg:.0f}° (right), need <= -{threshold}°"
+        else:
+            # 无方向要求，用绝对值
+            completed = abs_delta_deg >= threshold
+            current_value = abs_delta_deg
+            reason = f"rotation={abs_delta_deg:.0f}° >= {threshold}°"
+
+        progress = min(1.0, current_value / threshold) if threshold > 0 else 0
+        confidence = 1.0 if completed else 0.7 + 0.3 * progress
+        return {
+            "completed": completed,
+            "progress": progress,
+            "confidence": confidence,
+            "reason": reason,
+            "current_value": current_value,
+            "threshold": threshold
+        }
+
+    elif cc_type == "distance":
+        threshold = condition.get("min_meters", 5)
+        progress = min(1.0, horizontal_dist / threshold) if threshold > 0 else 0
+        confidence = 1.0 if progress > 0.9 else 0.7 + 0.3 * progress
+        return {
+            "completed": horizontal_dist >= threshold,
+            "progress": progress,
+            "confidence": confidence,
+            "reason": f"distance={horizontal_dist:.2f}m >= {threshold}m",
+            "current_value": horizontal_dist,
+            "threshold": threshold
+        }
+
+    elif cc_type == "near_object" or cc_type == "object_near":
+        perception_output = context.metadata.get("perception_output", "")
+        target = condition.get("object", "").lower()
+        # 从自然语言描述中搜索目标物体
+        found = target in perception_output.lower() if perception_output else False
+        return {
+            "completed": found,
+            "progress": 1.0 if found else 0.0,
+            "confidence": 1.0 if found else 0.3,
+            "reason": f"object '{target}' {'FOUND' if found else 'NOT FOUND'} in description",
+            "current_value": 1 if found else 0,
+            "threshold": 1
+        }
+
+    elif cc_type == "obstacle_detected":
+        threshold = condition.get("min_distance_moved", 1.0)
+        progress = min(1.0, horizontal_dist / threshold) if threshold > 0 else 0
+        confidence = 1.0 if progress > 0.9 else 0.7 + 0.3 * progress
+        return {
+            "completed": horizontal_dist >= threshold,
+            "progress": progress,
+            "confidence": confidence,
+            "reason": f"moved={horizontal_dist:.2f}m >= {threshold}m (obstacle reaction)",
+            "current_value": horizontal_dist,
+            "threshold": threshold
+        }
+
+    elif cc_type == "obstacle_cleared":
+        # Check if obstacle distance is > min_obstacle_distance
+        threshold = condition.get("min_obstacle_distance", 3.0)
+        # Get obstacle distance from perception (min_dist from blocked_info)
+        blocked_info = context.metadata.get("blocked_info", {})
+        obstacle_dist = blocked_info.get("min_dist", 999.0)  # Default to large if no obstacle
+        # If no obstacle detected, assume cleared
+        if obstacle_dist == 999.0 or blocked_info.get("blocked", False) == False:
+            obstacle_dist = 10.0  # Treat as cleared
+        progress = min(1.0, obstacle_dist / threshold) if threshold > 0 else 1.0
+        return {
+            "completed": obstacle_dist >= threshold,
+            "progress": progress,
+            "confidence": 1.0 if progress > 0.9 else 0.7 + 0.3 * progress,
+            "reason": f"obstacle_dist={obstacle_dist:.2f}m >= {threshold}m",
+            "current_value": obstacle_dist,
+            "threshold": threshold
+        }
+
+    else:
+        return {"completed": False, "progress": 0, "confidence": 0, "reason": f"未知条件类型: {cc_type}", "current_value": 0, "threshold": 0}
 
 
 @dataclass
@@ -350,6 +568,12 @@ class MultiAgentVLNEvaluator:
         """Initialize all agents"""
         self.logger.info("Initializing agents...")
 
+        # === Pipeline Architecture Branch ===
+        if self.config.get("use_pipeline", False):
+            self._init_pipeline_agents()
+            return
+
+        # === Legacy Architecture ===
         agent_config = {
             "confidence_threshold": 0.6,
             "max_history_steps": 5,
@@ -393,6 +617,29 @@ class MultiAgentVLNEvaluator:
 
         except Exception as e:
             self.logger.error(f"Agent initialization failed: {e}")
+
+    def _init_pipeline_agents(self) -> None:
+        """Initialize Pipeline Agent Architecture
+
+        Navigator + 6 SubAgents + Tools
+        """
+        self.logger.info("Initializing Pipeline architecture...")
+
+        from agents.pipeline.navigator import Navigator
+
+        self.navigator = Navigator({
+            "max_steps": self.config.get("max_steps", 50),
+            "report_interval": 10,
+        })
+
+        # 注册所有 SubAgents
+        self.navigator.register_subagents()
+
+        # 设置 ModelManager
+        if hasattr(self, 'model_manager') and self.model_manager:
+            self.navigator.set_model_manager(self.model_manager)
+
+        self.logger.info("Pipeline architecture initialized successfully")
 
     def run_evaluation(self, num_episodes: int = None, start_episode_id: int = None) -> Dict[str, Any]:
         """Run VLN evaluation
@@ -603,6 +850,32 @@ class MultiAgentVLNEvaluator:
                 }) \
                 .build()
 
+            # === Pipeline Architecture Branch ===
+            if self.config.get("use_pipeline", False):
+                self.logger.info("[Pipeline] Using Pipeline Agent Architecture")
+                # Initialize episode output for Pipeline
+                self.output_manager.start_episode(
+                    episode_id=episode.episode_id,
+                    scene_id=episode.scene_id,
+                    instruction=episode.instruction,
+                    goal_position=episode.goal_position,
+                    start_position=list(start_pos),
+                )
+                result = self._run_pipeline_episode(episode, sim, start_pos, initial_yaw, reporter)
+                # Save final output
+                self.output_manager.finish_episode(
+                    success=result["success"],
+                    final_distance=result.get("min_distance", 0.0),
+                    min_distance=result.get("min_distance", 0.0),
+                    steps=result["steps"],
+                    trajectory=result["trajectory"],
+                    task_level="pipeline",
+                    subtasks=result.get("subtasks", []),
+                    goal_position=list(episode.goal_position),
+                )
+                return result
+
+            # === Legacy Architecture ===
             # 3.5 Initialize episode output
             self.output_manager.start_episode(
                 episode_id=episode.episode_id,
@@ -763,8 +1036,14 @@ class MultiAgentVLNEvaluator:
 
                         # Update emergency detector
                         if emergency_detector:
+                            # 将字符串perception_output转换为简单字典格式供emergency_detector使用
+                            perception_text = context.metadata.get("perception_output", "")
+                            perception_dict = {
+                                "scene_description": perception_text,
+                                "room_type": "auto",  # 不再单独判断
+                            }
                             event = emergency_detector.update(
-                                perception_output=context.metadata.get("perception_output", {}),
+                                perception_output=perception_dict,
                                 obstacle_state=obstacle_state,
                                 current_position=tuple(context.position) if context.position else (0, 0, 0),
                                 stuck_counter=getattr(self.decision_agent, '_stuck_counter', 0) if self.decision_agent else 0
@@ -839,24 +1118,44 @@ class MultiAgentVLNEvaluator:
                 if need_new_sequence:
                     self.logger.info(f"[SEQUENCE] Generating new sequence: {reason}, difficulty: {task_level}")
 
+                    # Initialize status data for this step
+                    step_status = {
+                        "step": steps,
+                        "episode": episode.episode_id,
+                        "total_episodes": self.config.get("num_episodes", 1),
+                        "position": list(context.position) if hasattr(context, 'position') and context.position else [0, 0, 0],
+                        "distance_to_goal": context.metadata.get("distance_to_goal", 0),
+                        "task_level": task_level,
+                    }
+
                     # Call PerceptionAgent
                     perception_output = None
                     if self.perception_agent:
                         try:
                             reporter.update_phase("PerceptionAgent perceiving environment...")
                             reporter.update_agent("perception", "thinking")
-                            perception_result = self.perception_agent.process(context)
-                            perception_output = perception_result.data
+                            # 获取当前子任务用于任务导向感知
+                            current_subtask = context.get_current_subtask()
+                            perception_result = self.perception_agent.process(context, subtask=current_subtask)
+                            perception_output = perception_result.data  # 现在是自然语言字符串
                             context.metadata["perception_output"] = perception_output
-                            reporter.update_agent("perception", "done", output=f"Room:{perception_output.get('room_type','?')}")
-                            reporter.log(f"Perception: Room={perception_output.get('room_type','?')}, Objects={len(perception_output.get('objects',[]))}")
-                            self.logger.info(f"[PerceptionAgent] Room: {perception_output.get('room_type', 'unknown')}")
-                            self.logger.info(f"[PerceptionAgent] Objects: {[o.get('object', o.get('name', 'unknown')) for o in perception_output.get('objects', [])[:5]]}")
-                            self.logger.info(f"[PerceptionAgent] nav_hint: {perception_output.get('nav_hint', '')}")
+                            reporter.update_agent("perception", "done", output=f"Text:{perception_output[:50]}...")
+                            reporter.log(f"Perception: {perception_output[:80]}...")
+                            self.logger.info(f"[PerceptionAgent] Output: {perception_output[:100]}...")
+                            # Update status file
+                            step_status["perception"] = {
+                                "scene_description": perception_output[:200] if perception_output else "",
+                            }
+                            update_realtime_status(step_status)
                         except Exception as e:
                             reporter.update_agent("perception", "error", output=str(e))
                             self.logger.warning(f"[PerceptionAgent] Execution failed: {e}")
-                            perception_output = {}
+                            print(f"\n!!! AGENT FAILED: PerceptionAgent !!!")
+                            print(f"!!! Error: {str(e)} !!!")
+                            print(f"!!! Step: {steps}, Position: {context.position if hasattr(context, 'position') and context.position else 'N/A'} !!!\n")
+                            perception_output = "Perception failed."
+                            step_status["perception"] = {"error": str(e)}
+                            update_realtime_status(step_status)
 
                     # Call TrajectoryAgent
                     trajectory_output = None
@@ -870,21 +1169,75 @@ class MultiAgentVLNEvaluator:
                             reporter.update_agent("trajectory", "done")
                             reporter.log(f"Trajectory: Traveled {trajectory_output.get('distance_traveled', 0):.1f}m")
                             self.logger.info(f"[TrajectoryAgent] Distance traveled: {trajectory_output.get('distance_traveled', 0):.1f}m")
+                            # Update status file
+                            nav_info = trajectory_output.get("navigation", {})
+                            step_status["trajectory"] = {
+                                "distance_traveled": trajectory_output.get("distance_traveled", 0),
+                                "distance_to_goal": nav_info.get("distance_to_goal", 0),
+                                "heading": trajectory_output.get("heading", "?"),
+                                "y_change": trajectory_output.get("y_change", 0),
+                                "y_direction": trajectory_output.get("y_direction", "stable"),
+                                "topology": trajectory_output.get("topology_summary", {}),
+                            }
+                            update_realtime_status(step_status)
                         except Exception as e:
                             reporter.update_agent("trajectory", "error", output=str(e))
                             self.logger.warning(f"[TrajectoryAgent] Execution failed: {e}")
+                            print(f"\n!!! AGENT FAILED: TrajectoryAgent !!!")
+                            print(f"!!! Error: {str(e)} !!!")
+                            print(f"!!! Step: {steps}, Position: {context.position if hasattr(context, 'position') and context.position else 'N/A'} !!!\n")
                             trajectory_output = {}
+                            step_status["trajectory"] = {"error": str(e)}
+                            update_realtime_status(step_status)
 
                     # Call InstructionAgent (get subtask semantic analysis)
                     instruction_output = None
+
+                    # === Check mid-sequence completion detection ===
+                    mid_completion = context.metadata.get("mid_completion_detected")
+                    if mid_completion and mid_completion.get("completed", False):
+                        self.logger.info(f"[SEQUENCE] Mid-sequence completion detected: {mid_completion.get('reason', 'unknown')}")
+                        # Advance to next subtask since auto-detection passed with high confidence
+                        if context.advance_subtask():
+                            current_subtask = context.get_current_subtask()
+                            if current_subtask:
+                                reporter.update_subtask(
+                                    current_subtask.id,
+                                    current_subtask.description,
+                                    current_subtask.completion_condition
+                                )
+                                self.logger.info(f"[SEQUENCE] Advanced to next subtask: {current_subtask.description[:40] if current_subtask else 'N/A'}")
+                            else:
+                                reporter.log("All subtasks completed!")
+                                self.logger.info("[SEQUENCE] All subtasks completed after mid-sequence detection")
+                                action_name = "stop"
+                                # Clear mid_completion flag
+                                context.metadata["mid_completion_detected"] = None
+                                break  # Exit the navigation loop
+                        # Clear the detection flag after processing
+                        context.metadata["mid_completion_detected"] = None
+
                     if self.instruction_agent:
                         try:
                             instruction_result = self.instruction_agent.process(context)
                             instruction_output = instruction_result.data
                             context.metadata["instruction_output"] = instruction_output
+                            # Update status file
+                            step_status["instruction"] = {
+                                "current_subtask": instruction_output.get("current_subtask", ""),
+                                "directions": instruction_output.get("directions", []),
+                                "complexity": instruction_output.get("complexity", 0),
+                                "instruction_analysis": instruction_output.get("instruction_analysis", {}),
+                            }
+                            update_realtime_status(step_status)
                         except Exception as e:
                             self.logger.warning(f"[InstructionAgent] Execution failed: {e}")
+                            print(f"\n!!! AGENT FAILED: InstructionAgent !!!")
+                            print(f"!!! Error: {str(e)} !!!")
+                            print(f"!!! Step: {steps}, Position: {context.position if hasattr(context, 'position') and context.position else 'N/A'} !!!\n")
                             instruction_output = {}
+                            step_status["instruction"] = {"error": str(e)}
+                            update_realtime_status(step_status)
 
                     # Strategy config (pass remote LLM settings)
                     strategy_config = {
@@ -893,34 +1246,23 @@ class MultiAgentVLNEvaluator:
                     }
 
                     # Select strategy based on subtask difficulty
-                    if task_level == "easy":
-                        # Easy task: No strategy execution, DecisionAgent directly synthesizes info
-                        strategy_result = None
-                        self.logger.info("[SEQUENCE] Easy task: Skip strategy, DecisionAgent decides directly")
-                    elif task_level == "medium":
-                        strategy = CoTStrategy(config=strategy_config)
-                        self.logger.info(f"[SEQUENCE] Using strategy: {strategy.name}")
-                        reporter.update_phase(f"{strategy.name} strategy executing...")
-                        reporter.log(f"Strategy: {strategy.name}")
-                        agents_list = [self.perception_agent, self.trajectory_agent,
-                                       self.instruction_agent, self.evaluation_agent]
-                        # Pass last strategy result
-                        strategy_result = strategy.execute(context, agents_list, self._last_strategy_result)
-                    else:  # hard
-                        strategy = DebateStrategy(config=strategy_config)
-                        self.logger.info(f"[SEQUENCE] Using strategy: {strategy.name}")
-                        reporter.update_phase(f"{strategy.name} strategy executing...")
-                        reporter.log(f"Strategy: {strategy.name}")
-                        agents_list = [self.perception_agent, self.trajectory_agent,
-                                       self.instruction_agent, self.evaluation_agent]
-                        strategy_result = strategy.execute(context, agents_list)
+                    # FIX: All tasks use CoT strategy for complete perception info (stairs, topology, etc.)
+                    # Previous "easy" skip caused missing stair_direction in stair navigation
+                    strategy = CoTStrategy(config=strategy_config)
+                    self.logger.info(f"[SEQUENCE] Using strategy: {strategy.name}")
+                    reporter.update_phase(f"{strategy.name} strategy executing...")
+                    reporter.log(f"Strategy: {strategy.name}")
+                    agents_list = [self.perception_agent, self.trajectory_agent,
+                                   self.instruction_agent, self.evaluation_agent]
+                    # Pass last strategy result
+                    strategy_result = strategy.execute(context, agents_list, self._last_strategy_result)
 
-                    # Easy task has no strategy reasoning log
+                    # Log strategy reasoning
                     if strategy_result:
-                        reporter.log(f"Strategy reasoning: {strategy_result.reasoning[:80] if strategy_result.reasoning else 'none'}")
-                        self.logger.info(f"[{strategy.name}] Reasoning: {strategy_result.reasoning[:100] if strategy_result.reasoning else 'none'}")
+                        reporter.log(f"Strategy reasoning: {strategy_result.reasoning if strategy_result.reasoning else 'none'}")
+                        self.logger.info(f"[{strategy.name}] Reasoning: {strategy_result.reasoning if strategy_result.reasoning else 'none'}")
                         # Print to console
-                        print(f"\n[{strategy.name} Strategy] Reasoning: {strategy_result.reasoning[:300] if strategy_result.reasoning else 'none'}")
+                        print(f"\n[{strategy.name} Strategy] Reasoning: {strategy_result.reasoning if strategy_result.reasoning else 'none'}")
 
                     # Generate action sequence
                     reporter.update_phase("DecisionAgent generating action sequence...")
@@ -937,6 +1279,9 @@ class MultiAgentVLNEvaluator:
                         # LLM service unavailable, stop experiment
                         self.logger.error(f"[SEQUENCE] LLM service error, stopping experiment: {e}")
                         reporter.update_agent("decision", "error", output=str(e))
+                        print(f"\n!!! AGENT FAILED: DecisionAgent !!!")
+                        print(f"!!! Error: {str(e)} !!!")
+                        print(f"!!! Step: {steps}, Position: {context.position if hasattr(context, 'position') and context.position else 'N/A'} !!!\n")
                         raise  # Re-raise exception, stop experiment
                     reporter.update_agent("decision", "done", sequence_progress="0%")
 
@@ -944,6 +1289,13 @@ class MultiAgentVLNEvaluator:
                     context.metadata["decision_output"] = {
                         "sequence": [a[0].name if isinstance(a, tuple) else str(a) for a in current_sequence.actions],
                         "reasoning": current_sequence.reasoning,
+                        "subtask_completed": current_sequence.subtask_completed,
+                        "confidence": current_sequence.confidence,
+                    }
+                    # Update status file for DecisionAgent
+                    step_status["decision"] = {
+                        "sequence": [a[0].name if isinstance(a, tuple) else str(a) for a in current_sequence.actions],
+                        "reasoning": current_sequence.reasoning[:200] if current_sequence.reasoning else "",
                         "subtask_completed": current_sequence.subtask_completed,
                         "confidence": current_sequence.confidence,
                     }
@@ -956,11 +1308,52 @@ class MultiAgentVLNEvaluator:
                                 "reasoning": strategy_result.reasoning,
                                 "confidence": strategy_result.confidence,
                             }
+                            # Update status file for Strategy
+                            step_status["strategy"] = {
+                                "name": strategy.name,
+                                "success": strategy_result.success,
+                                "reasoning": strategy_result.reasoning[:200] if strategy_result.reasoning else "",
+                                "confidence": strategy_result.confidence,
+                            }
                             # Save strategy result for next call
                             self._last_strategy_result = strategy_result
+                    # Update realtime status with decision and strategy
+                    update_realtime_status(step_status)
                     reporter.log(f"Generated sequence: {len(current_sequence.actions)} steps, completed={current_sequence.subtask_completed}")
                     last_sequence_subtask_id = current_subtask.id if current_subtask else None
                     sequence_step_count = 0
+
+                    # === Step Summary Log ===
+                    # Summarize all agent outputs for debugging
+                    perception_out = context.metadata.get("perception_output", {})
+                    trajectory_out = context.metadata.get("trajectory_output", {})
+                    decision_out = context.metadata.get("decision_output", {})
+
+                    # Format perception info
+                    room_type = perception_out.get("room_type", "?") if isinstance(perception_out, dict) else "?"
+                    objects = perception_out.get("objects", []) if isinstance(perception_out, dict) else []
+                    obj_names = [o.get("name", "?") for o in objects[:5]]  # First 5 objects
+                    scene_desc = perception_out.get("scene_description", "")[:60] if isinstance(perception_out, dict) else ""
+
+                    # Format trajectory info
+                    distance = trajectory_out.get("distance_traveled", 0) if isinstance(trajectory_out, dict) else 0
+                    # Fix: distance_to_goal is in navigation sub-dict
+                    nav_info = trajectory_out.get("navigation", {}) if isinstance(trajectory_out, dict) else {}
+                    to_goal = nav_info.get("distance_to_goal", 0)
+                    heading = trajectory_out.get("heading", "?") if isinstance(trajectory_out, dict) else "?"
+
+                    # Format decision info
+                    actions_count = len(decision_out.get("sequence", [])) if isinstance(decision_out, dict) else 0
+                    confidence = decision_out.get("confidence", 0) if isinstance(decision_out, dict) else 0
+
+                    print(f"\n=== Step {steps} Summary ===")
+                    print(f"Perception: room={room_type}, objects={obj_names}, scene={scene_desc}")
+                    print(f"Trajectory: traveled={distance:.1f}m, to_goal={to_goal:.1f}m, heading={heading}")
+                    print(f"Decision: actions={actions_count}, confidence={confidence:.2f}")
+                    print(f"=== End ===\n")
+                    self.logger.info(f"[Step Summary] Perception: room={room_type}, objs={len(obj_names)}, scene={scene_desc}")
+                    self.logger.info(f"[Step Summary] Trajectory: traveled={distance:.1f}m, to_goal={to_goal:.1f}m")
+                    self.logger.info(f"[Step Summary] Decision: actions={actions_count}, confidence={confidence:.2f}")
 
                 # Check if sequence needs to be aborted
                 # Initialize history record variable (used when first generating sequence)
@@ -997,6 +1390,25 @@ class MultiAgentVLNEvaluator:
 
                         # Check if we have depth info for obstacle avoidance
                         depth_clear = self._check_depth_clear_direction(depth_image) if depth_image is not None else None
+
+                        # === NEW: Get stuck recovery suggestion from TrajectoryAgent ===
+                        if self.trajectory_agent:
+                            suggestion = self.trajectory_agent.get_stuck_recovery_suggestion(
+                                context,
+                                depth_clear_direction=depth_clear
+                            )
+
+                            # Store suggestion in context.metadata for DecisionAgent
+                            context.metadata["stuck_recovery_suggestion"] = suggestion
+
+                            # Mark escape_started for delayed result tracking
+                            context.metadata["escape_started"] = {
+                                "step": context.step_count,
+                                "position": tuple(context.position) if context.position else (0, 0, 0),
+                                "direction": suggestion.get("preferred_direction")
+                            }
+
+                            self.logger.info(f"[Recovery] Suggestion: {suggestion['reason']}, direction: {suggestion.get('preferred_direction')}")
 
                         if depth_clear:
                             # Use simple turn sequence based on depth (fast, no LLM call)
@@ -1037,6 +1449,9 @@ class MultiAgentVLNEvaluator:
                                 )
                             except RuntimeError as e:
                                 self.logger.error(f"[SEQUENCE] LLM service error, stopping experiment: {e}")
+                                print(f"\n!!! AGENT FAILED: DecisionAgent (stuck recovery) !!!")
+                                print(f"!!! Error: {str(e)} !!!")
+                                print(f"!!! Step: {steps}, Position: {context.position if hasattr(context, 'position') and context.position else 'N/A'} !!!\n")
                                 raise
                             self.logger.info(f"[SEQUENCE] New sequence after Debate: {current_sequence.reasoning[:50] if current_sequence else 'N/A'}")
                             # Save decision output to context metadata for logging
@@ -1053,6 +1468,21 @@ class MultiAgentVLNEvaluator:
                                 "reasoning": strategy_result.reasoning if strategy_result else "Stuck recovery",
                                 "confidence": strategy_result.confidence if strategy_result else 0.5,
                             }
+                            # Update status file for stuck recovery
+                            step_status["decision"] = {
+                                "sequence": [a[0].name if isinstance(a, tuple) else str(a) for a in current_sequence.actions],
+                                "reasoning": current_sequence.reasoning[:200] if current_sequence.reasoning else "",
+                                "subtask_completed": current_sequence.subtask_completed,
+                                "confidence": current_sequence.confidence,
+                                "stuck_recovery": True,
+                            }
+                            step_status["strategy"] = {
+                                "name": strategy.name,
+                                "success": strategy_result.success if strategy_result else False,
+                                "reasoning": strategy_result.reasoning[:200] if strategy_result and strategy_result.reasoning else "",
+                                "confidence": strategy_result.confidence if strategy_result else 0.5,
+                            }
+                            update_realtime_status(step_status)
 
                 # Get next action from sequence
                 action_name = "move_forward"  # Default action
@@ -1150,6 +1580,48 @@ class MultiAgentVLNEvaluator:
                 trajectory.append(pos)
                 steps += 1
 
+                # === Mid-sequence completion check ===
+                self.logger.info(f"[DEBUG] step={steps}, check_interval={steps % MID_SEQUENCE_CHECK_INTERVAL}, completion_checked={context.metadata.get('completion_checked')}")
+                if steps % MID_SEQUENCE_CHECK_INTERVAL == 0 and not context.metadata.get("completion_checked"):
+                    self.logger.info(f"[中途验证] 进入验证块, step={steps}")
+                    current_subtask = context.get_current_subtask() if hasattr(context, 'get_current_subtask') else None
+                    self.logger.info(f"[中途验证] current_subtask={current_subtask}, type={type(current_subtask).__name__ if current_subtask else 'None'}")
+
+                    # Log for debugging why validation might not trigger (use INFO level for visibility)
+                    if not current_subtask:
+                        self.logger.info(f"[中途验证] step {steps}: 无当前子任务")
+                    elif not hasattr(current_subtask, 'completion_condition'):
+                        self.logger.info(f"[中途验证] step {steps}: 子任务无completion_condition属性, type={type(current_subtask).__name__}")
+                    elif not current_subtask.completion_condition:
+                        # Fallback: check goal proximity for subtasks without explicit condition
+                        trajectory_output = context.metadata.get("trajectory_output", {})
+                        distance_to_goal = trajectory_output.get("distance_to_goal", 0) if isinstance(trajectory_output, dict) else 0
+                        if distance_to_goal < 3.0:  # Close to goal threshold
+                            self.logger.info(f"[中途验证] step {steps}: 无显式条件但接近目标 ({distance_to_goal:.1f}m)")
+                            context.metadata["completion_checked"] = True
+                            context.metadata["mid_completion_detected"] = {
+                                "completed": True,
+                                "confidence": 0.7,
+                                "reason": f"接近目标: {distance_to_goal:.1f}m"
+                            }
+                    else:
+                        try:
+                            auto_result = check_completion_condition(context, current_subtask.completion_condition)
+                        except Exception as e:
+                            self.logger.warning(f"[中途验证] check_completion_condition failed: {e}")
+                            auto_result = {"completed": False, "confidence": 0, "reason": str(e)}
+
+                        if auto_result.get("completed", False):
+                            # 自动检测通过，记录日志
+                            self.logger.info(f"[中途验证] step {steps}: 检测到可能完成 - {auto_result.get('reason', 'unknown')}")
+
+                            # 高置信度时提前终止序列
+                            if auto_result.get("confidence", 0) > HIGH_CONFIDENCE_THRESHOLD:
+                                self.logger.info("[中途验证] 高置信度，提前终止序列，等待LLM验证")
+                                current_sequence = None  # 终止当前序列
+                                context.metadata["completion_checked"] = True
+                                context.metadata["mid_completion_detected"] = auto_result
+
                 reporter.update_position(pos[0], pos[1], pos[2])
                 reporter.update_step(steps)
 
@@ -1172,6 +1644,47 @@ class MultiAgentVLNEvaluator:
                         cosy_cosp = 1 - 2 * (y * y + z * z)
                         yaw = math.atan2(siny_cosp, cosy_cosp)
                         context.rotation = yaw
+
+                        # === 拓扑轻量更新（每N步）===
+                        if steps % TOPOLOGY_UPDATE_INTERVAL == 0 and self.trajectory_agent:
+                            # 从context获取前一步位置
+                            prev_pos_topo = context.trajectory[-2] if len(context.trajectory) > 1 else tuple(pos)
+
+                            # 获取rotation
+                            current_rot_topo = yaw
+                            prev_rot_topo = getattr(context, '_prev_rotation', current_rot_topo)
+
+                            try:
+                                # 获取当前序列的动作列表
+                                seq_actions = []
+                                if current_sequence and current_sequence.actions:
+                                    seq_actions = [a[0].name if isinstance(a, tuple) else str(a)
+                                                   for a in current_sequence.actions]
+
+                                new_node_id = self.trajectory_agent.update_topology_only(
+                                    current_pos=tuple(pos),
+                                    prev_pos=prev_pos_topo,
+                                    current_rot=current_rot_topo,
+                                    prev_rot=prev_rot_topo,
+                                    step_count=steps,
+                                    action_sequence=seq_actions
+                                )
+
+                                if new_node_id:
+                                    self.logger.info(f"[拓扑] 序列执行中新增节点: {new_node_id}")
+
+                                # 更新trajectory_output的topology_summary
+                                if "trajectory_output" not in context.metadata:
+                                    context.metadata["trajectory_output"] = {}
+                                if self.trajectory_agent.topology_graph is not None:
+                                    context.metadata["trajectory_output"]["topology_summary"] = \
+                                        self.trajectory_agent.topology_graph.get_summary()
+
+                                # 保存当前rotation用于下次比较
+                                context._prev_rotation = current_rot_topo
+                            except Exception as topo_e:
+                                self.logger.warning(f"Topology update failed: {topo_e}")
+
                     except Exception as e:
                         self.logger.warning(f"Failed to extract rotation: {e}")
 
@@ -1193,6 +1706,31 @@ class MultiAgentVLNEvaluator:
                 context.metadata["last_distance"] = dist
                 context.metadata["distance_delta"] = distance_delta
                 context.metadata["distance_trend"] = distance_trend
+
+                # === 记录位置历史 ===
+                if "position_history" not in context.metadata:
+                    context.metadata["position_history"] = []
+
+                # 只记录x,z坐标（忽略y/高度）
+                pos_tuple = (round(pos[0], 1), round(pos[2], 1))
+                context.metadata["position_history"].append(pos_tuple)
+
+                # 限制历史长度，避免内存过大
+                if len(context.metadata["position_history"]) > 20:
+                    context.metadata["position_history"] = context.metadata["position_history"][-20:]
+
+                # === 检测原地打转 ===
+                recent_positions = context.metadata["position_history"][-5:]
+                if len(recent_positions) >= 5:
+                    unique_positions = set(recent_positions)
+                    if len(unique_positions) <= 2:
+                        context.metadata["stuck_detected"] = True
+                        context.metadata["stuck_message"] = "检测到原地打转，建议转向探索新方向"
+                    else:
+                        context.metadata["stuck_detected"] = False
+
+                # 记录已探索的不同位置数
+                context.metadata["explored_positions"] = len(set(context.metadata["position_history"]))
 
                 # === 计算目标方向角度 ===
                 dx = episode.goal_position[0] - pos[0]
@@ -1225,6 +1763,38 @@ class MultiAgentVLNEvaluator:
 
                 min_distance = min(min_distance, dist)
 
+                # === NEW: Delayed escape result update ===
+                escape_start = context.metadata.get("escape_started")
+                if escape_start and context.step_count >= escape_start["step"] + 5:
+                    # 计算平均移动量
+                    recent_positions = context.trajectory[-5:] if len(context.trajectory) >= 5 else context.trajectory
+
+                    if len(recent_positions) >= 2:
+                        total_movement = 0.0
+                        for i in range(1, len(recent_positions)):
+                            dx = recent_positions[i][0] - recent_positions[i-1][0]
+                            dz = recent_positions[i][2] - recent_positions[i-1][2]
+                            total_movement += math.sqrt(dx*dx + dz*dz)
+
+                        avg_movement = total_movement / (len(recent_positions) - 1)
+
+                        # 判断成功/失败（阈值0.3m）
+                        success = avg_movement > 0.3
+
+                        # 更新结果
+                        if self.trajectory_agent:
+                            self.trajectory_agent.mark_escape_result(
+                                position=escape_start["position"],
+                                direction=escape_start.get("direction", "unknown"),
+                                success=success,
+                                step=context.step_count
+                            )
+
+                            self.logger.info(f"[Recovery] Escape result: {success}, avg_movement={avg_movement:.2f}m")
+
+                        # 清除escape标记
+                        context.metadata.pop("escape_started", None)
+
                 # Record step output
                 self.output_manager.add_step_output(
                     step=steps,
@@ -1246,7 +1816,13 @@ class MultiAgentVLNEvaluator:
                     break
 
         except Exception as e:
-            self.logger.error(f"  Habitat error: {e}")
+            self.logger.error(f"Episode terminated unexpectedly: {e}")
+            # Safely access all variables in case exception happened before they were defined
+            final_max_steps = max_steps if 'max_steps' in locals() else self.config.get("max_steps", 100)
+            last_action = action_name if 'action_name' in locals() else 'N/A'
+            last_dist = dist if 'dist' in locals() else 'N/A'
+            self.logger.error(f"  Final state: steps={steps}, max_steps={final_max_steps}")
+            self.logger.error(f"  last_action={last_action}, dist={last_dist if isinstance(last_dist, str) else f'{last_dist:.2f}m'}")
             import traceback
             traceback.print_exc()
         finally:
@@ -1267,7 +1843,7 @@ class MultiAgentVLNEvaluator:
                     steps=steps,
                     trajectory=trajectory,
                     task_level=task_level,
-                    subtasks=context.metadata.get("instruction_output", {}).get("subtasks", []),
+                    subtasks=[st.to_dict() for st in context.subtasks] if context.subtasks else [],
                     goal_position=episode.goal_position,
                     reference_path=episode.reference_path,
                 )
@@ -1292,6 +1868,190 @@ class MultiAgentVLNEvaluator:
             "evaluation_scores": evaluation_scores,
             "task_level": task_level,
             "subtask_count": subtask_count,
+        }
+
+    def _run_pipeline_episode(
+        self,
+        episode,
+        sim,
+        start_pos,
+        initial_yaw: float,
+        reporter=None,
+    ) -> Dict[str, Any]:
+        """Run episode using Pipeline Agent Architecture
+
+        Args:
+            episode: R2REpisode 数据
+            sim: Habitat simulator
+            start_pos: 起始位置 [x, y, z]
+            initial_yaw: 起始朝向（弧度）
+
+        Returns:
+            与 _run_habitat_episode 格式一致的结果字典
+        """
+        from agents.pipeline.env_adapter import HabitatEnvAdapter
+        from agents.pipeline.tools.state_calculator import StateCalculator
+
+        self.logger.info(f"[Pipeline] Starting episode {episode.episode_id}")
+
+        # 创建环境适配器
+        env = HabitatEnvAdapter(sim, self._get_observations, self.config)
+
+        # 初始化 Navigator
+        self.navigator.initialize_episode(
+            instruction=episode.instruction,
+            start_position=list(start_pos),
+            goal_position=list(episode.goal_position),
+        )
+
+        # Note: completion_condition is now set by SubtaskDecompositionAgent
+        # No need to manually set it here
+
+        # 运行导航循环（带实时状态更新）
+        result = self._run_pipeline_loop_with_output(env, reporter)
+
+        # 收集轨迹
+        trajectory = [h["position"] for h in self.navigator._history]
+        steps = result["steps"]
+        success = result["success"]
+
+        # 计算指标
+        calc = StateCalculator()
+
+        min_distance = min(
+            calc.compute_distance(pos, episode.goal_position)
+            for pos in trajectory
+        ) if trajectory else float('inf')
+
+        trajectory_length = sum(
+            calc.compute_distance(trajectory[i-1], trajectory[i])
+            for i in range(1, len(trajectory))
+        ) if len(trajectory) > 1 else 0.0
+
+        # SPL (Success weighted by Path Length)
+        spl = 0.0
+        if success and trajectory_length > 0:
+            spl = episode.geodesic_distance / max(episode.geodesic_distance, trajectory_length)
+
+        # nDTW
+        ndtw = self._calculate_ndtw(trajectory, episode.reference_path) if hasattr(self, '_calculate_ndtw') else 0.0
+        sdtw = ndtw if success else 0.0
+
+        self.logger.info(f"[Pipeline] Episode complete: steps={steps}, success={success}")
+
+        return {
+            "trajectory": trajectory,
+            "steps": steps,
+            "success": success,
+            "min_distance": min_distance,
+            "trajectory_length": trajectory_length,
+            "spl": spl,
+            "ndtw": ndtw,
+            "sdtw": sdtw,
+            "task_level": "pipeline",
+            "subtask_count": len(self.navigator._subtasks),
+            "subtasks": self.navigator._subtasks,
+            "evaluation_scores": [],
+        }
+
+    def _run_pipeline_loop_with_output(self, env, reporter) -> Dict[str, Any]:
+        """Run Pipeline navigation loop with output saving and status reporting."""
+        from agents.pipeline.tools.state_calculator import StateCalculator
+        from dataclasses import asdict
+
+        max_steps = self.config.get("max_steps", 100)
+        report_interval = 10
+        trajectory = []
+        images = []  # 收集RGB图片用于可视化
+        calc = StateCalculator()
+
+        # Pipeline agent outputs (for logging)
+        observation_output_dict = None
+        analysis_output_dict = None
+        planning_output_dict = None
+
+        step_count = 0
+        while step_count < max_steps:
+            # 执行单个导航周期
+            actions = self.navigator._run_navigation_cycle(env)
+
+            # 获取本次 cycle 的 agent 输出
+            if self.navigator._last_observation_output:
+                observation_output_dict = asdict(self.navigator._last_observation_output)
+            if self.navigator._last_analysis_output:
+                analysis_output_dict = asdict(self.navigator._last_analysis_output)
+            if self.navigator._last_planning_output:
+                planning_output_dict = asdict(self.navigator._last_planning_output)
+
+            # 执行动作并记录
+            for action_type, repeat_count in actions:
+                for _ in range(repeat_count):
+                    # 获取当前观察（保存图片）
+                    observations = env.get_observations()
+                    rgb = observations.get("rgb")
+                    depth = observations.get("depth")
+                    if rgb is not None:
+                        images.append(rgb.copy())
+
+                    # 执行动作
+                    env.step(action_type)
+                    step_count += 1
+
+                    # 更新状态
+                    self.navigator._update_state(env)
+                    position = self.navigator._position
+                    rotation = self.navigator._rotation
+                    trajectory.append(position)
+
+                    # 计算距离目标
+                    distance_to_goal = calc.compute_distance(position, self.navigator._current_subtask.get("completion_condition", {}).get("goal_position", [0,0,0]))
+
+                    # 更新 reporter
+                    if reporter:
+                        reporter.update_position(position[0], position[1], position[2])
+                        reporter.update_agent("navigator", f"step {step_count}")
+
+                    # 保存图片
+                    self.output_manager.save_rgb_image(rgb, step_count)
+                    self.output_manager.save_depth_image(depth, step_count)
+
+                    # 保存每步输出（包含 Pipeline agent 输出）
+                    self.output_manager.add_step_output(
+                        step=step_count,
+                        action=str(action_type),
+                        position=position,
+                        rotation=rotation,
+                        distance_to_goal=distance_to_goal,
+                        perception_output=observation_output_dict,  # ObservationAgent -> perception
+                        decision_output=analysis_output_dict,       # AnalysisAgent -> decision
+                        strategy_output=planning_output_dict,        # PlanningAgent -> strategy
+                        current_subtask=self.navigator._current_subtask,
+                    )
+
+                    # 检查完成
+                    if self.navigator._check_completion():
+                        self.logger.info(f"[Pipeline] Task completed at step {step_count}")
+                        return {
+                            "success": True,
+                            "steps": step_count,
+                            "reason": "task_completed",
+                            "trajectory": trajectory,
+                            "images": images,
+                        }
+
+                    if step_count >= max_steps:
+                        break
+
+            # 周期性进度报告
+            if step_count % report_interval == 0:
+                print(f"[导航进度] 步数: {step_count}, 位置: {trajectory[-1] if trajectory else 'N/A'}")
+
+        return {
+            "success": False,
+            "steps": step_count,
+            "reason": "max_steps",
+            "trajectory": trajectory,
+            "images": images,
         }
 
     def _get_observations(self, sim: Any) -> Tuple[np.ndarray, np.ndarray]:
@@ -1371,7 +2131,8 @@ class MultiAgentVLNEvaluator:
             sim_cfg = habitat_sim.SimulatorConfiguration()
             sim_cfg.scene_id = scene_path
             sim_cfg.enable_physics = False
-            sim_cfg.gpu_device_id = 0
+            # Get GPU ID from config (for parallel evaluation)
+            sim_cfg.gpu_device_id = self.config.get("gpu_id", 0)
 
             cfg = habitat_sim.Configuration(sim_cfg, [agent_cfg])
             sim = habitat_sim.Simulator(cfg)
@@ -1692,6 +2453,10 @@ def main():
     parser.add_argument("--use-sequence-mode", action="store_true", default=False,
                         help="Use action sequence mode (subtask-level planning, reduces LLM calls)")
 
+    # Pipeline mode arguments (new architecture)
+    parser.add_argument("--use-pipeline", action="store_true", default=False,
+                        help="Use new Pipeline Agent Architecture (Navigator + SubAgents)")
+
 
     # Sequence length configuration
     parser.add_argument("--sequence-length", type=int, default=5,
@@ -1741,6 +2506,7 @@ def main():
         "vlm_server_url": args.vlm_server,
         "use_strategy_mode": args.use_strategy_mode,
         "use_sequence_mode": args.use_sequence_mode,
+        "use_pipeline": args.use_pipeline,
         "sequence_length": args.sequence_length,
         "adaptive_sequence": args.adaptive_sequence,
         "min_sequence_length": args.min_sequence_length,
@@ -1769,6 +2535,7 @@ def main():
         print(f"SiliconFlow Model: {args.siliconflow_model}")
         print(f"Local VLM Server: {args.vlm_server}")
     print(f"Strategy Mode: {'enabled' if args.use_strategy_mode else 'disabled'}")
+    print(f"Pipeline Architecture: {'enabled' if args.use_pipeline else 'disabled'}")
     print("=" * 70)
 
     evaluator = MultiAgentVLNEvaluator(config, log_level=args.log_level)

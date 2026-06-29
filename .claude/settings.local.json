@@ -325,7 +325,9 @@
       "Bash(pkill:*)",
       "Bash(python3:*)",
       "Bash(xvfb-run:*)",
-      "Bash(tee /tmp/vln_200steps.log)"
+      "Bash(tee /tmp/vln_200steps.log)",
+      "Bash(bash run_vllm_vln.sh:*)",
+      "Bash(/home/WZ/.conda/envs/vllm_env/bin/vllm serve:*)"
     ]
   }
 }

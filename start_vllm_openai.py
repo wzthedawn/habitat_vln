@@ -13,10 +13,10 @@ def main():
     parser = argparse.ArgumentParser(description="Start vLLM OpenAI-compatible server")
     parser.add_argument("--port", type=int, default=8000, help="Server port")
     parser.add_argument("--host", type=str, default="0.0.0.0", help="Server host")
-    parser.add_argument("--gpu-memory", type=float, default=0.45, help="GPU memory utilization")
+    parser.add_argument("--gpu-memory", type=float, default=0.85, help="GPU memory utilization")
     args = parser.parse_args()
 
-    model_path = "/root/.cache/modelscope/hub/models/Qwen/Qwen3___5-4B"
+    model_path = "/data/WZ/Model/Qwen/Qwen3___5-9b_AWQ"
 
     # Check model exists
     if not os.path.exists(model_path):
@@ -38,10 +38,11 @@ def main():
 
     engine_args = EngineArgs(
         model=model_path,
-        dtype="float16",
+        trust_remote_code=True,
+        dtype="auto",
+        quantization="awq",
         gpu_memory_utilization=args.gpu_memory,
         max_model_len=4096,
-        trust_remote_code=True,
         enforce_eager=True,
     )
 

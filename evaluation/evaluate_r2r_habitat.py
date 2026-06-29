@@ -807,7 +807,7 @@ def main():
     project_root = Path(__file__).parent
 
     # R2R data path
-    r2r_data_path = Path(f"/root/habitat-lab/data/datasets/vln/mp3d/r2r/v1/{args.split}/{args.split}.json")
+    r2r_data_path = Path(f"/data/WZ/Dataset/R2R/{args.split}/{args.split}.json")
 
     # Scenes directory
     scenes_dir = project_root / args.scenes_dir

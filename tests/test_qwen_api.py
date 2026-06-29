@@ -4,7 +4,7 @@
 """
 
 import sys
-sys.path.insert(0, '/root/habitat_vln')
+sys.path.insert(0, '/home/WZ/MA_VLN/habitat_vln')
 
 def test_qwen_api():
     """测试通义千问 API"""

@@ -164,10 +164,10 @@ agent_roles:
 
 # Weak level model (for Type-0 simple tasks)
 weak_level:
-  model: "Qwen/Qwen3.5-4B"
+  model: "Qwen/Qwen3.5-9B-AWQ"
   model_tier: "local_small"
   model_type: "local"
-  model_path: "/root/.cache/modelscope/hub/models/Qwen/Qwen3.5-4B"
+  model_path: "/data/WZ/Model/Qwen/Qwen3___5-9b_AWQ"
 
 # Strategy configurations
 strategy_configs:

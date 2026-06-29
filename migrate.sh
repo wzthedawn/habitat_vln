@@ -16,7 +16,7 @@ echo "=========================================="
 
 echo ""
 echo "=== Step 1: 打包代码 (646MB) ==="
-cd /root/habitat_vln
+cd /home/WZ/MA_VLN/habitat_vln
 tar -czvf /tmp/habitat_vln_full.tar.gz \
     --exclude='*.pyc' \
     --exclude='__pycache__' \
@@ -34,7 +34,7 @@ tar -czvf /tmp/habitat_data.tar.gz Dataset/ Habitat/
 
 echo ""
 echo "=== Step 4: 创建目标目录 ==="
-ssh $TARGET "mkdir -p /home/MA_VLN /data/WZ/models /data/WZ/habitat_data"
+ssh $TARGET "mkdir -p /home/MA_VLN /data/WZ/Model /data/WZ/Dataset"
 
 echo ""
 echo "=== Step 5: 传输代码 ==="
@@ -42,17 +42,17 @@ scp /tmp/habitat_vln_full.tar.gz $TARGET:/home/MA_VLN/
 
 echo ""
 echo "=== Step 6: 传输模型 ==="
-scp /tmp/qwen_models.tar.gz $TARGET:/data/WZ/models/
+scp /tmp/qwen_models.tar.gz $TARGET:/data/WZ/Model/
 
 echo ""
 echo "=== Step 7: 传输数据集 ==="
-scp /tmp/habitat_data.tar.gz $TARGET:/data/WZ/habitat_data/
+scp /tmp/habitat_data.tar.gz $TARGET:/data/WZ/Dataset/
 
 echo ""
 echo "=== Step 8: 解压文件 ==="
 ssh $TARGET "cd /home/MA_VLN && tar -xzf habitat_vln_full.tar.gz"
-ssh $TARGET "cd /data/WZ/models && tar -xzf qwen_models.tar.gz"
-ssh $TARGET "cd /data/WZ/habitat_data && tar -xzf habitat_data.tar.gz"
+ssh $TARGET "cd /data/WZ/Model && tar -xzf qwen_models.tar.gz"
+ssh $TARGET "cd /data/WZ/Dataset && tar -xzf habitat_data.tar.gz"
 
 echo ""
 echo "=========================================="
@@ -62,6 +62,6 @@ echo ""
 echo "请在目标服务器上:"
 echo "1. 创建conda环境 (Habitat, habitat_py310)"
 echo "2. 修改 configs/model_config.yaml 中的模型路径为:"
-echo "   /data/WZ/models/Qwen/Qwen3___5-4B"
+echo "   /data/WZ/Model/Qwen/Qwen3___5-4B"
 echo "3. 配置API密钥环境变量"
 echo ""

@@ -1,0 +1,2 @@
+- [FP8量化配置](fp8_config_35b.md) - 双卡RTX 4090加载70GB 35B MoE模型的FP8量化启动命令
+- [序列长度对比实验](sequence_length_comparison.md) - sequence-length=10与5步实验对比，耗时减少45%

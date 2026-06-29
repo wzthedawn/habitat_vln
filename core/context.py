@@ -12,21 +12,21 @@ from .action import Action
 
 # Precondition types for subtask verification
 PRECONDITION_TYPES = {
-    "height_reached": "到达指定高度",        # {"type": "height_reached", "target_y": -3.0, "tolerance": 1.0}
-    "floor_changed": "楼层已变化",           # {"type": "floor_changed", "direction": "down"}
-    "object_visible": "目标物体可见",        # {"type": "object_visible", "object": "stairs"}
-    "position_reached": "到达指定位置",      # {"type": "position_reached", "near": "stairs_bottom"}
-    "rotation_completed": "转向完成",        # {"type": "rotation_completed", "direction": "right"}
+    "height_reached": "Reached specified height",        # {"type": "height_reached", "target_y": -3.0, "tolerance": 1.0}
+    "floor_changed": "Floor has changed",           # {"type": "floor_changed", "direction": "down"}
+    "object_visible": "Target object visible",        # {"type": "object_visible", "object": "stairs"}
+    "position_reached": "Reached specified position",      # {"type": "position_reached", "near": "stairs_bottom"}
+    "rotation_completed": "Rotation completed",        # {"type": "rotation_completed", "direction": "right"}
 }
 
 # Completion condition types
 COMPLETION_TYPES = {
-    "y_change": "高度变化",                  # {"type": "y_change", "min_change": 2.0, "direction": "down"}
-    "rotation": "转向动作",                  # {"type": "rotation", "direction": "right", "min_degrees": 60}
-    "distance": "移动距离",                  # {"type": "distance", "min_meters": 3.0}
-    "object_near": "接近物体",               # {"type": "object_near", "object": "bench", "max_distance": 2.0}
-    "room_type": "房间类型",                 # {"type": "room_type", "expected": "hallway"}
-    "at_goal": "到达目标",                   # {"type": "at_goal", "max_distance": 3.0}
+    "y_change": "Height change",                  # {"type": "y_change", "min_change": 2.0, "direction": "down"}
+    "rotation": "Rotation action",                  # {"type": "rotation", "direction": "right", "min_degrees": 60}
+    "distance": "Distance moved",                  # {"type": "distance", "min_meters": 3.0}
+    "object_near": "Approaching object",               # {"type": "object_near", "object": "bench", "max_distance": 2.0}
+    "room_type": "Room type",                 # {"type": "room_type", "expected": "hallway"}
+    "at_goal": "Reached goal",                   # {"type": "at_goal", "max_distance": 3.0}
 }
 
 
@@ -67,7 +67,7 @@ class SubTask:
     id: int
     description: str
     status: str = "pending"  # pending, in_progress, completed, failed
-    level: str = "中等"  # 子任务难度等级 (简单/中等/困难)
+    level: str = "medium"  # Subtask difficulty level (easy/medium/hard)
     required_agents: List[str] = field(default_factory=list)
     dependencies: List[int] = field(default_factory=list)
     result: Optional[str] = None
@@ -256,7 +256,25 @@ class NavContext:
     def advance_subtask(self) -> bool:
         """Advance to next subtask. Returns True if successful."""
         if self.current_subtask_idx < len(self.subtasks) - 1:
+            # Complete current subtask first
+            current = self.get_current_subtask()
+            if current and current.status == "in_progress":
+                current.status = "completed"
+
             self.current_subtask_idx += 1
+
+            # Start new subtask (record start state)
+            new_subtask = self.get_current_subtask()
+            if new_subtask:
+                new_subtask.start_context = {
+                    "position": self.position,
+                    "rotation": self.rotation,
+                    "y": self.position[1],
+                    "step": self.step_count,
+                    "timestamp": time.time(),
+                }
+                new_subtask.status = "in_progress"
+
             return True
         return False
 

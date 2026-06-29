@@ -2,25 +2,42 @@
 
 This version implements:
 1. Simple mapping (position recording)
-2. LLM-enhanced trajectory summary using Qwen3.5-2B
+2. LLM-enhanced trajectory summary using Qwen3.5-4B
 3. Visited location detection
 4. Path quality assessment
 """
 
 from typing import Dict, Any, Optional, List, Tuple
+from dataclasses import dataclass, field
 import math
 import logging
+import time
 from collections import defaultdict
 
 from .base_agent import BaseAgent, AgentOutput, AgentRole
 from core.context import NavContext
+from .topology_graph import TopologyGraph, KeyPositionDetector
+
+
+@dataclass
+class ActionRecord:
+    """记录一次动作序列及其结果"""
+    step_id: int                              # 步骤 ID
+    actions: List[str]                        # 动作序列
+    start_pos: Tuple[float, float, float]     # 执行前位置
+    end_pos: Tuple[float, float, float]       # 执行后位置
+    goal_distance_before: float               # 执行前距离目标
+    goal_distance_after: float                # 执行后距离目标
+    stuck_triggered: bool                     # 是否触发 stuck
+    perception_feedback: str = ""             # 感知反馈
+    timestamp: float = field(default_factory=time.time)  # 时间戳
 
 
 class TrajectoryAgent(BaseAgent):
     """
     Agent responsible for trajectory planning and progress tracking.
 
-    Uses Qwen3.5-2B (independent instance) for trajectory summarization.
+    Uses Qwen3.5-4B (independent instance) for trajectory summarization.
 
     Key responsibilities:
     1. Track navigation progress
@@ -61,9 +78,40 @@ class TrajectoryAgent(BaseAgent):
         self._goal_position = None
         self._waypoints = []
 
-        # NEW: Stuck region tracking
+        # NEW: Stuck region tracking with escape history
+        # NOTE: Two different structures are used by record_stuck_region() and mark_stuck_region():
+        #
+        # record_stuck_region() creates:
+        # {
+        #     "position": Tuple[float, float, float],
+        #     "radius": float (default 1.0),
+        #     "entry_step": int,
+        #     "exit_step": Optional[int],
+        #     "escape_actions": List[str],
+        #     "failed_attempts": List[str],
+        # }
+        #
+        # mark_stuck_region() creates/updates:
+        # {
+        #     "position": Tuple[float, float, float],
+        #     "radius": float (default 1.0),
+        #     "escape_attempts": int,
+        #     "escape_success": bool,
+        #     "successful_direction": Optional[str] ("left"/"right"/None),
+        #     "escape_actions": List[str],
+        #     "timestamp": float,
+        # }
         self._stuck_regions: List[Dict] = []
         self._stuck_paths: List[List[Tuple]] = []
+
+        # NEW: Action history tracking
+        self._action_history: List[ActionRecord] = []
+
+        # NEW: Topology graph for trajectory compression
+        self.topology_graph = TopologyGraph()
+        self.key_detector = KeyPositionDetector()
+        self.last_room = ""
+        self._last_topology_node_id: Optional[str] = None
 
         # Model reference
         self._model_manager = None
@@ -84,7 +132,7 @@ class TrajectoryAgent(BaseAgent):
         return ["position", "rotation"]
 
     def get_output_keys(self) -> List[str]:
-        return ["waypoints", "progress", "path_confidence", "trajectory_summary", "visited"]
+        return ["waypoints", "progress", "path_confidence", "trajectory_summary", "visited", "topology_summary"]
 
     def initialize(self) -> None:
         """Initialize model manager and load LLM."""
@@ -92,6 +140,14 @@ class TrajectoryAgent(BaseAgent):
             return
 
         try:
+            # First, try to use model_manager from config (passed by experiment)
+            if self.config.get("model_manager"):
+                self._model_manager = self.config["model_manager"]
+                self._initialized = True
+                self.logger.info("TrajectoryAgent: using provided model_manager (remote mode)")
+                return
+
+            # Fallback: create new model manager (for standalone usage)
             from models.model_manager import get_model_manager
             self._model_manager = get_model_manager(self.config)
 
@@ -104,13 +160,13 @@ class TrajectoryAgent(BaseAgent):
             else:
                 self._model_manager.load_all_models()
 
-                # Load Qwen3.5-2B for trajectory if LLM is enabled
+                # Load Qwen3.5-4B for trajectory if LLM is enabled
                 if self.use_llm:
-                    self.logger.info("Loading Qwen3.5-2B for trajectory...")
-                    if self._model_manager.load_llm("qwen-2b-trajectory"):
-                        self.logger.info("Qwen3.5-2B (trajectory) loaded successfully")
+                    self.logger.info("Loading Qwen3.5-4B for trajectory...")
+                    if self._model_manager.load_llm("qwen-9b-trajectory"):
+                        self.logger.info("Qwen3.5-4B (trajectory) loaded successfully")
                     else:
-                        self.logger.warning("Failed to load Qwen3.5-2B, using template-based summaries")
+                        self.logger.warning("Failed to load Qwen3.5-4B, using template-based summaries")
                         self.use_llm = False
 
             self._initialized = True
@@ -170,6 +226,88 @@ class TrajectoryAgent(BaseAgent):
                 if abs(y_change) > 0.3:
                     y_direction = "上升" if y_change > 0 else "下降"
 
+            # === NEW: Calculate subtask state change ===
+            subtask_delta = self._calculate_subtask_delta(context)
+
+            # === NEW: Calculate distance to goal ===
+            # DEBUG: Verify goal_position is available
+            goal_pos_debug = context.metadata.get("goal_position")
+            self.logger.info(f"[DEBUG-Trajectory] goal_position from metadata: {goal_pos_debug}")
+            self.logger.info(f"[DEBUG-Trajectory] context.position: {context.position}")
+            distance_to_goal = self._calculate_distance_to_goal(context)
+            self.logger.info(f"[DEBUG-Trajectory] calculated distance_to_goal: {distance_to_goal}")
+
+            # === NEW: Topology graph detection ===
+            room_type = ""
+            if hasattr(context, 'visual_features') and context.visual_features:
+                room_type = getattr(context.visual_features, 'room_type', '') or ""
+            elif context.metadata.get("perception"):
+                room_type = context.metadata.get("perception", {}).get("room_type", "")
+
+            # Build action history for key detector (list of action names)
+            action_names = []
+            if self._action_history:
+                # Get recent action names from the last few records
+                for record in self._action_history[-3:]:
+                    action_names.extend(record.actions)
+
+            # Detect key position
+            if len(trajectory) >= 2:
+                current_pos = trajectory[-1]
+                prev_pos = trajectory[-2] if len(trajectory) > 1 else trajectory[-1]
+
+                node_type = self.key_detector.detect(
+                    current_pos=current_pos,
+                    prev_pos=prev_pos,
+                    action_history=action_names,
+                    semantic_info={
+                        "room_changed": room_type != self.last_room,
+                        "room_type": room_type
+                    }
+                )
+
+                if node_type:
+                    # Add new node to topology graph
+                    semantic_info = None
+                    if node_type == "room_entrance" and room_type:
+                        semantic_info = f"{room_type}入口"
+                    elif node_type == "stairs":
+                        y_diff = current_pos[1] - prev_pos[1]
+                        semantic_info = "楼梯上升" if y_diff > 0 else "楼梯下降"
+
+                    new_node_id = self.topology_graph.add_node(
+                        position=current_pos,
+                        node_type=node_type,
+                        semantic_info=semantic_info,
+                        timestamp=context.step_count
+                    )
+
+                    # Add edge from last node to new node if exists
+                    if self._last_topology_node_id:
+                        self.topology_graph.add_edge(
+                            source_id=self._last_topology_node_id,
+                            target_id=new_node_id,
+                            action_sequence=action_names[-5:] if action_names else []
+                        )
+
+                    self._last_topology_node_id = new_node_id
+                    self.logger.debug(f"[Topology] Added node: {node_type} at {current_pos}")
+
+                # Update current node position
+                self.topology_graph.update_current_node(position)
+
+                # Update last room
+                if room_type:
+                    self.last_room = room_type
+
+            # Periodic pruning check
+            if context.step_count % 50 == 0 and len(self.topology_graph.nodes) > 20:
+                self.topology_graph.prune_nodes()
+                self.logger.debug(f"[Topology] Pruned to {len(self.topology_graph.nodes)} nodes")
+
+            # Get topology summary
+            topology_summary = self.topology_graph.get_summary()
+
             # Update context
             context.metadata["trajectory"] = {
                 "progress": progress,
@@ -178,13 +316,35 @@ class TrajectoryAgent(BaseAgent):
                 "visited": visited,
                 "heading": heading,
                 "distance_traveled": distance_traveled,
-                # NEW: Height change info
                 "y_change": y_change,
                 "y_direction": y_direction,
+                # NEW: Structured state data
+                "subtask_delta": subtask_delta,
+                "distance_to_goal": distance_to_goal,
             }
 
             return AgentOutput.success_output(
                 data={
+                    # ===== NEW: Structured state data =====
+                    "state": {
+                        "position": [round(position[0], 2), round(position[1], 2), round(position[2], 2)],
+                        "rotation_deg": round(math.degrees(rotation), 1),
+                        "step": context.step_count,
+                    },
+
+                    # ===== NEW: Subtask state change (core) =====
+                    "subtask_delta": subtask_delta,
+
+                    # ===== NEW: Global navigation state =====
+                    "navigation": {
+                        "total_distance": round(distance_traveled, 2),
+                        "distance_to_goal": round(distance_to_goal, 2),
+                        "heading": heading,
+                        "visited_cells": len(self._visited_cells),
+                        "efficiency": round(path_confidence, 2),
+                    },
+
+                    # ===== Keep existing fields for compatibility =====
                     "waypoints": waypoints,
                     "progress": progress,
                     "progress_percentage": progress * 100,
@@ -195,6 +355,8 @@ class TrajectoryAgent(BaseAgent):
                     "visited": visited,
                     "trajectory_summary": trajectory_summary,
                     "num_visited_cells": len(self._visited_cells),
+                    # ===== NEW: Topology summary for DecisionAgent =====
+                    "topology_summary": topology_summary,
                 },
                 confidence=path_confidence,
                 reasoning=f"Progress: {progress*100:.1f}%, visited: {visited}, heading: {heading}",
@@ -323,6 +485,88 @@ class TrajectoryAgent(BaseAgent):
             )
         return distance
 
+    def _calculate_subtask_delta(self, context: NavContext) -> Dict[str, Any]:
+        """Calculate state change within current subtask (generic, no judgment).
+
+        Returns position_delta and rotation_delta for DecisionAgent to interpret.
+        """
+        current_subtask = context.get_current_subtask()
+
+        # Basic info
+        result = {
+            "subtask_id": current_subtask.id if current_subtask else -1,
+            "subtask_description": current_subtask.description if current_subtask else "",
+        }
+
+        # Current state
+        current_pos = context.position
+        current_rot = context.rotation
+
+        # Get subtask start state
+        start_context = current_subtask.start_context if current_subtask and current_subtask.start_context else {}
+        start_pos = start_context.get("position", current_pos)
+        start_rot = start_context.get("rotation", current_rot)
+
+        # Position change (XYZ all included)
+        dx = current_pos[0] - start_pos[0]
+        dy = current_pos[1] - start_pos[1]  # Y change (vertical)
+        dz = current_pos[2] - start_pos[2]
+        horizontal_dist = math.sqrt(dx*dx + dz*dz)
+        total_dist = math.sqrt(dx*dx + dy*dy + dz*dz)
+
+        result["position_delta"] = {
+            "start": [round(start_pos[0], 2), round(start_pos[1], 2), round(start_pos[2], 2)],
+            "current": [round(current_pos[0], 2), round(current_pos[1], 2), round(current_pos[2], 2)],
+            "dx": round(dx, 2),
+            "dy": round(dy, 2),
+            "dz": round(dz, 2),
+            "horizontal_distance": round(horizontal_dist, 2),
+            "total_distance": round(total_dist, 2),
+        }
+
+        # Rotation change (handle boundary crossing)
+        start_deg = math.degrees(start_rot)
+        current_deg = math.degrees(current_rot)
+        delta_deg = current_deg - start_deg
+
+        # Handle -180/180 boundary
+        if delta_deg > 180:
+            delta_deg -= 360
+        elif delta_deg < -180:
+            delta_deg += 360
+
+        # Determine direction
+        if abs(delta_deg) < 5:
+            rot_direction = "none"
+        elif delta_deg > 0:
+            rot_direction = "left"   # Positive angle = turn left
+        else:
+            rot_direction = "right"  # Negative angle = turn right
+
+        result["rotation_delta"] = {
+            "start_deg": round(start_deg, 1),
+            "current_deg": round(current_deg, 1),
+            "delta_deg": round(abs(delta_deg), 1),
+            "direction": rot_direction,
+        }
+
+        # Steps in subtask
+        start_step = start_context.get("step", context.step_count)
+        result["steps_in_subtask"] = context.step_count - start_step
+
+        return result
+
+    def _calculate_distance_to_goal(self, context: NavContext) -> float:
+        """Calculate distance to goal position."""
+        goal_pos = context.metadata.get("goal_position")
+        if not goal_pos or not context.position:
+            return 0.0
+
+        dx = goal_pos[0] - context.position[0]
+        dy = goal_pos[1] - context.position[1]
+        dz = goal_pos[2] - context.position[2]
+        return math.sqrt(dx*dx + dy*dy + dz*dz)
+
     def _angle_between_vectors(self, v1: Tuple, v2: Tuple) -> float:
         """Calculate angle between two 2D vectors in degrees."""
         dot = v1[0] * v2[0] + v1[1] * v2[1]
@@ -354,7 +598,7 @@ class TrajectoryAgent(BaseAgent):
 
         if context.subtasks:
             for subtask in context.subtasks:
-                if subtask.status == "pending":
+                if subtask.status in ["pending", "in_progress"]:
                     waypoints.append({
                         "type": "subtask",
                         "subtask_id": subtask.id,
@@ -492,9 +736,9 @@ class TrajectoryAgent(BaseAgent):
 
             # Generate summary with conversation context
             response = self._model_manager.generate(
-                "qwen-2b-trajectory",
+                "qwen-9b-trajectory",
                 prompt,
-                max_new_tokens=80,  # Enough for JSON output
+                max_new_tokens=50,  # Optimized: actual usage 21 tokens (was 256)
                 temperature=0.1,  # Lower temperature for more consistent JSON
                 conversation_id=conversation_id,
                 keep_context=True,
@@ -644,16 +888,131 @@ class TrajectoryAgent(BaseAgent):
             f"已走: {output_data['已走距离']:.1f}m"
         )
 
+        # Print to console
+        print(f"[TrajectoryAgent] 位置: {output_data['当前位置']}, 朝向: {output_data['当前朝向']}°, 已走: {output_data['已走距离']:.1f}m")
+
         return json.dumps(output_data, ensure_ascii=False)
 
     def reset_map(self) -> None:
-        """Reset the visited cells map."""
+        """Reset the visited cells map and topology graph."""
         self._visited_cells.clear()
         self._waypoints.clear()
         self._goal_position = None
         self._conversation_history.clear()
         self._stuck_regions.clear()
         self._stuck_paths.clear()
+        self._action_history.clear()
+        # Reset topology graph
+        self.topology_graph = TopologyGraph()
+        self.last_room = ""
+        self._last_topology_node_id = None
+
+    def update_topology_only(
+        self,
+        current_pos: Tuple[float, float, float],
+        prev_pos: Tuple[float, float, float],
+        current_rot: float,
+        prev_rot: float,
+        step_count: int,
+        action_sequence: List[str] = []
+    ) -> Optional[str]:
+        """轻量级拓扑更新（序列执行期间调用，仅检测stairs/junction）。
+
+        Args:
+            current_pos: 当前位置 (x, y, z)
+            prev_pos: 前一步位置
+            current_rot: 当前旋转角度（弧度）
+            prev_rot: 前一步旋转角度
+            step_count: 当前步数
+            action_sequence: 当前执行的动作序列（用于边的 action_sequence 属性）
+
+        Returns:
+            新节点ID（如果添加了节点），否则None
+        """
+        # 检测stairs（高度变化 > 0.5m）
+        y_diff = current_pos[1] - prev_pos[1]
+        if abs(y_diff) > 0.5:
+            semantic_info = "楼梯上升" if y_diff > 0 else "楼梯下降"
+            new_node_id = self.topology_graph.add_node(
+                position=current_pos,
+                node_type="stairs",
+                semantic_info=semantic_info,
+                timestamp=step_count
+            )
+            if self._last_topology_node_id:
+                self.topology_graph.add_edge(
+                    source_id=self._last_topology_node_id,
+                    target_id=new_node_id,
+                    action_sequence=action_sequence
+                )
+            self._last_topology_node_id = new_node_id
+            self.logger.debug(f"[Topology-lite] Added stairs node: {semantic_info}")
+            return new_node_id
+
+        # 检测junction（转向 > 28°，约0.5弧度）
+        rot_diff = current_rot - prev_rot
+        # 处理-π/π边界
+        if rot_diff > math.pi:
+            rot_diff -= 2 * math.pi
+        elif rot_diff < -math.pi:
+            rot_diff += 2 * math.pi
+
+        if abs(rot_diff) > 0.5:
+            new_node_id = self.topology_graph.add_node(
+                position=current_pos,
+                node_type="junction",
+                semantic_info="转向点",
+                timestamp=step_count
+            )
+            if self._last_topology_node_id:
+                self.topology_graph.add_edge(
+                    source_id=self._last_topology_node_id,
+                    target_id=new_node_id,
+                    action_sequence=action_sequence
+                )
+            self._last_topology_node_id = new_node_id
+            self.logger.debug(f"[Topology-lite] Added junction node")
+            return new_node_id
+
+        # 无关键位置变化，更新当前节点
+        self.topology_graph.update_current_node(current_pos)
+        return None
+
+    def record_action_sequence(
+        self,
+        step_id: int,
+        actions: List[str],
+        start_pos: Tuple[float, float, float],
+        end_pos: Tuple[float, float, float],
+        goal_distance_before: float,
+        goal_distance_after: float,
+        stuck_triggered: bool,
+        perception_feedback: str = ""
+    ) -> None:
+        """记录一次动作序列及其结果。
+
+        Args:
+            step_id: 步骤 ID
+            actions: 动作序列 (如 ['turn_right', 'turn_right', 'forward'])
+            start_pos: 执行前位置 (x, y, z)
+            end_pos: 执行后位置 (x, y, z)
+            goal_distance_before: 执行前距离目标
+            goal_distance_after: 执行后距离目标
+            stuck_triggered: 是否触发 stuck
+            perception_feedback: 感知反馈
+        """
+        record = ActionRecord(
+            step_id=step_id,
+            actions=actions,
+            start_pos=start_pos,
+            end_pos=end_pos,
+            goal_distance_before=goal_distance_before,
+            goal_distance_after=goal_distance_after,
+            stuck_triggered=stuck_triggered,
+            perception_feedback=perception_feedback,
+        )
+        self._action_history.append(record)
+        self.logger.info(f"[Trajectory] 记录动作序列：{len(actions)}步，stuck={stuck_triggered}")
 
     def record_stuck_region(
         self,
@@ -698,178 +1057,6 @@ class TrajectoryAgent(BaseAgent):
                 return True
         return False
 
-    def get_stuck_escape_opinion(
-        self,
-        trajectory: List[Tuple],
-        stuck_regions: List[Dict],
-        current_rotation: float = 0.0
-    ) -> Dict[str, Any]:
-        """Provide stuck escape opinion based on trajectory history.
-
-        Analyzes the trajectory to find unexplored directions and
-        escape routes from stuck regions.
-
-        Args:
-            trajectory: List of positions in the trajectory
-            stuck_regions: List of known stuck regions
-            current_rotation: Current rotation angle in radians
-
-        Returns:
-            Dict with escape direction, confidence, and reasoning
-        """
-        opinion = {
-            "direction": "right",
-            "confidence": 0.5,
-            "reason": "默认建议",
-            "stop_condition": "",
-            "agent_source": "trajectory",
-        }
-
-        if len(trajectory) < 3:
-            opinion["reason"] = "轨迹数据不足"
-            return opinion
-
-        # Analyze recent trajectory for movement patterns
-        recent = trajectory[-10:] if len(trajectory) >= 10 else trajectory
-
-        # Calculate movement directions
-        directions = []
-        for i in range(1, len(recent)):
-            prev = recent[i - 1]
-            curr = recent[i]
-            dx = curr[0] - prev[0]
-            dz = curr[2] - prev[2]
-            dist = math.sqrt(dx*dx + dz*dz)
-            if dist > 0.05:
-                angle = math.atan2(-dx, dz)  # Habitat coordinate system
-                directions.append(angle)
-
-        if not directions:
-            opinion["reason"] = "无有效移动记录"
-            return opinion
-
-        # Find explored directions
-        explored_angles = set()
-        for angle in directions:
-            # Quantize to 45-degree sectors
-            sector = int(math.degrees(angle) // 45) * 45
-            explored_angles.add(sector)
-
-        # All possible directions (8 sectors)
-        all_sectors = {-180, -135, -90, -45, 0, 45, 90, 135, 180}
-        unexplored = all_sectors - explored_angles
-
-        # Current facing direction
-        current_sector = int(math.degrees(current_rotation) // 45) * 45
-
-        # Find best unexplored direction relative to current facing
-        if unexplored:
-            # Find closest unexplored sector to current direction
-            min_diff = 360
-            best_sector = current_sector
-            for sector in unexplored:
-                diff = abs(sector - current_sector)
-                if diff > 180:
-                    diff = 360 - diff
-                if diff < min_diff:
-                    min_diff = diff
-                    best_sector = sector
-
-            # Determine turn direction
-            angle_diff = best_sector - current_sector
-            if angle_diff > 180:
-                angle_diff -= 360
-            elif angle_diff < -180:
-                angle_diff += 360
-
-            if angle_diff > 22:
-                opinion["direction"] = "left"
-                opinion["confidence"] = 0.7
-                opinion["reason"] = f"未探索方向在左侧({angle_diff}°)"
-            elif angle_diff < -22:
-                opinion["direction"] = "right"
-                opinion["confidence"] = 0.7
-                opinion["reason"] = f"未探索方向在右侧({-angle_diff}°)"
-            else:
-                opinion["direction"] = "forward"
-                opinion["confidence"] = 0.75
-                opinion["reason"] = "前方为未探索方向"
-
-        else:
-            # All directions explored - check for blocked paths
-            opinion["reason"] = "所有方向已探索"
-
-            # Check if in known stuck region
-            if stuck_regions:
-                current_pos = trajectory[-1] if trajectory else (0, 0, 0)
-                for region in stuck_regions:
-                    dx = current_pos[0] - region["position"][0]
-                    dz = current_pos[2] - region["position"][2]
-                    dist = math.sqrt(dx*dx + dz*dz)
-
-                    if dist < region["radius"] * 1.5:
-                        # In or near a stuck region - use escape actions if available
-                        if region.get("escape_actions"):
-                            last_escape = region["escape_actions"][-1]
-                            opinion["direction"] = last_escape
-                            opinion["confidence"] = 0.8
-                            opinion["reason"] = "使用已知逃离路径"
-                        break
-
-        opinion["stop_condition"] = "移动1米或进入新区域"
-
-        return opinion
-
-    def get_stuck_regions_summary(self) -> List[Dict]:
-        """Get summary of all stuck regions."""
-        return self._stuck_regions.copy()
-
-    def mark_stuck_region(
-        self,
-        position: Tuple[float, float, float],
-        escape_success: bool,
-        escape_direction: Optional[str] = None
-    ) -> None:
-        """Mark a stuck region with escape result for future reference.
-
-        Phase 5: Part of escape verification closed loop.
-
-        Args:
-            position: Position where stuck occurred
-            escape_success: Whether escape was successful
-            escape_direction: Direction that successfully escaped (if any)
-        """
-        # Check if this region already exists
-        for region in self._stuck_regions:
-            dx = position[0] - region["position"][0]
-            dz = position[2] - region["position"][2]
-            dist = math.sqrt(dx * dx + dz * dz)
-
-            if dist < region["radius"]:
-                # Update existing record
-                region["escape_attempts"] = region.get("escape_attempts", 0) + 1
-                if escape_success:
-                    region["escape_success"] = True
-                    region["successful_direction"] = escape_direction
-                    if escape_direction and escape_direction not in region.get("escape_actions", []):
-                        region.setdefault("escape_actions", []).append(escape_direction)
-                self.logger.info(f"[Trajectory] 更新卡住区域: {position}, 成功={escape_success}")
-                return
-
-        # Create new stuck region record
-        import time
-        new_region = {
-            "position": position,
-            "radius": 1.0,
-            "escape_attempts": 1,
-            "escape_success": escape_success,
-            "successful_direction": escape_direction if escape_success else None,
-            "escape_actions": [escape_direction] if escape_success and escape_direction else [],
-            "timestamp": time.time(),
-        }
-        self._stuck_regions.append(new_region)
-        self.logger.info(f"[Trajectory] 新卡住区域: {position}")
-
     def get_stuck_region_info(self, position: Tuple[float, float, float]) -> Optional[Dict[str, Any]]:
         """Get information about a stuck region at a position.
 
@@ -893,345 +1080,300 @@ class TrajectoryAgent(BaseAgent):
                 }
         return None
 
-    def build_debate_opinion(
+    def get_stuck_recovery_suggestion(
         self,
-        context: "NavContext",
-        stuck_regions: List[Dict] = None
-    ) -> "DebateOpinion":
-        """Build a DebateOpinion for the debate strategy using LLM.
+        context: NavContext,
+        depth_clear_direction: Optional[str] = None
+    ) -> Dict[str, Any]:
+        """根据拓扑历史 + 深度图分析返回恢复方向建议。
 
         Args:
-            context: Navigation context
-            stuck_regions: Known stuck regions
+            context: 当前导航上下文
+            depth_clear_direction: 来自run_vln_experiment的深度图分析结果
 
         Returns:
-            DebateOpinion with trajectory-based constraints
+            Dict包含：
+            - preferred_direction: 推荐方向 ("left"/"right"/None)
+            - avoid_directions: 需避免的方向列表
+            - reason: 推荐理由
+            - confidence: 置信度 (0.5-0.8)
+            - use_depth_analysis: 是否需要深度图辅助
         """
-        from core.debate_types import DebateOpinion, ActionConstraint
+        current_pos = context.position if hasattr(context, 'position') else (0, 0, 0)
+        current_step = context.step_count if hasattr(context, 'step_count') else 0
 
-        trajectory = context.trajectory if context.trajectory else []
-        stuck_regions = stuck_regions or []
+        # 查找匹配的stuck_region
+        matched_region = self._find_matching_stuck_region(current_pos)
 
-        # Analyze recent action history
-        turn_left_count = 0
-        turn_right_count = 0
-        forward_failures = 0
+        if matched_region:
+            # 检查是否有历史成功方向
+            if matched_region.get("successful_direction"):
+                return {
+                    "preferred_direction": matched_region["successful_direction"],
+                    "avoid_directions": matched_region.get("failed_directions", []),
+                    "reason": "历史成功方向",
+                    "confidence": 0.8,
+                    "use_depth_analysis": False
+                }
 
-        if context.action_history:
-            recent = context.action_history[-10:]
-            turn_left_count = sum(1 for a in recent if a.action_type.name == "TURN_LEFT")
-            turn_right_count = sum(1 for a in recent if a.action_type.name == "TURN_RIGHT")
+            # 有历史失败方向（无成功）
+            return {
+                "preferred_direction": depth_clear_direction,
+                "avoid_directions": matched_region.get("failed_directions", []),
+                "reason": "避开历史失败方向",
+                "confidence": 0.6,
+                "use_depth_analysis": True
+            }
 
-        # Use LLM for trajectory-based opinion
-        if self._model_manager:
-            return self._build_trajectory_opinion_with_llm(
-                context, turn_left_count, turn_right_count, stuck_regions
-            )
+        # 无历史记录 → 创建新stuck_region
+        self._create_stuck_region(current_pos, current_step)
+        return {
+            "preferred_direction": depth_clear_direction,
+            "avoid_directions": [],
+            "reason": "首次卡住，使用深度图分析",
+            "confidence": 0.5,
+            "use_depth_analysis": True
+        }
+
+    def _find_matching_stuck_region(
+        self,
+        position: Tuple[float, float, float]
+    ) -> Optional[Dict]:
+        """通过距离阈值匹配已知stuck_region。
+
+        Note: Returns full region dict unlike get_stuck_region_info which returns
+        a subset. Kept separate for backward compatibility with recovery logic.
+
+        Args:
+            position: 当前位置
+
+        Returns:
+            匹配的stuck_region或None
+        """
+        if not self._stuck_regions:
+            return None
+
+        for region in self._stuck_regions:
+            dx = position[0] - region["position"][0]
+            dz = position[2] - region["position"][2]
+            distance = math.sqrt(dx * dx + dz * dz)
+
+            if distance < region.get("radius", 1.0):
+                return region
+
+        return None
+
+    def _create_stuck_region(
+        self,
+        position: Tuple[float, float, float],
+        step: int
+    ) -> None:
+        """创建新的stuck_region记录（扩展结构）。
+
+        Schema is aligned with mark_stuck_region for compatibility:
+        - radius: 1.0 (matching mark_stuck_region)
+        - escape_success: False (will be updated on successful escape)
+        - escape_actions: [] (will be populated on successful escapes)
+        - timestamp: 0.0 (placeholder, will be updated on actual escape)
+
+        Extended fields for recovery feature:
+        - failed_directions: list of directions that didn't work
+        - last_attempt_step: step of last escape attempt
+        - created_at: step when region was created
+
+        Args:
+            position: 卡住位置
+            step: 当前步数
+        """
+        import time
+        new_region = {
+            # Core fields (matching mark_stuck_region schema)
+            "position": position,
+            "radius": 1.0,  # 匹配 mark_stuck_region
+            "escape_attempts": 0,
+            "escape_success": False,  # 兼容字段
+            "successful_direction": None,
+            "escape_actions": [],  # 兼容字段
+            "timestamp": time.time(),  # 兼容字段
+            # Extended fields for recovery feature
+            "failed_directions": [],
+            "last_attempt_step": step,
+            "created_at": step,
+        }
+
+        self._stuck_regions.append(new_region)
+        self.logger.info(f"[Trajectory] Created stuck_region at {position}")
+
+    def mark_escape_result(
+        self,
+        position: Tuple[float, float, float],
+        direction: str,
+        success: bool,
+        step: int
+    ) -> None:
+        """延迟更新escape结果。
+
+        Args:
+            position: 卡住位置
+            direction: 尝试方向 ("left"/"right")
+            success: 是否成功逃离
+            step: 当前步数
+        """
+        region = self._find_matching_stuck_region(position)
+        if not region:
+            self.logger.warning(f"[Trajectory] No stuck_region found at {position}")
+            return
+
+        region["last_attempt_step"] = step
+        region["escape_attempts"] = region.get("escape_attempts", 0) + 1
+
+        if success:
+            region["successful_direction"] = direction
+            region["escape_success"] = True  # 兼容字段
+            # 从失败列表移除（如果之前标记过）
+            failed_dirs = region.get("failed_directions", [])
+            if direction in failed_dirs:
+                failed_dirs.remove(direction)
+                region["failed_directions"] = failed_dirs
+            self.logger.info(f"[Trajectory] Escape success with {direction} at {region['position']}")
         else:
-            return self._build_trajectory_opinion_fallback(
-                context, turn_left_count, turn_right_count, stuck_regions
-            )
+            failed_dirs = region.get("failed_directions", [])
+            if direction not in failed_dirs:
+                failed_dirs.append(direction)
+                region["failed_directions"] = failed_dirs
+            self.logger.warning(f"[Trajectory] Escape failed with {direction} at {region['position']}")
 
-    def _build_trajectory_opinion_with_llm(
+    # ========== Action History Methods ==========
+
+    def get_similar_location_history(
         self,
-        context: "NavContext",
-        turn_left_count: int,
-        turn_right_count: int,
-        stuck_regions: List[Dict]
-    ) -> "DebateOpinion":
-        """Build trajectory opinion using LLM with enhanced spatial awareness."""
-        from core.debate_types import DebateOpinion, ActionConstraint
-        import math
+        current_pos: Tuple[float, float, float],
+        radius: float = 2.0,
+        max_records: int = 5
+    ) -> List[ActionRecord]:
+        """获取相似位置的历史动作记录。
 
-        # Analyze trajectory data
-        trajectory = context.trajectory if context.trajectory else []
-        recent_actions = [a.action_type.name for a in context.action_history[-10:]] if context.action_history else []
+        Args:
+            current_pos: 当前位置 (x, y, z)
+            radius: 搜索半径（米）
+            max_records: 返回最大记录数
 
-        # Calculate path metrics
-        total_distance = 0.0
-        if len(trajectory) >= 2:
-            for i in range(1, len(trajectory)):
-                dx = trajectory[i][0] - trajectory[i-1][0]
-                dz = trajectory[i][2] - trajectory[i-1][2]
-                total_distance += math.sqrt(dx*dx + dz*dz)
+        Returns:
+            历史记录列表，按距离排序
+        """
+        similar_records = []
 
-        # Calculate efficiency
-        efficiency = 1.0
-        if len(trajectory) >= 2:
-            start = trajectory[0]
-            end = trajectory[-1]
-            direct = math.sqrt((end[0]-start[0])**2 + (end[2]-start[2])**2)
-            if total_distance > 0:
-                efficiency = min(direct / total_distance, 1.0)
+        for record in self._action_history:
+            # 计算与起始位置的距离
+            start_pos = record.start_pos
+            dx = current_pos[0] - start_pos[0]
+            dz = current_pos[2] - start_pos[2]
+            dist = math.sqrt(dx * dx + dz * dz)
 
-        # Height analysis
-        y_trend = "稳定"
-        y_change = 0.0
-        if len(trajectory) >= 3:
-            recent_y = [p[1] for p in trajectory[-5:]]
-            y_change = recent_y[-1] - recent_y[0]
-            if abs(y_change) > 0.2:
-                y_trend = f"{'上升' if y_change > 0 else '下降'}{abs(y_change):.1f}米"
+            if dist <= radius:
+                similar_records.append((dist, record))
 
-        # Goal direction analysis
-        goal_pos = context.metadata.get("goal_position")
-        current_pos = context.position if context.position else (0, 0, 0)
+        # 按距离排序
+        similar_records.sort(key=lambda x: x[0])
 
-        goal_direction = "未知"
-        goal_distance = 0.0
-        goal_angle = 0.0
-        floor_relation = "同层"
+        # 返回最近的 max_records 条记录
+        return [record for _, record in similar_records[:max_records]]
 
-        if goal_pos:
-            dx = goal_pos[0] - current_pos[0]
-            dz = goal_pos[2] - current_pos[2]
-            goal_distance = math.sqrt(dx*dx + dz*dz)
+    def get_history_summary(self, current_pos: Tuple[float, float, float], radius: float = 2.0) -> str:
+        """获取位置历史记录的摘要文本。
 
-            # Angle to goal
-            goal_angle = math.degrees(math.atan2(dx, -dz))
-            if goal_angle < 0:
-                goal_angle += 360
+        Args:
+            current_pos: 当前位置
+            radius: 搜索半径
 
-            # Direction name
-            if goal_angle < 45 or goal_angle >= 315:
-                goal_direction = "正前方"
-            elif 45 <= goal_angle < 135:
-                goal_direction = "右侧"
-            elif 135 <= goal_angle < 225:
-                goal_direction = "后方"
+        Returns:
+            历史记录摘要文本
+        """
+        history = self.get_similar_location_history(current_pos, radius)
+
+        if not history:
+            return "附近无历史记录"
+
+        summaries = []
+        for record in history[:3]:  # 最多显示 3 条
+            action_str = " → ".join(record.actions[:5])
+            if len(record.actions) > 5:
+                action_str += "..."
+
+            # 判断动作效果
+            dist_change = record.goal_distance_after - record.goal_distance_before
+            if dist_change < -0.5:
+                effect = "靠近目标"
+            elif dist_change > 0.5:
+                effect = "远离目标"
+            elif record.stuck_triggered:
+                effect = "触发 stuck"
             else:
-                goal_direction = "左侧"
+                effect = "无明显效果"
 
-            # Floor relation
-            vert_dist = goal_pos[1] - current_pos[1]
-            if vert_dist < -0.5:
-                floor_relation = "目标在下层"
-            elif vert_dist > 0.5:
-                floor_relation = "目标在上层"
+            summaries.append(f"动作 [{action_str}] {effect}")
 
-        # Detect looping pattern
-        is_looping = False
-        loop_pattern = "无"
-        if len(recent_actions) >= 6:
-            # Check for alternating left-right pattern
-            pattern_str = "".join(["L" if "LEFT" in a else "R" if "RIGHT" in a else "F" for a in recent_actions[-6:]])
-            if "LRLR" in pattern_str or "RLRL" in pattern_str:
-                is_looping = True
-                loop_pattern = "左右摇摆"
-            elif recent_actions.count("TURN_LEFT") >= 4:
-                is_looping = True
-                loop_pattern = "连续左转"
-            elif recent_actions.count("TURN_RIGHT") >= 4:
-                is_looping = True
-                loop_pattern = "连续右转"
+        return "; ".join(summaries)
 
-        # Build enhanced prompt
-        prompt = f"""/no_think
-你是轨迹规划专家。基于导航轨迹分析最佳动作。
-
-## 轨迹状态
-- 总步数: {context.step_count}
-- 已走距离: {total_distance:.1f}米
-- 路径效率: {efficiency:.2f}
-
-## 空间关系
-- 目标方向: {goal_direction}
-- 目标角度: {goal_angle:.0f}度
-- 目标距离: {goal_distance:.1f}米
-- 楼层关系: {floor_relation}
-
-## 高度分析
-- 当前高度: {current_pos[1]:.2f}米
-- 高度变化: {y_trend}
-- 总高度差: {y_change:+.2f}米
-
-## 动作历史分析
-- 最近10动作: {recent_actions if recent_actions else "无"}
-- 左转次数: {turn_left_count}
-- 右转次数: {turn_right_count}
-- 循环模式: {loop_pattern}
-- 是否原地打转: {"是" if is_looping else "否"}
-
-## 卡住检测
-- 卡住步数: {context.stuck_counter if hasattr(context, 'stuck_counter') else 0}
-- 已知卡住区域: {len(stuck_regions)}个
-
-## 决策推理要求
-1. 如果原地打转(左右摇摆)，必须选择新方向
-2. 如果目标在不同楼层，应寻找楼梯
-3. 如果效率低于0.3，说明路径曲折，应重新规划
-
-## 输出格式(JSON)
-{{
-  "primary_action": "forward/turn_left/turn_right/stop",
-  "confidence": 0.0-1.0,
-  "reasoning": "推荐理由",
-  "path_quality": {{
-    "efficiency": {efficiency:.2f},
-    "stuck_risk": {min(context.stuck_counter if hasattr(context, 'stuck_counter') else 0, 10)}/10,
-    "recommendation": "继续当前方向/转向探索/寻找楼梯"
-  }},
-  "constraints": {{
-    "hard": [{{"action": "应避免的动作", "blocked": true, "reason": "原因"}}],
-    "soft": [{{"action": "优先动作", "weight": 0.5, "reason": "原因"}}]
-  }}
-}}
-
-只输出JSON，无其他内容。"""
-        try:
-            response = self._model_manager.generate(
-                "qwen-2b-trajectory",
-                prompt,
-                max_new_tokens=200,
-                temperature=0.1,
-            )
-            return self._parse_trajectory_opinion_response(response, turn_left_count, turn_right_count, efficiency, is_looping)
-        except Exception as e:
-            self.logger.error(f"LLM trajectory opinion failed: {e}")
-            return self._build_trajectory_opinion_fallback(
-                context, turn_left_count, turn_right_count, stuck_regions
-            )
-
-    def _parse_trajectory_opinion_response(
+    def build_action_history_opinion(
         self,
-        response: str,
-        turn_left_count: int,
-        turn_right_count: int,
-        efficiency: float = 1.0,
-        is_looping: bool = False
-    ) -> "DebateOpinion":
-        """Parse LLM response into DebateOpinion."""
-        import json
-        import re
-        from core.debate_types import DebateOpinion, ActionConstraint
+        current_pos: Tuple[float, float, float],
+        radius: float = 2.0
+    ) -> Dict[str, Any]:
+        """基于动作历史生成决策意见。
 
-        primary_action = "turn_right"
-        confidence = 0.6
-        reasoning = ""
-        constraints = {"hard": [], "soft": []}
-        path_quality = {}
+        分析相似位置的历史记录，提供：
+        1. 应避免的动作（导致 stuck 或远离目标）
+        2. 推荐的动作（成功靠近目标）
 
-        try:
-            json_match = re.search(r'\{(?:[^{}]|\{[^{}]*\})*\}', response)
-            if json_match:
-                data = json.loads(json_match.group())
+        Args:
+            current_pos: 当前位置
+            radius: 搜索半径
 
-                primary_action = data.get("primary_action", "turn_right")
-                confidence = float(data.get("confidence", 0.6))
-                reasoning = data.get("reasoning", "")
-                path_quality = data.get("path_quality", {})
+        Returns:
+            包含建议和约束的意见字典
+        """
+        opinion = {
+            "recommended_actions": [],
+            "avoid_actions": [],
+            "reasoning": "基于历史动作分析",
+            "confidence": 0.5,
+        }
 
-                # Parse hard constraints
-                hard = data.get("constraints", {}).get("hard", [])
-                for c in hard:
-                    constraints["hard"].append(ActionConstraint(
-                        action=c.get("action", "turn_right"),
-                        blocked=c.get("blocked", True),
-                        reason=c.get("reason", ""),
-                    ))
+        history = self.get_similar_location_history(current_pos, radius)
 
-                # Parse soft constraints
-                soft = data.get("constraints", {}).get("soft", [])
-                for c in soft:
-                    constraints["soft"].append(ActionConstraint(
-                        action=c.get("action", "turn_right"),
-                        weight_multiplier=c.get("weight", 1.0),
-                        reason=c.get("reason", ""),
-                    ))
+        if not history:
+            opinion["reasoning"] = "附近无历史记录，采用默认策略"
+            return opinion
 
-        except (json.JSONDecodeError, ValueError):
-            pass
+        # 分析历史记录
+        successful_actions = []
+        failed_actions = []
 
-        # Fallback logic based on trajectory analysis
-        if not reasoning:
-            if is_looping:
-                reasoning = "检测到原地打转，建议选择新方向"
-            elif efficiency < 0.3:
-                reasoning = "路径效率低，建议重新规划"
-            else:
-                reasoning = "轨迹分析建议"
+        for record in history:
+            dist_change = record.goal_distance_after - record.goal_distance_before
 
-        return DebateOpinion(
-            agent="trajectory",
-            primary_action=primary_action,
-            confidence=confidence,
-            evidence={
-                "recent_turns": {"left": turn_left_count, "right": turn_right_count},
-                "efficiency": efficiency,
-                "is_looping": is_looping,
-                "path_quality": path_quality,
-            },
-            reasoning=reasoning,
-            constraints=constraints,
-        )
+            if record.stuck_triggered:
+                # 触发 stuck 的动作序列
+                failed_actions.extend(record.actions[:3])  # 记录前 3 个动作
+            elif dist_change > 0.5:
+                # 远离目标的动作
+                failed_actions.extend(record.actions[:3])
+            elif dist_change < -0.3:
+                # 靠近目标的动作
+                successful_actions.extend(record.actions[:3])
 
-    def _build_trajectory_opinion_fallback(
-        self,
-        context: "NavContext",
-        turn_left_count: int,
-        turn_right_count: int,
-        stuck_regions: List[Dict]
-    ) -> "DebateOpinion":
-        """Fallback rule-based trajectory opinion."""
-        from core.debate_types import DebateOpinion, ActionConstraint
+        # 统计动作频率
+        from collections import Counter
+        if failed_actions:
+            failed_counts = Counter(failed_actions)
+            opinion["avoid_actions"] = [action for action, _ in failed_counts.most_common(3)]
+            opinion["reasoning"] += f"，避免{opinion['avoid_actions'][0] if opinion['avoid_actions'] else '无效动作'}"
 
-        trajectory = context.trajectory if context.trajectory else []
-        forward_failures = 0
-        if hasattr(context, 'stuck_counter'):
-            forward_failures = context.stuck_counter
+        if successful_actions:
+            success_counts = Counter(successful_actions)
+            opinion["recommended_actions"] = [action for action, _ in success_counts.most_common(3)]
+            opinion["reasoning"] += f"，推荐{opinion['recommended_actions'][0] if opinion['recommended_actions'] else '成功动作'}"
+            opinion["confidence"] = 0.7
 
-        # Determine primary action
-        primary_action = "turn_right"
-        confidence = 0.6
-
-        if turn_right_count > turn_left_count + 2:
-            primary_action = "turn_left"
-            reasoning = f"已多次右转({turn_right_count})，建议左转"
-        elif turn_left_count > turn_right_count + 2:
-            primary_action = "turn_right"
-            reasoning = f"已多次左转({turn_left_count})，建议右转"
-        else:
-            reasoning = "探索新方向"
-
-        # Build constraints
-        constraints = {"hard": [], "soft": []}
-
-        # Penalize overused directions
-        if turn_right_count > 3:
-            constraints["soft"].append(ActionConstraint(
-                action="turn_right",
-                weight_multiplier=0.5,
-                reason=f"already_tried_{turn_right_count}_times",
-            ))
-        if turn_left_count > 3:
-            constraints["soft"].append(ActionConstraint(
-                action="turn_left",
-                weight_multiplier=0.5,
-                reason=f"already_tried_{turn_left_count}_times",
-            ))
-
-        # Check for known stuck regions
-        if trajectory:
-            current_pos = trajectory[-1]
-            stuck_info = self.get_stuck_region_info(current_pos)
-            if stuck_info and stuck_info.get("successful_direction"):
-                success_dir = stuck_info["successful_direction"]
-                constraints["soft"].append(ActionConstraint(
-                    action=success_dir,
-                    weight_multiplier=1.3,
-                    reason="known_escape_direction",
-                ))
-
-        return DebateOpinion(
-            agent="trajectory",
-            primary_action=primary_action,
-            confidence=confidence,
-            evidence={
-                "recent_turns": {"left": turn_left_count, "right": turn_right_count},
-                "consecutive_forward_failures": forward_failures,
-                "visited_cells": len(self._visited_cells) if hasattr(self, '_visited_cells') else len(trajectory),
-                "stuck_regions": len(self._stuck_regions) if hasattr(self, '_stuck_regions') else len(stuck_regions),
-            },
-            reasoning=reasoning,
-            constraints=constraints,
-        )
+        return opinion
