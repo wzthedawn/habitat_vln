@@ -442,6 +442,9 @@ class Navigator(BaseAgent):
             self.logger.warning(f"[Navigator] EmergencyAgent detection failed: {e}")
             self._last_emergency_event = None
 
+        # 3.5 Compute subtask progress (how much of completion condition is satisfied)
+        subtask_progress = self._get_subtask_progress()
+
         # 4. AnalysisAgent - LLM reasoning (with difficulty-graded strategy)
         try:
             analysis_output = self._registry.call(
@@ -450,6 +453,7 @@ class Navigator(BaseAgent):
                 subtask=subtask_obj,
                 history=self._history,
                 static_difficulty=self._static_difficulty,
+                subtask_progress=subtask_progress,
                 dynamic_difficulty=self._dynamic_difficulty,
             )
             self._last_analysis_output = analysis_output
@@ -665,6 +669,52 @@ class Navigator(BaseAgent):
         except Exception as e:
             self.logger.warning(f"[Navigator] ReviewAgent check failed: {e}")
             return False
+
+    def _get_subtask_progress(self) -> Dict[str, Any]:
+        """Compute current subtask completion progress.
+
+        Returns dict with:
+            condition_type, direction, threshold, current_value, progress_pct, description
+        Used by AnalysisAgent to maintain subtask-level goal awareness.
+        """
+        if not self._current_subtask:
+            return {"available": False}
+
+        cc = self._current_subtask.get("completion_condition")
+        if not cc:
+            return {"available": False}
+
+        cc_type = cc.get("type", "")
+        desc = self._current_subtask.get("description", "")
+        result = {"available": True, "type": cc_type, "description": desc}
+
+        if cc_type == "y_change":
+            direction = cc.get("direction", "down")
+            threshold = cc.get("threshold", cc.get("min_change", 1.5))
+            # Calculate Y change since subtask started
+            start_y = None
+            if len(self._history) > 1:
+                # Find the history entry closest to when this subtask started
+                start_y = self._history[0].get("position", [0,0,0])[1]
+            current_y = self._position[1] if self._position else 0
+            y_change = abs(current_y - start_y) if start_y is not None else 0
+            progress = min(1.0, y_change / threshold) if threshold > 0 else 0
+
+            result.update({
+                "direction": direction,
+                "threshold": threshold,
+                "current_y_change": round(y_change, 2),
+                "progress_pct": round(progress * 100),
+                "hint": f"Subtask is {round(progress*100)}% complete. "
+                        f"Need {direction} movement: {y_change:.1f}m / {threshold:.1f}m. "
+                        f"{'KEEP GOING' if progress < 0.9 else 'ALMOST DONE'}"
+            })
+
+        elif cc_type == "rotation":
+            threshold = cc.get("threshold", cc.get("min_degrees", 70))
+            result["hint"] = f"Need rotation of {threshold}°"
+
+        return result
 
     def _classify_dynamic_difficulty(
         self,

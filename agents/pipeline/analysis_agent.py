@@ -88,6 +88,7 @@ class AnalysisAgent(SubAgent):
         prev_result: Optional[dict] = None,
         static_difficulty: str = "medium",
         dynamic_difficulty: str = "easy",
+        subtask_progress: Optional[dict] = None,
     ) -> AnalysisOutput:
         """Process observation and produce analysis output.
 
@@ -101,6 +102,7 @@ class AnalysisAgent(SubAgent):
             prev_result: Optional previous analysis result
             static_difficulty: Pre-computed static difficulty (easy/medium/hard)
             dynamic_difficulty: Runtime dynamic difficulty (easy/medium/hard)
+            subtask_progress: Current subtask completion progress dict
 
         Returns:
             AnalysisOutput with goal analysis and action recommendation
@@ -118,7 +120,7 @@ class AnalysisAgent(SubAgent):
 
         # Execute corresponding strategy (LLM-based)
         if strategy == "cot":
-            result = self._cot_analysis(observation, subtask, history)
+            result = self._cot_analysis(observation, subtask, history, subtask_progress)
         elif strategy == "debate_light":
             result = self._debate_analysis(observation, subtask, history, mode=self.DEBATE_LIGHT)
         elif strategy == "debate_standard":
@@ -128,7 +130,7 @@ class AnalysisAgent(SubAgent):
         elif strategy == "reflection":
             result = self._reflection_analysis(observation, subtask, history, prev_result)
         else:
-            result = self._cot_analysis(observation, subtask, history)
+            result = self._cot_analysis(observation, subtask, history, subtask_progress)
 
         # Track debate history
         if "debate" in strategy:
@@ -258,6 +260,7 @@ class AnalysisAgent(SubAgent):
         observation: ObservationOutput,
         subtask,
         history: List[dict],
+        subtask_progress: Optional[dict] = None,
     ) -> dict:
         """Chain of Thought analysis - LLM core.
 
@@ -267,11 +270,12 @@ class AnalysisAgent(SubAgent):
             observation: Current observation
             subtask: Current subtask
             history: Navigation history
+            subtask_progress: Optional subtask completion progress
 
         Returns:
             Analysis result dictionary
         """
-        prompt = self._build_cot_prompt(observation, subtask, history)
+        prompt = self._build_cot_prompt(observation, subtask, history, subtask_progress)
         # Use strong model for better reasoning quality
         model = self.config.get("strong_model_key", "qwen3.6-35b-strong")
         response = self._call_llm(prompt, max_tokens=400, temperature=0.3,
@@ -284,19 +288,34 @@ class AnalysisAgent(SubAgent):
         observation: ObservationOutput,
         subtask,
         history: List[dict],
+        subtask_progress: Optional[dict] = None,
     ) -> str:
-        """Build CoT analysis prompt.
+        """Build CoT analysis prompt with subtask progress awareness.
 
         Args:
             observation: Current observation
             subtask: Current subtask
             history: Navigation history
+            subtask_progress: Optional subtask completion progress
 
         Returns:
             Prompt string for LLM
         """
         # Extract history info
         history_summary = self._summarize_history(history)
+
+        # Build subtask progress section
+        progress_section = ""
+        if subtask_progress and subtask_progress.get("available"):
+            progress_section = f"""
+## SUBTASK PROGRESS (CRITICAL)
+{subtask_progress.get('hint', '')}
+- Type: {subtask_progress.get('type', 'unknown')}
+- Current progress: {subtask_progress.get('progress_pct', 0)}%
+- Your job: keep working toward completing this subtask.
+  If progress < 50%, you MUST continue the same action direction.
+  If target not visible, explore to find it rather than switching goals.
+"""
 
         # Format objects with details
         objects_text = self._format_objects(observation.objects)
@@ -313,7 +332,7 @@ class AnalysisAgent(SubAgent):
 
 ## Navigation Goal
 Current subtask: {subtask.description if hasattr(subtask, 'description') else str(subtask)}
-
+{progress_section}
 ## Current Observation
 - Subtask relevant: {observation.subtask_relevant if hasattr(observation, 'subtask_relevant') else observation.task_relevant}
 - Instruction relevant: {observation.instruction_relevant if hasattr(observation, 'instruction_relevant') else False}

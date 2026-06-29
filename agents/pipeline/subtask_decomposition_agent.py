@@ -261,27 +261,48 @@ JSON output only:"""
     ) -> DecompositionOutput:
         """Create fallback single-subtask decomposition.
 
-        Args:
-            instruction: Original instruction
-            goal_position: Goal position
-
-        Returns:
-            DecompositionOutput with single subtask
+        Uses keyword detection to set appropriate completion condition type.
         """
-        return DecompositionOutput(
-            subtasks=[
-                {
+        # Smart fallback: detect stair/vertical keywords
+        cond_type = "distance_to_goal"
+        cond_threshold = 3.0
+        relevant_objects = []
+
+        instruction_lower = instruction.lower()
+        if any(kw in instruction_lower for kw in ["down", "up", "stairs", "stair"]):
+            cond_type = "y_change"
+            cond_threshold = 1.5
+            direction = "down" if "down" in instruction_lower else "up"
+            relevant_objects = ["stairs", "steps", "railing", "handrail"]
+            return DecompositionOutput(
+                subtasks=[{
                     "id": 1,
                     "description": instruction,
                     "completion_condition": {
-                        "type": "distance_to_goal",
-                        "threshold": 3.0,
+                        "type": "y_change",
+                        "direction": direction,
+                        "threshold": cond_threshold,
                         "goal_position": goal_position,
                     },
-                    "relevant_objects": [],
-                }
-            ],
-            reasoning="Fallback: No LLM available or LLM failed",
+                    "relevant_objects": relevant_objects,
+                }],
+                reasoning="Fallback: detected stair/vertical navigation instruction",
+                static_difficulty="hard",
+                difficulty_factors={"has_vertical_nav": True},
+            )
+
+        return DecompositionOutput(
+            subtasks=[{
+                "id": 1,
+                "description": instruction,
+                "completion_condition": {
+                    "type": "distance_to_goal",
+                    "threshold": cond_threshold,
+                    "goal_position": goal_position,
+                },
+                "relevant_objects": [],
+            }],
+            reasoning="Fallback: No LLM available",
             static_difficulty="medium",
             difficulty_factors={"fallback": True},
         )
