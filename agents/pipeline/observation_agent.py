@@ -240,16 +240,18 @@ JSON output only:"""
         """
         # 默认值 - 包含新字段
         defaults = {
-            "subtask_relevant": False,  # 新字段名（替代原task_relevant）
-            "instruction_relevant": False,  # 新增
-            "fallback_mode": False,  # 新增
-            "objects": [],  # List[Dict[str, Any]]
-            "exploration_hint": "",  # 新增
+            "subtask_relevant": False,
+            "instruction_relevant": False,
+            "fallback_mode": False,
+            "objects": [],
+            "exploration_hint": "",
             "target_direction": "unknown",
             "target_distance": "unknown",
             "path_blocked": False,
             "navigation_cues": [],
             "scene_description": "",
+            "stair_position": "none",
+            "stair_direction": "none",
         }
 
         if not response:
