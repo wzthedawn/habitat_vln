@@ -193,17 +193,14 @@ class Navigator(BaseAgent):
         """
         if self._model_manager is None:
             self.logger.warning("[Navigator] No ModelManager, using fallback decomposition")
-            return [
-                {
-                    "id": 1,
-                    "description": instruction,
-                    "completion_condition": {
-                        "type": "distance_to_goal",
-                        "threshold": 3.0,
-                        "goal_position": goal_position,
-                    },
-                }
-            ]
+            # Use smart fallback from SubtaskDecompositionAgent
+            from agents.pipeline.subtask_decomposition_agent import SubtaskDecompositionAgent
+            fb = SubtaskDecompositionAgent()._fallback_decomposition(instruction, goal_position)
+            # Update static difficulty
+            self._static_difficulty = fb.static_difficulty
+            self._difficulty_factors = fb.difficulty_factors
+            self.logger.info(f"[Navigator] Fallback: difficulty={fb.static_difficulty}, subtasks={len(fb.subtasks)}")
+            return fb.subtasks
 
         try:
             decomposition_output = self._registry.call(
@@ -228,17 +225,11 @@ class Navigator(BaseAgent):
             return decomposition_output.subtasks
         except Exception as e:
             self.logger.warning(f"[Navigator] Decomposition failed: {e}")
-            return [
-                {
-                    "id": 1,
-                    "description": instruction,
-                    "completion_condition": {
-                        "type": "distance_to_goal",
-                        "threshold": 3.0,
-                        "goal_position": goal_position,
-                    },
-                }
-            ]
+            from agents.pipeline.subtask_decomposition_agent import SubtaskDecompositionAgent
+            fb = SubtaskDecompositionAgent()._fallback_decomposition(instruction, goal_position)
+            self._static_difficulty = fb.static_difficulty
+            self._difficulty_factors = fb.difficulty_factors
+            return fb.subtasks
 
     def initialize_episode(
         self,
@@ -264,13 +255,10 @@ class Navigator(BaseAgent):
             self._subtasks = self._decompose_instruction(instruction, goal_position)
         else:
             # Fallback if no goal_position
-            self._subtasks = [
-                {
-                    "id": 1,
-                    "description": instruction,
-                    "completion_condition": None,
-                }
-            ]
+            from agents.pipeline.subtask_decomposition_agent import SubtaskDecompositionAgent
+            fb = SubtaskDecompositionAgent()._fallback_decomposition(instruction, [0,0,0])
+            self._subtasks = fb.subtasks
+            self._static_difficulty = fb.static_difficulty
 
         self._current_subtask_index = 0
         self._current_subtask = self._subtasks[0]
