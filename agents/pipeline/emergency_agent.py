@@ -234,11 +234,20 @@ class EmergencyAgent(SubAgent):
 
         observation_info = ""
         if observation and isinstance(observation, ObservationOutput):
+            # Format objects - handle both dict and string formats
+            obj_names = []
+            for obj in (observation.objects or []):
+                if isinstance(obj, dict):
+                    obj_names.append(obj.get('name', str(obj)))
+                else:
+                    obj_names.append(str(obj))
+            objects_str = ', '.join(obj_names) if obj_names else 'none'
+            cues_str = ', '.join(observation.navigation_cues) if observation.navigation_cues else 'none'
             observation_info = f"""
 - Scene: {observation.scene_description}
 - Path blocked: {observation.path_blocked}
-- Objects visible: {', '.join(observation.objects) if observation.objects else 'none'}
-- Navigation cues: {', '.join(observation.navigation_cues) if observation.navigation_cues else 'none'}
+- Objects visible: {objects_str}
+- Navigation cues: {cues_str}
 """
 
         prompt = f"""Assess the severity of this emergency event for a navigation robot.
@@ -365,7 +374,7 @@ Output ONLY a JSON object with severity level:
             observation_info = f"""
 ## Current Observation
 - Scene: {observation.scene_description}
-- Objects visible: {', '.join(observation.objects) if observation.objects else 'none'}
+- Objects visible: {', '.join(obj.get('name', str(obj)) if isinstance(obj, dict) else str(obj) for obj in observation.objects) if observation.objects else 'none'}
 - Target direction: {observation.target_direction}
 - Target distance: {observation.target_distance}
 - Navigation cues: {', '.join(observation.navigation_cues) if observation.navigation_cues else 'none'}
@@ -478,7 +487,7 @@ or
             observation_info = f"""
 ## Current Observation
 - Scene: {observation.scene_description}
-- Objects visible: {', '.join(observation.objects) if observation.objects else 'none'}
+- Objects visible: {', '.join(obj.get('name', str(obj)) if isinstance(obj, dict) else str(obj) for obj in observation.objects) if observation.objects else 'none'}
 - Target direction: {observation.target_direction}
 """
 
@@ -533,7 +542,7 @@ Output ONLY a JSON object with action sequence (3-10 actions):
             observation_info = f"""
 ## Current Observation
 - Scene: {observation.scene_description}
-- Objects visible: {', '.join(observation.objects) if observation.objects else 'none'}
+- Objects visible: {', '.join(obj.get('name', str(obj)) if isinstance(obj, dict) else str(obj) for obj in observation.objects) if observation.objects else 'none'}
 - Navigation cues: {', '.join(observation.navigation_cues) if observation.navigation_cues else 'none'}
 """
 

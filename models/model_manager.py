@@ -152,17 +152,23 @@ class ModelManager:
 
     # Multi-server routing: model_key → (server_url, use_openai)
     # Matches the 3-server deployment in scripts/start_vllm_multi.sh
+    # TODO: uncomment multi-server config once all 3 servers are running
     MODEL_SERVER_MAP = {
-        "qwen3-vl-8b":           ("http://localhost:8000", True),   # GPU 0
-        "qwen3.5-9b-fast":       ("http://localhost:8001", True),   # GPU 1
-        "qwen3.6-35b-strong":    ("http://localhost:8002", True),   # GPU 2+3
-        # Backward compat aliases → fast server
-        "qwen-9b":               ("http://localhost:8001", True),
-        "qwen-9b-perception":    ("http://localhost:8001", True),
-        "qwen-9b-decision":      ("http://localhost:8001", True),
-        "qwen-9b-instruction":   ("http://localhost:8001", True),
-        "qwen-9b-evaluation":    ("http://localhost:8001", True),
-        "qwen-9b-trajectory":    ("http://localhost:8001", True),
+        # Single-server mode (all models → GPU 0:8000, for testing)
+        "qwen3-vl-8b":           ("http://localhost:8000", True),
+        "qwen3.5-9b-fast":       ("http://localhost:8000", True),
+        "qwen3.6-35b-strong":    ("http://localhost:8000", True),
+        # Backward compat aliases
+        "qwen-9b":               ("http://localhost:8000", True),
+        "qwen-9b-perception":    ("http://localhost:8000", True),
+        "qwen-9b-decision":      ("http://localhost:8000", True),
+        "qwen-9b-instruction":   ("http://localhost:8000", True),
+        "qwen-9b-evaluation":    ("http://localhost:8000", True),
+        "qwen-9b-trajectory":    ("http://localhost:8000", True),
+        # Multi-server mode (uncomment when all servers are up):
+        # "qwen3-vl-8b":           ("http://localhost:8000", True),   # GPU 0
+        # "qwen3.5-9b-fast":       ("http://localhost:8001", True),   # GPU 1
+        # "qwen3.6-35b-strong":    ("http://localhost:8002", True),   # GPU 2+3
     }
 
     def __new__(cls, config: Dict[str, Any] = None):
@@ -220,6 +226,27 @@ class ModelManager:
         else:
             mode = "local"
         self.logger.info(f"ModelManager initialized (device={self.device}, int8={self.use_int8}, mode={mode})")
+
+    def _resolve_served_name(self, model_key: str) -> str:
+        """Resolve the actual served model name on the vLLM server.
+
+        When all models share one vLLM instance (single-server mode),
+        all keys map to the same served name. In multi-server mode,
+        each server has its own served name.
+
+        Args:
+            model_key: Internal model key
+
+        Returns:
+            Model name string to send to vLLM server
+        """
+        # In single-server mode, everything goes to qwen3.5-9b-fast
+        # In multi-server mode, the key itself is the served name
+        # When all servers point to the same URL, use unified name
+        unique_servers = set(url for url, _ in self.MODEL_SERVER_MAP.values())
+        if len(unique_servers) == 1:
+            return "qwen3.5-9b-fast"
+        return model_key
 
     def _get_client_for_model(self, model_key: str):
         """Get or create a RemoteLLMClient for the given model_key.
@@ -575,7 +602,7 @@ class ModelManager:
 
         try:
             result = client.generate_sync(
-                model=model_key,
+                model=self._resolve_served_name(model_key),
                 prompt=prompt,
                 max_new_tokens=max_new_tokens,
                 temperature=temperature,
@@ -629,7 +656,7 @@ class ModelManager:
             result = vlm_client.generate_vision(
                 image=image,
                 prompt=prompt,
-                model=model_key,
+                model=self._resolve_served_name(model_key),
                 max_new_tokens=max_new_tokens,
                 temperature=temperature,
                 seed=seed_value,
@@ -691,7 +718,7 @@ class ModelManager:
                 rgb_image=rgb_image,
                 depth_image=depth_image,
                 prompt=prompt,
-                model=model_key,
+                model=self._resolve_served_name(model_key),
                 max_new_tokens=max_new_tokens,
                 temperature=temperature,
                 seed=seed_value,
@@ -872,9 +899,9 @@ class ModelManager:
             self.logger.error(f"No client for model_key: {model_key}")
             return ""
 
-        # Resolve served model name from server map
-        server_info = self.MODEL_SERVER_MAP.get(model_key, (self.remote_server_url, True))
-        remote_model_key = model_key  # vLLM uses --served-model-name to map
+        # Map model_key to the actual served model name on the vLLM server
+        # When using single-server, all keys → "qwen3.5-9b-fast"
+        remote_model_key = self._resolve_served_name(model_key)
 
         config = self.MODEL_CONFIGS.get(model_key, {})
         if max_new_tokens is None:

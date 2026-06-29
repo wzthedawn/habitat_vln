@@ -70,6 +70,7 @@ class PlanningOutput:
     actions: List[str]  # Action sequence (typically 5 actions)
     expected_result: str  # Expected result after executing actions
     algorithm_used: str  # Algorithm used (llm/topology/hybrid)
+    decision_source: str = "llm"  # Which source influenced the decision most
     path: Optional[List] = None  # Path nodes (for topology planning)
 
 
