@@ -771,8 +771,9 @@ class Navigator(BaseAgent):
             # Average depth in central region
             avg_depth = np.mean(center_region) if center_region.size > 0 else 999.0
 
-            # Obstacle if average depth < 1.5m (very close obstacle)
-            obstacle_threshold = 1.5
+            # Obstacle if average depth < 0.8m (only very close obstacles)
+            # Increased from 1.5m to avoid false positives near walls
+            obstacle_threshold = 0.8
             blocked = avg_depth < obstacle_threshold
 
             if blocked:

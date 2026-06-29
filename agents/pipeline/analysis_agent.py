@@ -146,6 +146,11 @@ class AnalysisAgent(SubAgent):
 
         result["strategy_used"] = strategy
 
+        # Always print key decision for visibility
+        print(f"\n[AnalysisAgent] strategy={strategy} action={result.get('recommended_action')} "
+              f"confidence={result.get('confidence', 0):.2f} "
+              f"reasoning={result.get('reasoning', '')[:100]}")
+
         return AnalysisOutput(**result)
 
     def _resolve_difficulty(self, static: str, dynamic: str) -> str:

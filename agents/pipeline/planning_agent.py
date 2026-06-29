@@ -94,6 +94,8 @@ class PlanningAgent(SubAgent):
         # Add algorithm_used to result
         result["algorithm_used"] = algorithm
 
+        print(f"[PlanningAgent] algo={algorithm} actions={result.get('actions', [])}")
+
         return PlanningOutput(**result)
 
     def _select_algorithm(self, topology: TopologyGraph, goal: Optional[List[float]]) -> str:
