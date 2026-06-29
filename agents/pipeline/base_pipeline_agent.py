@@ -203,17 +203,21 @@ class SubAgent(BaseAgent):
         self,
         prompt: str,
         images: List,
-        max_tokens: int = 300,
+        max_tokens: int = 400,
         temperature: float = 0.2,
+        model_key: str = None,
         **kwargs,
     ) -> Dict[str, Any]:
         """Call VLM for vision-language generation.
 
+        Uses RGB+depth dual-image mode by default, routed to dedicated VLM server.
+
         Args:
             prompt: Input prompt text
-            images: List of images (PIL Image or numpy array)
+            images: List of [rgb_image, depth_image] (numpy arrays)
             max_tokens: Maximum tokens to generate
             temperature: Sampling temperature
+            model_key: VLM model key (default: "qwen3-vl-8b" → GPU 1:8001)
             **kwargs: Additional generation parameters
 
         Returns:
@@ -225,30 +229,27 @@ class SubAgent(BaseAgent):
         if self._model_manager is None:
             raise RuntimeError("ModelManager not set")
 
-        # TEMPORARY: Use single RGB image only (skip depth) to fix VLM recognition
-        if len(images) >= 1:
-            return self._model_manager.generate_vision(
-                image=images[0],
-                prompt=prompt,
-                max_new_tokens=max_tokens,
-                temperature=temperature,
-                **kwargs,
-            )
-        elif len(images) == 2 and hasattr(self._model_manager, "generate_vision_dual"):
+        resolved_key = model_key or self.config.get("model_key", "qwen3-vl-8b")
+
+        # Use RGB+depth dual-image mode for Qwen3-VL-8B
+        if len(images) >= 2:
             return self._model_manager.generate_vision_dual(
                 rgb_image=images[0],
                 depth_image=images[1],
                 prompt=prompt,
+                model_key=resolved_key,
+                max_new_tokens=max_tokens,
+                temperature=temperature,
+                **kwargs,
+            )
+        elif len(images) == 1:
+            return self._model_manager.generate_vision(
+                image=images[0],
+                prompt=prompt,
+                model_key=resolved_key,
                 max_new_tokens=max_tokens,
                 temperature=temperature,
                 **kwargs,
             )
         else:
-            # Fallback to single image processing
-            return self._model_manager.generate_vision(
-                image=images[0],
-                prompt=prompt,
-                max_new_tokens=max_tokens,
-                temperature=temperature,
-                **kwargs,
-            )
+            raise ValueError("No images provided to _call_vlm")
