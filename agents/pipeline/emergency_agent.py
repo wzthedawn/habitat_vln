@@ -143,17 +143,35 @@ class EmergencyAgent(SubAgent):
                 details={"collision": True, "source": "collision"},
             )
 
-        # 3. 路径受阻检测 - DISABLED
-        # VLM 容易误判地面物体（地毯、地板纹理）为障碍
-        # 只有实际碰撞才触发 emergency，避免频繁误触发
-        # if observation and isinstance(observation, ObservationOutput):
-        #     if observation.path_blocked:
-        #         self.logger.info("[EmergencyAgent] Path blocked detected from observation")
-        #         return EmergencyEvent(
-        #             type="obstacle",
-        #             severity="low",
-        #             details={"path_blocked": True, "source": "observation"},
-        #         )
+        # 3. 路径受阻检测 - 深度图规则 + VLM交叉验证
+        # 深度图检测：前方区域深度值持续低于阈值 → 有障碍物
+        # 结合VLM的path_blocked信号（需连续两帧确认，避免地毯误判）
+        depth_blocked = context.get("depth_blocked", False)
+        vlm_blocked = False
+        if observation and isinstance(observation, ObservationOutput):
+            vlm_blocked = observation.path_blocked
+
+        # VLM path_blocked needs 2 consecutive confirmations to rule out false positives
+        if vlm_blocked:
+            if not hasattr(self, '_vlm_blocked_count'):
+                self._vlm_blocked_count = 0
+            self._vlm_blocked_count += 1
+            if self._vlm_blocked_count < 2:
+                self.logger.debug("[EmergencyAgent] VLM path_blocked: waiting for confirmation")
+                vlm_blocked = False  # Not confirmed yet
+        else:
+            self._vlm_blocked_count = 0
+
+        # Trigger if depth confirms obstacle OR VLM confirms twice
+        if depth_blocked or vlm_blocked:
+            source = "depth" if depth_blocked else "vlm_2frame"
+            self.logger.info(f"[EmergencyAgent] Path blocked detected from {source}")
+            return EmergencyEvent(
+                type="obstacle",
+                severity="medium",
+                details={"path_blocked": True, "source": source,
+                         "depth_blocked": depth_blocked, "vlm_blocked": vlm_blocked},
+            )
 
         # 无应急
         return None

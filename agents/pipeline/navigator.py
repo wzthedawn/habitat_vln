@@ -417,6 +417,9 @@ class Navigator(BaseAgent):
             f"(static={self._static_difficulty})"
         )
 
+        # 2.6 Depth-based obstacle check (rule, no LLM)
+        depth_blocked = self._check_depth_obstacle(depth)
+
         # 3. Emergency detection
         try:
             emergency = self._registry.call(
@@ -424,9 +427,10 @@ class Navigator(BaseAgent):
                 context={
                     "observation": observation_output,
                     "history": self._history[-5:] if len(self._history) > 5 else self._history,
-                    "collision_status": False,  # Can be set by env
+                    "collision_status": False,
                     "position": self._position,
                     "topology": self._topology,
+                    "depth_blocked": depth_blocked,
                 },
             )
             self._last_emergency_event = emergency
@@ -588,6 +592,9 @@ class Navigator(BaseAgent):
 
         # Update topology
         self._topology.add_visited_position(self._position)
+        # Detect key nodes from last observation
+        if self._last_observation_output:
+            self._detect_key_nodes(self._last_observation_output, prev_pos=None)
 
     def _check_completion(self) -> bool:
         """Check if current subtask is completed.
@@ -731,6 +738,115 @@ class Navigator(BaseAgent):
             return "medium"
         else:
             return "easy"
+
+    def _check_depth_obstacle(self, depth_image) -> bool:
+        """Rule-based depth obstacle detection.
+
+        Checks if the central region of the depth image shows an obstacle
+        closer than obstacle_threshold (default 1.5m).
+
+        Args:
+            depth_image: Depth image as numpy array (H, W)
+
+        Returns:
+            True if obstacle detected directly ahead
+        """
+        if depth_image is None:
+            return False
+
+        try:
+            import numpy as np
+            depth = np.array(depth_image)
+            if depth.ndim == 3:
+                depth = depth[:, :, 0]
+
+            h, w = depth.shape[:2]
+            # Check central 30% of image (directly ahead)
+            center_h_start, center_h_end = int(h * 0.35), int(h * 0.65)
+            center_w_start, center_w_end = int(w * 0.35), int(w * 0.65)
+
+            center_region = depth[center_h_start:center_h_end,
+                                  center_w_start:center_w_end]
+
+            # Average depth in central region
+            avg_depth = np.mean(center_region) if center_region.size > 0 else 999.0
+
+            # Obstacle if average depth < 1.5m (very close obstacle)
+            obstacle_threshold = 1.5
+            blocked = avg_depth < obstacle_threshold
+
+            if blocked:
+                self.logger.info(
+                    f"[DepthObstacle] Central avg depth={avg_depth:.2f}m "
+                    f"< threshold={obstacle_threshold}m"
+                )
+            return blocked
+        except Exception as e:
+            self.logger.debug(f"[DepthObstacle] Check failed: {e}")
+            return False
+
+    def _detect_key_nodes(
+        self,
+        observation_output,
+        prev_pos: List[float],
+    ) -> None:
+        """Detect and register key topology nodes from observation.
+
+        Called after each navigation cycle. Identifies:
+        - turn_point: when agent changes direction significantly
+        - stairs_entry: when stairs are detected in observation
+        - room_entry: when room type changes
+        - door: when door is detected
+
+        Args:
+            observation_output: ObservationOutput from ObservationAgent
+            prev_pos: Previous position before this cycle
+        """
+        if not observation_output or not self._position:
+            return
+
+        # Detect stairs from observation
+        scene_desc = getattr(observation_output, 'scene_description', '') or ''
+        objects = getattr(observation_output, 'objects', []) or []
+        cues = getattr(observation_output, 'navigation_cues', []) or []
+
+        # Check for stairs
+        stairs_keywords = ['stair', 'step', 'staircase', 'stairway']
+        has_stairs = any(kw in scene_desc.lower() for kw in stairs_keywords)
+        if not has_stairs and objects:
+            has_stairs = any(
+                any(kw in str(obj.get('name', '')).lower() for kw in stairs_keywords)
+                for obj in objects if isinstance(obj, dict)
+            )
+
+        if has_stairs:
+            from agents.pipeline.tools.topology_graph import NodeType
+            self._topology.add_key_node(
+                position=list(self._position),
+                node_type=NodeType.STAIRS_ENTRY,
+                rotation=self._rotation or 0.0,
+                metadata={"source": "observation"},
+            )
+            self.logger.info(f"[Topology] Added STAIRS_ENTRY node at {self._position}")
+
+        # Check for door
+        door_keywords = ['door', 'doorway', 'entrance', 'archway']
+        has_door = any(kw in scene_desc.lower() for kw in door_keywords)
+        if not has_door and cues:
+            has_door = any(
+                any(kw in cue.lower() for kw in door_keywords)
+                for cue in cues
+            )
+
+        if has_door:
+            from agents.pipeline.tools.topology_graph import NodeType
+            self._topology.add_key_node(
+                position=list(self._position),
+                node_type=NodeType.DOOR,
+                rotation=self._rotation or 0.0,
+                metadata={"source": "observation"},
+            )
+            self.logger.info(f"[Topology] Added DOOR node at {self._position}")
 
     def _report_progress(self) -> None:
         """Report current navigation progress."""

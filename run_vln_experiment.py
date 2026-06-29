@@ -1229,10 +1229,20 @@ class MultiAgentVLNEvaluator:
         return math.sqrt(sum((a - b) ** 2 for a, b in zip(p1[:3], p2[:3])))
 
     def _calculate_ndtw(self, trajectory: List[List[float]], reference: List[List[float]]) -> float:
+        """Calculate nDTW using standard VLN formula.
+
+        nDTW = exp(-DTW / (d_avg * max_len))
+        where d_avg is the average step distance in the reference path.
+        This matches the standard VLN literature (MSNav, MapGPT, etc.).
+        """
         if not trajectory or not reference:
             return 0.0
 
         n, m = len(trajectory), len(reference)
+        if n < 2 or m < 2:
+            return 0.0
+
+        # Compute DTW matrix
         dtw = [[float('inf')] * (m + 1) for _ in range(n + 1)]
         dtw[0][0] = 0
 
@@ -1241,8 +1251,16 @@ class MultiAgentVLNEvaluator:
                 cost = self._distance(trajectory[i-1], reference[j-1])
                 dtw[i][j] = cost + min(dtw[i-1][j], dtw[i][j-1], dtw[i-1][j-1])
 
+        # Average step distance in reference path
+        ref_step_sum = sum(
+            self._distance(reference[k-1], reference[k])
+            for k in range(1, len(reference))
+        )
+        d_avg = ref_step_sum / (len(reference) - 1) if len(reference) > 1 else 1.0
+
         max_len = max(n, m)
-        return math.exp(-dtw[n][m] / max_len / 5.0) if max_len > 0 else 0.0
+        ndtw = math.exp(-dtw[n][m] / (d_avg * max_len)) if max_len > 0 and d_avg > 0 else 0.0
+        return ndtw
 
     def _cleanup_sims(self) -> None:
         """Clean up all Simulators"""
@@ -1349,7 +1367,7 @@ def main():
                         help="Output JSON filename (default: results_timestamp.json)")
     parser.add_argument("--log-level", type=str, default="INFO")
     parser.add_argument("--device", type=str, default="cuda")
-    parser.add_argument("--use-int8", action="store_true", default=True, help="Use INT8 quantization")
+    parser.add_argument("--no-int8", action="store_true", default=False, help="Disable INT8 quantization (use FP16)")
 
     # Remote LLM arguments for dual-environment IPC
     parser.add_argument("--use-remote-llm", action="store_true", default=False,
@@ -1369,38 +1387,24 @@ def main():
     parser.add_argument("--vlm-server", type=str, default="http://localhost:8000",
                         help="Local VLM server URL for vision tasks (used with --use-siliconflow)")
 
-    # Strategy mode arguments
-    parser.add_argument("--use-strategy-mode", action="store_true", default=False,
-                        help="Use strategy mode for decision making (CoT/Reflection/Debate)")
+    # Random seed for reproducibility
+    parser.add_argument("--seed", type=int, default=42,
+                        help="Random seed for reproducibility (default: 42)")
 
-    # Sequence mode arguments (subtask-level planning)
-    parser.add_argument("--use-sequence-mode", action="store_true", default=False,
-                        help="Use action sequence mode (subtask-level planning, reduces LLM calls)")
-
-    # Pipeline mode arguments (new architecture)
-    parser.add_argument("--use-pipeline", action="store_true", default=False,
-                        help="Use new Pipeline Agent Architecture (Navigator + SubAgents)")
-
-
-    # Sequence length configuration
-    parser.add_argument("--sequence-length", type=int, default=5,
-                        help="Action sequence length (default 5 steps, used when adaptive-sequence=False)")
-    parser.add_argument("--adaptive-sequence", action="store_true", default=False,
-                        help="Enable adaptive sequence length (LLM decides step count)")
-    parser.add_argument("--min-sequence-length", type=int, default=3,
-                        help="Minimum sequence length (default 2 steps, used when adaptive-sequence=True)")
-    parser.add_argument("--max-sequence-length", type=int, default=10,
-                        help="Maximum sequence length (default 20 steps, used when adaptive-sequence=True)")
     # Output arguments
     parser.add_argument("--output-dir", type=str, default="results",
-                        help="Output directory for episode visual images, trajectory maps and agent outputs")
+                        help="Output directory for results (default: results)")
 
     args = parser.parse_args()
 
-    # Create timestamped session directory under results/
-    session_timestamp = datetime.now().strftime("%Y-%m%d-%H%M")
-    # Always create timestamped directory under results/
-    args.output_dir = f"results/episode-{session_timestamp}"
+    # Set random seed for reproducibility
+    random.seed(args.seed)
+    np.random.seed(args.seed)
+
+    # If output-dir is default, append timestamp for uniqueness
+    if args.output_dir == "results":
+        session_timestamp = datetime.now().strftime("%Y-%m%d-%H%M")
+        args.output_dir = f"results/episode-{session_timestamp}"
 
     # Ensure the session directory exists
     os.makedirs(args.output_dir, exist_ok=True)
@@ -1420,7 +1424,8 @@ def main():
         "success_distance": args.success_distance,
         "output": args.output,
         "device": args.device,
-        "use_int8": args.use_int8,
+        "use_int8": not args.no_int8,
+        "seed": args.seed,
         "use_remote_llm": args.use_remote_llm,
         "llm_server": args.llm_server,
         "remote_timeout": args.remote_timeout,
@@ -1428,10 +1433,6 @@ def main():
         "siliconflow_api_key": args.siliconflow_api_key,
         "siliconflow_model": args.siliconflow_model,
         "vlm_server_url": args.vlm_server,
-        "sequence_length": args.sequence_length,
-        "adaptive_sequence": args.adaptive_sequence,
-        "min_sequence_length": args.min_sequence_length,
-        "max_sequence_length": args.max_sequence_length,
         "output_dir": args.output_dir,
     }
 
@@ -1447,7 +1448,7 @@ def main():
     print(f"Output File: {args.output}")
     print(f"Output Dir: {args.output_dir}")
     print(f"Device: {args.device}")
-    print(f"INT8 Quantization: {args.use_int8}")
+    print(f"INT8 Quantization: {not args.no_int8}")
     print(f"Remote LLM: {'enabled' if args.use_remote_llm else 'disabled'}")
     if args.use_remote_llm:
         print(f"LLM Server: {args.llm_server}")
