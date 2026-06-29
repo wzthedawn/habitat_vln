@@ -405,8 +405,11 @@ class Navigator(BaseAgent):
             f"(static={self._static_difficulty})"
         )
 
-        # 2.6 Depth-based obstacle check (rule, no LLM)
-        depth_blocked = self._check_depth_obstacle(depth)
+        # 2.6 Depth-based obstacle check with smart escape direction
+        depth_info = self._check_depth_obstacle(depth)
+        self._last_depth_info = depth_info
+        if not depth_info.get("blocked", False):
+            self._clear_emergency_state()
 
         # 3. Emergency detection
         try:
@@ -418,7 +421,8 @@ class Navigator(BaseAgent):
                     "collision_status": False,
                     "position": self._position,
                     "topology": self._topology,
-                    "depth_blocked": depth_blocked,
+                    "depth_blocked": depth_info["blocked"],
+                    "depth_info": depth_info,
                 },
             )
             self._last_emergency_event = emergency
@@ -502,7 +506,10 @@ class Navigator(BaseAgent):
         event: EmergencyEvent,
         env,
     ) -> List[Tuple[ActionType, int]]:
-        """Handle emergency event.
+        """Handle emergency with two-tier escalation.
+
+        Tier 1: Smart escape (depth-guided direction, no LLM)
+        Tier 2: If Tier 1 fails 2+ times consecutively, backtrack via topology
 
         Args:
             event: EmergencyEvent
@@ -513,37 +520,50 @@ class Navigator(BaseAgent):
         """
         self.logger.warning(f"[Navigator] Handling emergency: type={event.type}, severity={event.severity}")
 
-        # Call EmergencyAgent.handle
-        emergency_agent = self._registry.get("emergency")
+        # Track consecutive emergencies
+        if not hasattr(self, '_consecutive_emergencies'):
+            self._consecutive_emergencies = 0
+        self._consecutive_emergencies += 1
 
+        emergency_agent = self._registry.get("emergency")
         if emergency_agent is None:
-            # Fallback: default obstacle bypass
             actions = self._action_converter.convert(["turn_left", "forward", "forward"])
             return actions
 
+        # Tier 2 escalation: backtrack if stuck in repeated emergencies
+        if self._consecutive_emergencies >= 3:
+            self.logger.warning(f"[Navigator] Tier 2 escalation: backtracking after {self._consecutive_emergencies} consecutive emergencies")
+            self._consecutive_emergencies = 0
+            # U-turn: turn around and move away
+            actions = self._action_converter.convert(
+                ["turn_left", "turn_left", "forward", "forward", "forward"]
+            )
+            return actions
+
+        # Tier 1: Smart escape with depth guidance
         try:
             emergency_actions = emergency_agent.handle(
                 event=event,
                 context={
                     "topology": self._topology,
                     "position": self._position,
-                    "observation": None,  # Can pass observation_output if needed
+                    "observation": self._last_observation_output,
+                    "depth_info": getattr(self, '_last_depth_info', {}),
                 },
             )
-
-            # Convert actions
             actions = self._action_converter.convert(emergency_actions)
-
-            # Ensure at least 5 actions for consistency
             if len(actions) < 5:
                 actions = self._action_converter.ensure_5_actions(actions)
-
             return actions
         except Exception as e:
             self.logger.error(f"[Navigator] Emergency handling failed: {e}")
-            # Fallback: turn and move
             actions = self._action_converter.convert(["turn_left", "forward", "forward", "forward", "forward"])
             return actions
+
+    def _clear_emergency_state(self) -> None:
+        """Reset emergency tracking (call when agent moves freely)."""
+        if hasattr(self, '_consecutive_emergencies'):
+            self._consecutive_emergencies = 0
 
     def _handle_emergency_command(self, command: Dict[str, Any]) -> None:
         """Handle user emergency command.
@@ -787,20 +807,29 @@ class Navigator(BaseAgent):
         else:
             return "easy"
 
-    def _check_depth_obstacle(self, depth_image) -> bool:
-        """Rule-based depth obstacle detection.
+    def _check_depth_obstacle(self, depth_image) -> Dict[str, Any]:
+        """Depth-based obstacle detection with escape direction analysis.
 
-        Checks if the central region of the depth image shows an obstacle
-        closer than obstacle_threshold (default 1.5m).
+        Checks central region for obstacles and analyzes left/right clearance
+        to recommend the best escape direction.
 
         Args:
             depth_image: Depth image as numpy array (H, W)
 
         Returns:
-            True if obstacle detected directly ahead
+            Dict with:
+                blocked: True if obstacle ahead
+                escape_direction: 'left' or 'right' (side with more clearance)
+                left_clearance: average depth on left side
+                right_clearance: average depth on right side
+                center_depth: average depth in center
         """
+        result = {"blocked": False, "escape_direction": "left",
+                  "left_clearance": 999.0, "right_clearance": 999.0,
+                  "center_depth": 999.0}
+
         if depth_image is None:
-            return False
+            return result
 
         try:
             import numpy as np
@@ -809,30 +838,41 @@ class Navigator(BaseAgent):
                 depth = depth[:, :, 0]
 
             h, w = depth.shape[:2]
-            # Check central 30% of image (directly ahead)
-            center_h_start, center_h_end = int(h * 0.35), int(h * 0.65)
-            center_w_start, center_w_end = int(w * 0.35), int(w * 0.65)
-
-            center_region = depth[center_h_start:center_h_end,
-                                  center_w_start:center_w_end]
-
-            # Average depth in central region
-            avg_depth = np.mean(center_region) if center_region.size > 0 else 999.0
-
-            # Obstacle if average depth < 0.8m (only very close obstacles)
-            # Increased from 1.5m to avoid false positives near walls
             obstacle_threshold = 0.8
-            blocked = avg_depth < obstacle_threshold
+
+            # Analyze three vertical strips: left(10-35%), center(35-65%), right(65-90%)
+            left_region = depth[int(h*0.3):int(h*0.7), int(w*0.10):int(w*0.35)]
+            center_region = depth[int(h*0.3):int(h*0.7), int(w*0.35):int(w*0.65)]
+            right_region = depth[int(h*0.3):int(h*0.7), int(w*0.65):int(w*0.90)]
+
+            center_depth = np.mean(center_region) if center_region.size > 0 else 999.0
+            left_depth = np.mean(left_region) if left_region.size > 0 else 999.0
+            right_depth = np.mean(right_region) if right_region.size > 0 else 999.0
+
+            blocked = center_depth < obstacle_threshold
+
+            # Choose escape direction based on which side has more clearance
+            escape_direction = "left" if left_depth >= right_depth else "right"
+
+            result.update({
+                "blocked": blocked,
+                "escape_direction": escape_direction,
+                "left_clearance": round(float(left_depth), 2),
+                "right_clearance": round(float(right_depth), 2),
+                "center_depth": round(float(center_depth), 2),
+            })
 
             if blocked:
                 self.logger.info(
-                    f"[DepthObstacle] Central avg depth={avg_depth:.2f}m "
-                    f"< threshold={obstacle_threshold}m"
+                    f"[DepthObstacle] BLOCKED center={center_depth:.2f}m, "
+                    f"left={left_depth:.2f}m, right={right_depth:.2f}m "
+                    f"→ escape {escape_direction}"
                 )
-            return blocked
+
+            return result
         except Exception as e:
             self.logger.debug(f"[DepthObstacle] Check failed: {e}")
-            return False
+            return result
 
     def _detect_key_nodes(
         self,

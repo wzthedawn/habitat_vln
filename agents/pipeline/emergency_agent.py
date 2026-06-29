@@ -44,6 +44,29 @@ class EmergencyAgent(SubAgent):
     DEFAULT_OBSTACLE_ACTIONS = ["turn_left", "forward", "forward"]
     DEFAULT_EVACUATE_ACTIONS = ["turn_left", "turn_left", "forward", "forward", "forward"]
 
+    def _get_smart_escape_actions(self, depth_info: Dict[str, Any]) -> List[str]:
+        """Generate smart escape actions based on depth clearance analysis.
+
+        Turns toward the side with more open space, not blindly left.
+
+        Args:
+            depth_info: Dict from Navigator._check_depth_obstacle() with
+                       escape_direction, left/right_clearance, center_depth
+
+        Returns:
+            Action sequence list
+        """
+        direction = depth_info.get("escape_direction", "left")
+        left = depth_info.get("left_clearance", 0)
+        right = depth_info.get("right_clearance", 0)
+
+        if direction == "right":
+            self.logger.info(f"[Emergency] Smart escape: turning RIGHT (L={left:.1f}m, R={right:.1f}m)")
+            return ["turn_right", "forward", "forward"]
+        else:
+            self.logger.info(f"[Emergency] Smart escape: turning LEFT (L={left:.1f}m, R={right:.1f}m)")
+            return ["turn_left", "forward", "forward"]
+
     def __init__(self, config: Dict[str, Any] = None):
         """Initialize EmergencyAgent.
 
@@ -330,7 +353,7 @@ Output ONLY a JSON object with severity level:
         return "medium"
 
     def _handle_obstacle(self, event: EmergencyEvent, context: dict) -> List[str]:
-        """LLM决策障碍绕行。
+        """障碍绕行决策（深度智能选向 + LLM辅助）。
 
         Args:
             event: EmergencyEvent (type=obstacle)
@@ -339,7 +362,12 @@ Output ONLY a JSON object with severity level:
         Returns:
             动作序列
         """
-        # 有ModelManager时，使用LLM决策
+        # Priority 1: Use depth-based smart escape direction (zero LLM, fast)
+        depth_info = context.get("depth_info", {})
+        if depth_info.get("escape_direction"):
+            return self._get_smart_escape_actions(depth_info)
+
+        # Priority 2: LLM决策（depth info不可用时）
         if self._model_manager is not None:
             try:
                 prompt = self._build_obstacle_prompt(event, context)
