@@ -238,7 +238,8 @@ class PlanningAgent(SubAgent):
             astar_info, nearby_nodes
         )
 
-        response = self._call_llm(prompt, max_tokens=400, temperature=0.3)
+        mk = self.config.get("strong_model_key", self.config.get("model_key", "qwen3.5-9b-fast"))
+        response = self._call_llm(prompt, max_tokens=400, temperature=0.5, model_key=mk)
         return self._parse_response(response)
 
     def _build_llm_prompt(
@@ -380,9 +381,18 @@ Generate exactly 5 actions. Apply rules above.
 Output only valid JSON:
 {{"actions": ["action1", "action2", "action3", "action4", "action5"], "expected_result": "description", "decision_source": "fallback|topology|astar|analysis|hybrid"}}
 
+## ANTI-TEMPLATE RULE (critical)
+Do NOT always output the same pattern. Vary your sequences based on the situation:
+- If the observation shows a clear path ahead → more forwards
+- If the observation shows walls/obstacles → more turns to explore
+- If the target is to the left → turn_left then forward
+- If the target is to the right → turn_right then forward
+- If you just turned and got stuck → try the opposite direction next time
+
 ## Rules
 - actions must contain exactly 5 items
 - Each action must be one of: forward, turn_left, turn_right
+- VARY your pattern based on observation, do NOT repeat the same template
 - First action(s) MUST be turns if target is not directly forward
 - For stairs: if stuck, vary approach angle, don't repeat same heading
 - decision_source indicates which information source influenced your decision most

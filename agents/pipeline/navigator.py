@@ -162,7 +162,7 @@ class Navigator(BaseAgent):
             }
         ))
         self._registry.register("planning", PlanningAgent(
-            config={"model_key": mc["planning"]}
+            config={"model_key": mc["planning"], "strong_model_key": mc["analysis_strong"]}
         ))
         self._registry.register("review", ReviewAgent(
             config={"model_key": mc["review"]}
@@ -493,11 +493,30 @@ class Navigator(BaseAgent):
                         hasattr(observation_output, 'stair_position') and
                         observation_output.stair_position in ("top", "bottom"))
         if is_stair_nav:
-            # Limit to first 2-3 actions so agent re-observes frequently
             actions = actions[:3]
             self.logger.info(f"[Navigator] Stair mode: reduced to {len(actions)} actions for re-alignment")
         else:
             actions = self._action_converter.ensure_5_actions(actions)
+
+        # Anti-template: if same action pattern repeats 3+ times, force variation
+        action_names = [a[0].name if hasattr(a[0], 'name') else str(a[0]) for a in actions]
+        pattern = ''.join(a[0] for a in action_names[:2])  # first char of first 2 actions
+        if not hasattr(self, '_last_patterns'):
+            self._last_patterns = []
+        self._last_patterns.append(pattern)
+        if len(self._last_patterns) > 5:
+            self._last_patterns = self._last_patterns[-5:]
+        if len(self._last_patterns) >= 3 and len(set(self._last_patterns[-3:])) == 1:
+            self.logger.warning(f"[AntiTemplate] Pattern '{pattern}' repeated 3x, forcing variation")
+            # Flip the first action
+            from core.action import ActionType
+            if actions and len(actions) > 0:
+                old_first = actions[0][0]
+                new_first = (ActionType.TURN_RIGHT if old_first == ActionType.TURN_LEFT
+                             else ActionType.TURN_LEFT if old_first == ActionType.TURN_RIGHT
+                             else ActionType.TURN_LEFT)
+                actions[0] = (new_first, 1)
+            self._last_patterns = []
 
         return actions
 
