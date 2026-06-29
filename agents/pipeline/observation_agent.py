@@ -186,6 +186,13 @@ class ObservationAgent(SubAgent):
 2. Fallback: Objects from original instruction → if subtask objects NOT visible, check instruction-related objects
 3. Last fallback: Report blocking situation + suggest exploration direction
 
+## STAIR ANALYSIS (critical for navigation)
+If stairs are detected, you MUST determine:
+- stair_position: "top" (you are at the top looking down) or "bottom" (you are at the bottom looking up)
+- stair_direction: "ascend" (you need to go up) or "descend" (you need to go down)
+- Use depth colors to determine: if RED (close) is at the BOTTOM of the stairs = you're at the top.
+  If RED (close) is at the TOP of the stairs = you're at the bottom.
+
 ## Output Format (JSON only)
 {{
   "subtask_relevant": true/false,
@@ -205,7 +212,9 @@ class ObservationAgent(SubAgent):
   "target_distance": "close/medium/far/unknown",
   "path_blocked": true/false,
   "navigation_cues": ["cue1", "cue2"],
-  "scene_description": "brief description"
+  "scene_description": "brief description",
+  "stair_position": "top|bottom|none",
+  "stair_direction": "ascend|descend|none"
 }}
 
 ## Rules

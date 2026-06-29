@@ -35,6 +35,8 @@ class ObservationOutput:
     # Complex types (with defaults due to field ordering)
     objects: List[Dict[str, Any]] = field(default_factory=list)  # List of objects with features
     navigation_cues: List[str] = field(default_factory=list)  # Navigation cues for decision making
+    stair_position: str = "none"  # "top", "bottom", or "none"
+    stair_direction: str = "none"  # "ascend", "descend", or "none"
 
     # Compatibility alias for legacy code
     @property

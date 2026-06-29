@@ -317,6 +317,8 @@ Current subtask: {subtask.description if hasattr(subtask, 'description') else st
 ## Current Observation
 - Subtask relevant: {observation.subtask_relevant if hasattr(observation, 'subtask_relevant') else observation.task_relevant}
 - Instruction relevant: {observation.instruction_relevant if hasattr(observation, 'instruction_relevant') else False}
+- Stair position: {observation.stair_position if hasattr(observation, 'stair_position') else 'none'}
+- Stair direction: {observation.stair_direction if hasattr(observation, 'stair_direction') else 'none'}
 - Fallback mode: {observation.fallback_mode if hasattr(observation, 'fallback_mode') else False}
 - Detected objects (with details): {objects_text}
 - Exploration hint: {observation.exploration_hint if hasattr(observation, 'exploration_hint') else ''}
@@ -333,12 +335,17 @@ Current subtask: {subtask.description if hasattr(subtask, 'description') else st
 ## Analysis Steps
 1. Goal Summary: Identify the navigation goal in one sentence
 2. Current Gap: What is missing or blocking progress toward the goal?
-3. ALIGNMENT CHECK: If the subtask target (e.g. stairs, door) is detected with direction "forward_left" or "forward_right", you MUST turn to align with it BEFORE going forward.
-   - "forward_left" → turn_left 1-2 times, then forward
-   - "forward_right" → turn_right 1-2 times, then forward
-   - "left" → turn_left 2-3 times, then forward
-   - "right" → turn_right 2-3 times, then forward
-   - ONLY if direction="forward" → go straight forward
+3. ALIGNMENT CHECK: Turn to face the target BEFORE going forward.
+   - TARGET DIRECTION RULES:
+     "forward_left" → turn_left ×1, then forward
+     "forward_right" → turn_right ×1, then forward
+     "left" → turn_left ×2-3, then forward
+     "right" → turn_right ×2-3, then forward
+     ONLY "forward" → straight forward
+   - STAIR RULES:
+     stair_position=top + stair_direction=descend → MUST walk onto stairs (go forward toward them)
+     stair_position=bottom + stair_direction=ascend → MUST walk up stairs
+     If stairs are visible but you keep not descending → you may need to turn more to face the stairway entrance
 4. Reasoning: Explain the alignment and movement plan
 5. Action: Recommend one action: forward, turn_left, or turn_right
 
