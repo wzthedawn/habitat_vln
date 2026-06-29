@@ -155,18 +155,8 @@ class ObservationProcessor:
         Returns:
             Feature vector
         """
-        # Lazy load encoder
-        if self._visual_encoder is None:
-            try:
-                from models.visual_encoder import VisualEncoder
-                self._visual_encoder = VisualEncoder(self.config.get("encoder", {}))
-            except ImportError:
-                self.logger.warning("VisualEncoder not available")
-                return None
-
-        if "rgb" in observation:
-            return self._visual_encoder.encode_image(observation["rgb"])
-
+        # Visual feature extraction is now handled by VLM (ObservationAgent)
+        # This legacy path returns None — use ObservationAgent for perception
         return None
 
     def detect_objects(

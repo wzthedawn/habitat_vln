@@ -110,16 +110,20 @@ class BaseAgent(ABC):
         """
         Get appropriate model for the task.
 
+        Note: Pipeline architecture uses ModelManager directly via _call_llm/_call_vlm.
+        This method is retained for backward compatibility only.
+
         Args:
             task_type: Optional task type for model selection
 
         Returns:
-            Model instance
+            Model instance (None if ModelManager not available)
         """
-        from models.model_selector import ModelSelector
-
-        selector = ModelSelector(self.config.get("model_selector", {}))
-        return selector.select_model(task_type or "Type-1")
+        try:
+            from models.model_manager import get_model_manager
+            return get_model_manager(self.config)
+        except Exception:
+            return None
 
     def validate_context(self, context: NavContext) -> List[str]:
         """

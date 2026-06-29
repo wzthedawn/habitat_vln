@@ -1,7 +1,6 @@
 # Core modules
 from .context import NavContext, SubTask, NavContextBuilder
 from .action import Action, ActionType
-from .navigator import VLNNavigator
 
 __all__ = [
     "NavContext",
@@ -9,5 +8,4 @@ __all__ = [
     "NavContextBuilder",
     "Action",
     "ActionType",
-    "VLNNavigator",
 ]

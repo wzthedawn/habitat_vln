@@ -1,4 +1,4 @@
-"""Default configuration for VLN system."""
+"""Default configuration for VLN Pipeline system."""
 
 from typing import Dict, Any
 import yaml
@@ -7,7 +7,7 @@ from pathlib import Path
 
 def get_default_config() -> Dict[str, Any]:
     """
-    Get default configuration for the VLN system.
+    Get default configuration for the VLN Pipeline system.
 
     Returns:
         Configuration dictionary
@@ -15,72 +15,62 @@ def get_default_config() -> Dict[str, Any]:
     return {
         # System settings
         "system": {
-            "name": "Multi-Agent VLN Navigator",
-            "version": "1.0.0",
+            "name": "Pipeline VLN Navigator",
+            "version": "2.0.0",
             "log_level": "INFO",
         },
 
         # Navigation settings
         "navigation": {
-            "max_steps": 500,
+            "max_steps": 150,
             "stop_distance": 0.2,
-            "turn_angle": 15.0,  # degrees
-            "collision_threshold": 0.1,
+            "turn_angle": 15.0,
+            "success_distance": 3.0,
         },
 
-        # Classifier settings
-        "classifier": {
-            "rule_threshold": 0.9,
-            "use_llm_fallback": True,
-            "cache_results": True,
-        },
-
-        # Supernet settings
-        "supernet": {
-            "architecture_search": False,
-            "adaptive_selection": True,
-        },
-
-        # Agent settings
-        "agents": {
-            "default_model": "local",
-            "fallback_model": "llm",
-            "parallel_execution": False,
-        },
-
-        # Strategy settings
-        "strategies": {
-            "default_strategy": "ReAct",
-            "max_iterations": 10,
-            "timeout": 30.0,
-        },
-
-        # Optimization settings
-        "optimization": {
-            "context_compression": True,
-            "compression_level": "standard",
-            "cache_prompts": True,
-            "max_history_length": 50,
-        },
-
-        # Fallback settings
-        "fallback": {
-            "enabled": True,
-            "max_retries": 3,
-            "cascading_levels": 5,
-        },
-
-        # Model settings
-        "model": {
-            "local_model": {
-                "type": "clip",
-                "device": "cuda",
+        # Pipeline Agent configuration
+        "pipeline": {
+            "max_steps": 150,
+            "report_interval": 10,
+            "debate_mode": "standard",  # light | standard | deep
+            # Model key allocation per SubAgent
+            "model_configs": {
+                "decomposition": "qwen3.5-9b-fast",
+                "observation": "qwen3-vl-8b",
+                "analysis": "qwen3.5-9b-fast",
+                "analysis_strong": "qwen3.6-35b-strong",
+                "planning": "qwen3.6-35b-strong",
+                "review": "qwen3.5-9b-fast",
+                "emergency": "qwen3.5-9b-fast",
             },
-            "llm_model": {
-                "type": "gpt-4",
-                "max_tokens": 2000,
-                "temperature": 0.7,
-            },
+        },
+
+        # Difficulty grading thresholds
+        "difficulty": {
+            "static_hard_threshold": 6,
+            "static_medium_threshold": 3,
+            "dynamic_hard_threshold": 5,
+            "dynamic_medium_threshold": 2,
+        },
+
+        # Remote LLM settings
+        "remote_llm": {
+            "server_url": "http://localhost:8000",
+            "timeout": 120.0,
+            "use_siliconflow": False,
+        },
+
+        # Datasets
+        "datasets": {
+            "mp3d_path": "/data/WZ/Dataset/mp3d_dataset/mp3d",
+            "r2r_path": "/data/WZ/Dataset/r2r/v1/val_seen/val_seen.json",
+        },
+
+        # Output
+        "output": {
+            "dir": "results",
+            "enable_video": True,
+            "enable_trajectory": True,
         },
     }
 
@@ -102,7 +92,6 @@ def load_config(config_path: str) -> Dict[str, Any]:
     with open(path, "r") as f:
         config = yaml.safe_load(f)
 
-    # Merge with defaults
     default = get_default_config()
     return deep_merge(default, config)
 
