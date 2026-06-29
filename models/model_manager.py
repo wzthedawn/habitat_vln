@@ -156,6 +156,21 @@ class ModelManager:
         },
     }
 
+    # Multi-server routing: model_key → (server_url, use_openai)
+    # Matches the 3-server deployment in scripts/start_vllm_multi.sh
+    MODEL_SERVER_MAP = {
+        "qwen3-vl-8b":           ("http://localhost:8000", True),   # GPU 0
+        "qwen3.5-9b-fast":       ("http://localhost:8001", True),   # GPU 1
+        "qwen3.6-35b-strong":    ("http://localhost:8002", True),   # GPU 2+3
+        # Backward compat aliases → fast server
+        "qwen-9b":               ("http://localhost:8001", True),
+        "qwen-9b-perception":    ("http://localhost:8001", True),
+        "qwen-9b-decision":      ("http://localhost:8001", True),
+        "qwen-9b-instruction":   ("http://localhost:8001", True),
+        "qwen-9b-evaluation":    ("http://localhost:8001", True),
+        "qwen-9b-trajectory":    ("http://localhost:8001", True),
+    }
+
     def __new__(cls, config: Dict[str, Any] = None):
         """Singleton pattern for model manager."""
         if cls._instance is None:
@@ -188,8 +203,7 @@ class ModelManager:
         # Local VLM server for vision tasks (can be different from SiliconFlow)
         self.vlm_server_url = self.config.get("vlm_server_url", "http://localhost:8000")
 
-        self._remote_client = None
-        self._vlm_client = None  # Separate client for VLM
+        self._remote_clients: Dict[str, Any] = {}  # server_url → RemoteLLMClient
         self._remote_healthy = False
 
         # Model storage
@@ -213,16 +227,55 @@ class ModelManager:
             mode = "local"
         self.logger.info(f"ModelManager initialized (device={self.device}, int8={self.use_int8}, mode={mode})")
 
-    def _init_remote_client(self) -> bool:
-        """Initialize remote LLM client."""
-        try:
-            from models.remote_client import RemoteLLMClient
+    def _get_client_for_model(self, model_key: str):
+        """Get or create a RemoteLLMClient for the given model_key.
 
-            # Initialize SiliconFlow client for text LLM if enabled
+        Uses MODEL_SERVER_MAP to route each model to its correct server.
+        Creates one client per unique server_url (lazy, cached).
+
+        Args:
+            model_key: Model identifier
+
+        Returns:
+            RemoteLLMClient instance or None
+        """
+        from models.remote_client import RemoteLLMClient
+
+        # Look up server for this model
+        server_info = self.MODEL_SERVER_MAP.get(model_key)
+        if server_info is None:
+            # Unknown model key → use default server
+            server_url = self.remote_server_url
+            use_openai = True
+        else:
+            server_url, use_openai = server_info
+
+        # Return cached client if exists
+        if server_url in self._remote_clients:
+            return self._remote_clients[server_url]
+
+        # Create new client for this server
+        timeout = self.config.get("remote_timeout", 120.0)
+        client = RemoteLLMClient(
+            server_url=server_url,
+            timeout=timeout,
+            use_openai=use_openai,
+            use_siliconflow=False,
+        )
+        self._remote_clients[server_url] = client
+        self.logger.info(f"[MultiServer] Created client: {model_key} → {server_url}")
+        return client
+
+    def _init_remote_client(self) -> bool:
+        """Initialize remote LLM clients for all configured servers.
+
+        Pre-creates clients for each unique server in MODEL_SERVER_MAP.
+        """
+        try:
             if self.use_siliconflow:
-                # SiliconFlow needs longer timeout for large models
+                from models.remote_client import RemoteLLMClient
                 siliconflow_timeout = self.config.get("remote_timeout", 180.0)
-                self._remote_client = RemoteLLMClient(
+                sf_client = RemoteLLMClient(
                     server_url="https://api.siliconflow.cn",
                     timeout=siliconflow_timeout,
                     use_openai=False,
@@ -230,46 +283,44 @@ class ModelManager:
                     siliconflow_api_key=self.siliconflow_api_key,
                     siliconflow_model=self.siliconflow_model,
                 )
-                self.logger.info(f"Using SiliconFlow API for text LLM (timeout={siliconflow_timeout}s)")
+                # SiliconFlow handles all text models
+                for key in self.MODEL_SERVER_MAP:
+                    if "35b" not in key and "vl" not in key:
+                        server_info = self.MODEL_SERVER_MAP[key]
+                        self._remote_clients[server_info[0]] = sf_client
+                self.logger.info("Using SiliconFlow API for text LLM")
                 self._remote_healthy = True
-
-                # Initialize separate VLM client for local vLLM server (HTTP mode, not OpenAI mode)
-                vlm_timeout = self.config.get("vlm_timeout", 60.0)
-                self._vlm_client = RemoteLLMClient(
-                    server_url=self.vlm_server_url,
-                    timeout=vlm_timeout,
-                    use_openai=False,  # Use HTTP mode for custom vllm_server.py
-                    use_siliconflow=False,
-                    model_path=self.model_path,  # Dynamic model path override
-                )
-                self.logger.info(f"Using local VLM server (HTTP mode): {self.vlm_server_url}")
                 return True
-            else:
-                # Use vLLM server for all LLM (text + VLM)
-                # use_openai=True: use vLLM's native OpenAI-compatible API (/v1/chat/completions)
-                self._remote_client = RemoteLLMClient(
-                    server_url=self.remote_server_url,
-                    timeout=self.config.get("remote_timeout", 60.0),
-                    use_openai=True,  # Use vLLM's OpenAI-compatible API
-                    model_path=self.model_path,  # Dynamic model path override
+
+            # Standard multi-server: pre-create clients for each unique server
+            from models.remote_client import RemoteLLMClient
+            seen_servers = set()
+            for model_key, (server_url, use_openai) in self.MODEL_SERVER_MAP.items():
+                if server_url in seen_servers:
+                    continue
+                seen_servers.add(server_url)
+                timeout = self.config.get("remote_timeout", 120.0)
+                client = RemoteLLMClient(
+                    server_url=server_url,
+                    timeout=timeout,
+                    use_openai=use_openai,
                 )
+                self._remote_clients[server_url] = client
+                self.logger.info(f"[MultiServer] {server_url} → use_openai={use_openai}")
 
-            # Check server health
-            self._remote_healthy = self._remote_client.health_check()
-            if self._remote_healthy:
-                self.logger.info(f"Remote LLM server connected: {self.remote_server_url}")
-            else:
-                self.logger.warning(f"Remote LLM server not responding: {self.remote_server_url}")
-
-            return self._remote_healthy
+            # Quick health check on first server
+            if self._remote_clients:
+                first_url = next(iter(self._remote_clients))
+                self._remote_healthy = self._remote_clients[first_url].health_check()
+                self.logger.info(f"[MultiServer] {len(self._remote_clients)} servers configured, health={self._remote_healthy}")
+            return True
 
         except ImportError as e:
             self.logger.error(f"Failed to import RemoteLLMClient: {e}")
-            self.logger.error("Install with: pip install aiohttp or pip install requests")
             self.use_remote = False
             return False
         except Exception as e:
-            self.logger.error(f"Failed to initialize remote client: {e}")
+            self.logger.error(f"Failed to initialize remote clients: {e}")
             self.use_remote = False
             return False
 
@@ -468,7 +519,7 @@ class ModelManager:
         seed_value = seed if seed is not None else 42
 
         # Use remote generation if configured
-        if self.use_remote and self._remote_client:
+        if self.use_remote and self._remote_clients:
             return self._generate_remote(
                 model_key=model_key,
                 prompt=prompt,
@@ -498,14 +549,12 @@ class ModelManager:
         seed: Optional[int] = None,
         **kwargs
     ) -> str:
-        """
-        Synchronous generation using remote LLM server.
+        """Synchronous generation with multi-server routing.
 
-        This is a convenience method that wraps the remote client's generate_sync.
-        Primarily used by pipeline agents for synchronous LLM calls.
+        Used by Pipeline SubAgents via _call_llm().
 
         Args:
-            model_key: Model identifier
+            model_key: Model identifier (routed to correct GPU/server)
             prompt: Input prompt
             max_new_tokens: Maximum tokens to generate
             temperature: Sampling temperature
@@ -516,21 +565,13 @@ class ModelManager:
         Returns:
             Generated text string (empty string on failure)
         """
-        # Use fixed seed for deterministic output
         seed_value = seed if seed is not None else 42
 
-        if not self.use_remote or not self._remote_client:
-            self.logger.warning("generate_sync requires remote LLM mode")
-            # Fall back to regular generate for local mode
-            return self.generate(
-                model_key=model_key,
-                prompt=prompt,
-                max_new_tokens=max_new_tokens,
-                temperature=temperature,
-                lora_name=lora_name,
-                seed=seed_value,
-                **kwargs
-            )
+        # Route to correct server
+        client = self._get_client_for_model(model_key)
+        if client is None:
+            self.logger.error(f"generate_sync: no client for {model_key}")
+            return ""
 
         config = self.MODEL_CONFIGS.get(model_key, {})
         if max_new_tokens is None:
@@ -539,7 +580,7 @@ class ModelManager:
             temperature = config.get("temperature", 0.3)
 
         try:
-            result = self._remote_client.generate_sync(
+            result = client.generate_sync(
                 model=model_key,
                 prompt=prompt,
                 max_new_tokens=max_new_tokens,
@@ -548,7 +589,7 @@ class ModelManager:
             )
             return result.response if result and hasattr(result, 'response') else ""
         except Exception as e:
-            self.logger.error(f"generate_sync failed: {e}")
+            self.logger.error(f"generate_sync failed for {model_key}: {e}")
             return ""
 
     def generate_vision(
@@ -575,9 +616,9 @@ class ModelManager:
         Returns:
             Dictionary with 'response', 'objects', 'scene_description', 'nav_hint'
         """
-        # For VLM, use local vLLM server (not SiliconFlow)
-        vlm_client = self._vlm_client if self.use_siliconflow else self._remote_client
-        if not (self.use_remote or self.use_siliconflow) or not vlm_client:
+        # Route VLM to correct server via multi-server map
+        vlm_client = self._get_client_for_model(model_key)
+        if not vlm_client:
             self.logger.warning("VLM requires remote server mode or local VLM server")
             return self._get_vlm_fallback(prompt)
 
@@ -616,21 +657,20 @@ class ModelManager:
         rgb_image: Any,
         depth_image: Any,
         prompt: str,
-        model_key: str = "qwen-9b-perception",
+        model_key: str = "qwen3-vl-8b",
         max_new_tokens: int = None,
         temperature: float = None,
         seed: Optional[int] = None,
     ) -> Dict[str, Any]:
         """Generate text from RGB + Depth images using VLM.
 
-        Depth image is converted to JET colormap (red=near, blue=far)
-        for better visualization by the VLM.
+        Routes to the VLM server (GPU 0, port 8000).
 
         Args:
             rgb_image: PIL Image or numpy array for RGB
             depth_image: numpy array for depth (in meters)
             prompt: Input prompt for generation
-            model_key: VLM model identifier
+            model_key: VLM model identifier (default: qwen3-vl-8b)
             max_new_tokens: Maximum tokens to generate
             temperature: Sampling temperature
             seed: Random seed for deterministic output (default: 42)
@@ -638,26 +678,21 @@ class ModelManager:
         Returns:
             Dictionary with 'response', 'objects', 'scene_description', 'nav_hint'
         """
-        self.logger.debug(f"[generate_vision_dual] Called with model_key={model_key}, max_tokens={max_new_tokens}, temp={temperature}")
-        self.logger.debug(f"[generate_vision_dual] Prompt: {prompt[:200]}..." if len(prompt) > 200 else f"[generate_vision_dual] Prompt: {prompt}")
-
-        # For VLM, use local vLLM server (not SiliconFlow)
-        vlm_client = self._vlm_client if self.use_siliconflow else self._remote_client
-        if not (self.use_remote or self.use_siliconflow) or not vlm_client:
-            self.logger.warning("VLM requires remote server mode or local VLM server")
+        # Get VLM client (routed to GPU 0:8000 via MODEL_SERVER_MAP)
+        vlm_client = self._get_client_for_model(model_key)
+        if vlm_client is None:
+            self.logger.warning("VLM client not available")
             return self._get_vlm_fallback(prompt)
 
         config = self.MODEL_CONFIGS.get(model_key, {})
         if max_new_tokens is None:
-            max_new_tokens = config.get("max_new_tokens", 256)
+            max_new_tokens = config.get("max_new_tokens", 400)
         if temperature is None:
-            temperature = config.get("temperature", 0.3)
+            temperature = config.get("temperature", 0.2)
 
-        # Use fixed seed for deterministic output
         seed_value = seed if seed is not None else 42
 
         try:
-            self.logger.debug(f"[generate_vision_dual] Calling VLM client...")
             result = vlm_client.generate_vision_dual(
                 rgb_image=rgb_image,
                 depth_image=depth_image,
@@ -669,19 +704,13 @@ class ModelManager:
             )
 
             if result.error:
-                self.logger.warning(f"VLM dual-vision generation error: {result.error}")
+                self.logger.warning(f"VLM error: {result.error}")
                 return self._get_vlm_fallback(prompt)
 
-            self.logger.debug(f"[generate_vision_dual] Raw response length: {len(result.response) if result.response else 0}")
-            self.logger.debug(f"[generate_vision_dual] Response preview: {result.response[:300] if result.response else 'None'}...")
-
-            # Parse VLM response
-            parsed = self._parse_vlm_response(result.response)
-            self.logger.debug(f"[generate_vision_dual] Parsed: room_type={parsed.get('room_type')}, objects={len(parsed.get('objects', []))}, nav_hint={parsed.get('nav_hint', '')[:50]}")
-            return parsed
+            return self._parse_vlm_response(result.response)
 
         except Exception as e:
-            self.logger.error(f"VLM dual-vision generation failed: {e}")
+            self.logger.error(f"VLM generation failed: {e}")
             return self._get_vlm_fallback(prompt)
 
     def _parse_vlm_response(self, response: str) -> Dict[str, Any]:
@@ -828,10 +857,12 @@ class ModelManager:
         seed: Optional[int] = None,
         **kwargs
     ) -> str:
-        """Generate text using remote LLM server.
+        """Generate text using multi-server remote LLM routing.
+
+        Routes each model_key to its correct vLLM server based on MODEL_SERVER_MAP.
 
         Args:
-            model_key: Model identifier
+            model_key: Model identifier (routed to correct GPU/server)
             prompt: Input prompt
             max_new_tokens: Maximum tokens to generate
             temperature: Sampling temperature
@@ -842,13 +873,14 @@ class ModelManager:
         Returns:
             Generated text
         """
-        if not self._remote_client:
-            self.logger.error("Remote client not initialized")
+        client = self._get_client_for_model(model_key)
+        if client is None:
+            self.logger.error(f"No client for model_key: {model_key}")
             return ""
 
-        # For unified model server, use model_key directly
-        # Server has all qwen-9b-* aliases registered to the same engine
-        remote_model_key = model_key
+        # Resolve served model name from server map
+        server_info = self.MODEL_SERVER_MAP.get(model_key, (self.remote_server_url, True))
+        remote_model_key = model_key  # vLLM uses --served-model-name to map
 
         config = self.MODEL_CONFIGS.get(model_key, {})
         if max_new_tokens is None:
@@ -856,11 +888,10 @@ class ModelManager:
         if temperature is None:
             temperature = config.get("temperature", 0.3)
 
-        # Use fixed seed for deterministic output
         seed_value = seed if seed is not None else 42
 
         try:
-            result = self._remote_client.generate(
+            result = client.generate(
                 model=remote_model_key,
                 prompt=prompt,
                 max_new_tokens=max_new_tokens,
@@ -872,17 +903,18 @@ class ModelManager:
             )
             return result
         except Exception as e:
-            self.logger.error(f"Remote generation failed: {e}")
+            self.logger.error(f"Remote generation failed for {model_key}: {e}")
             return ""
 
     def _get_available_remote_models(self) -> List[str]:
-        """Get list of available models from remote server."""
-        if not self._remote_client:
+        """Get list of available models from remote servers."""
+        if not self._remote_clients:
             return []
 
         try:
-            # Use health check to get available models
-            health = self._remote_client.health_check_sync()
+            # Check health on first available server
+            first_client = next(iter(self._remote_clients.values()))
+            health = first_client.health_check_sync()
             if isinstance(health, dict) and "models_loaded" in health:
                 return health.get("models_loaded", [])
         except Exception as e:
