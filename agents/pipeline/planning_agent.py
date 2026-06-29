@@ -351,9 +351,17 @@ Position: {position}
 3. If A* direction available → Reference math suggestion for direction
 4. Synthesize analysis reasoning with above sources
 
+## CRITICAL: Alignment-First Rule
+Before going forward, you MUST align with the target. Check visible objects:
+- If a target object (stairs, door, etc.) has direction "forward_left" → start with 1x turn_left
+- If direction is "forward_right" → start with 1x turn_right
+- If direction is "left" → start with 2x turn_left
+- If direction is "right" → start with 2x turn_right
+- ONLY if all target objects show direction="forward" → all forward actions
+
 ## Task
-Generate exactly 5 actions that best achieve the navigation goal.
-Consider ALL sources above and prioritize according to decision priority rules.
+Generate exactly 5 actions. Apply the Alignment-First Rule above.
+First 1-2 actions: turn to face the target. Remaining actions: move forward.
 
 ## Output Format (JSON)
 Output only valid JSON:
@@ -362,6 +370,7 @@ Output only valid JSON:
 ## Rules
 - actions must contain exactly 5 items
 - Each action must be one of: forward, turn_left, turn_right
+- First action(s) MUST be turns if target is not directly forward
 - decision_source indicates which information source influenced your decision most
 - Output ONLY the JSON, no additional text
 """

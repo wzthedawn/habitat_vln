@@ -333,8 +333,14 @@ Current subtask: {subtask.description if hasattr(subtask, 'description') else st
 ## Analysis Steps
 1. Goal Summary: Identify the navigation goal in one sentence
 2. Current Gap: What is missing or blocking progress toward the goal?
-3. Reasoning: Based on observation (especially object features like direction/location/distance), what should the agent do?
-4. Action: Recommend one action: forward, turn_left, or turn_right
+3. ALIGNMENT CHECK: If the subtask target (e.g. stairs, door) is detected with direction "forward_left" or "forward_right", you MUST turn to align with it BEFORE going forward.
+   - "forward_left" → turn_left 1-2 times, then forward
+   - "forward_right" → turn_right 1-2 times, then forward
+   - "left" → turn_left 2-3 times, then forward
+   - "right" → turn_right 2-3 times, then forward
+   - ONLY if direction="forward" → go straight forward
+4. Reasoning: Explain the alignment and movement plan
+5. Action: Recommend one action: forward, turn_left, or turn_right
 
 ## Output Format (JSON)
 Output only valid JSON:
