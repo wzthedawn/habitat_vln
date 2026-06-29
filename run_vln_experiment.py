@@ -885,6 +885,12 @@ class MultiAgentVLNEvaluator:
         # 创建环境适配器
         env = HabitatEnvAdapter(sim, self._get_observations, self.config)
 
+        # R2R离散模式：加载viewpoint图，启用节点间瞬移
+        if self.config.get("r2r_discrete", False):
+            viewpoint_graph = self._load_viewpoint_graph(sim, episode.scene_id)
+            env.set_r2r_discrete(viewpoint_graph)
+            self.logger.info(f"[R2R-Discrete] Viewpoint navigation enabled ({len(viewpoint_graph['viewpoints'])} nodes)")
+
         # 初始化 Navigator
         self.navigator.initialize_episode(
             instruction=episode.instruction,
@@ -1078,6 +1084,142 @@ class MultiAgentVLNEvaluator:
                 np.zeros((self.image_height, self.image_width, 3), dtype=np.uint8),
                 np.zeros((self.image_height, self.image_width), dtype=np.float32)
             )
+
+    def _load_viewpoint_graph(self, sim: Any, scene_id: str) -> Dict[str, Any]:
+        """Load or build viewpoint navigation graph for R2R discrete mode.
+
+        Extracts navigable viewpoints from the scene's navmesh and builds
+        an adjacency graph enabling node-to-node teleportation.
+
+        Returns:
+            Dict with 'viewpoints' (list of positions) and 'adjacency' (dict)
+        """
+        if not hasattr(self, '_viewpoint_cache'):
+            self._viewpoint_cache = {}
+
+        if scene_id in self._viewpoint_cache:
+            return self._viewpoint_cache[scene_id]
+
+        # Sample navigable points from navmesh using pathfinder
+        pathfinder = sim.pathfinder
+        navmesh_verts = pathfinder.build_navmesh_vertices()
+
+        # Subsample uniformly to get viewpoint candidates (~2-3m apart like R2R)
+        viewpoints = []
+        step = 1.5  # meters between sampled viewpoints
+        for v in navmesh_verts:
+            # Check if far enough from existing viewpoints
+            too_close = False
+            for existing in viewpoints:
+                if np.linalg.norm(np.array(v - existing)) < step:
+                    too_close = True
+                    break
+            if not too_close and pathfinder.is_navigable(v):
+                viewpoints.append(v.tolist())
+
+        # Build adjacency: two viewpoints connected if pathfinder finds a short path
+        adjacency = {}
+        for i, v1 in enumerate(viewpoints):
+            adj = []
+            for j, v2 in enumerate(viewpoints):
+                if i == j:
+                    continue
+                dist = np.linalg.norm(np.array(v1) - np.array(v2))
+                if dist < 4.0:  # Adjacent if within 4m (typical R2R node distance)
+                    path = habitat_sim.ShortestPath()
+                    path.requested_start = v1
+                    path.requested_end = v2
+                    found = pathfinder.find_path(path)
+                    if found and path.geodesic_distance < 5.0:
+                        adj.append({'index': j, 'position': v2, 'distance': dist,
+                                    'geodesic': path.geodesic_distance})
+            adjacency[i] = sorted(adj, key=lambda x: x['distance'])
+
+        graph = {'viewpoints': viewpoints, 'adjacency': adjacency}
+        self._viewpoint_cache[scene_id] = graph
+        self.logger.info(f"[R2R-Discrete] Built viewpoint graph: {len(viewpoints)} nodes")
+        return graph
+
+    def _execute_r2r_action(self, sim: Any, action: str, viewpoint_graph: Dict) -> np.ndarray:
+        """Execute action in R2R discrete nav-graph mode.
+
+        move_forward: teleport to adjacent viewpoint in heading direction
+        turn_left/right: rotate ~30° to face adjacent viewpoints
+        stop: no-op
+
+        Returns new position after action.
+        """
+        agent = sim.get_agent(0)
+        state = agent.get_state()
+        pos = np.array(state.position)
+        rot = state.rotation
+
+        # Extract yaw from quaternion
+        import quaternion
+        q_arr = quaternion.as_float_array(rot)
+        w, x, y, z = q_arr[0], q_arr[1], q_arr[2], q_arr[3]
+        siny = 2 * (w * y + x * z)
+        cosy = 1 - 2 * (y * y + z * z)
+        yaw = math.atan2(siny, cosy)
+
+        if action == "move_forward":
+            # Find nearest viewpoint
+            viewpoints = viewpoint_graph['viewpoints']
+            if not viewpoints:
+                sim.step(action)
+                return np.array(agent.get_state().position)
+
+            nearest_idx = min(range(len(viewpoints)),
+                             key=lambda i: np.linalg.norm(np.array(viewpoints[i]) - pos))
+
+            # Find adjacent viewpoint closest to heading direction
+            heading_vec = np.array([math.sin(yaw), 0, math.cos(yaw)])
+            best_adj = None
+            best_score = -2
+
+            for adj_info in viewpoint_graph['adjacency'].get(nearest_idx, []):
+                adj_pos = np.array(adj_info['position'])
+                direction = adj_pos - pos
+                direction[1] = 0  # Ignore Y
+                direction_norm = np.linalg.norm(direction)
+                if direction_norm < 0.1:
+                    continue
+                direction = direction / direction_norm
+                score = np.dot(heading_vec, direction)
+                if score > best_score and score > 0.1:  # Within ~85° of heading
+                    best_score = score
+                    best_adj = adj_info
+
+            if best_adj:
+                # Teleport to adjacent viewpoint
+                new_pos = best_adj['position'].copy()
+                new_pos[1] = sim.pathfinder.get_random_navigable_point_near(
+                    best_adj['position'][0:3], 0.5
+                )[1] if hasattr(sim.pathfinder, 'get_random_navigable_point_near') else best_adj['position'][1]
+
+                state.position = np.array(best_adj['position'])
+                agent.set_state(state)
+                return np.array(best_adj['position'])
+            else:
+                # No adjacent viewpoint found, fall back to physical step
+                sim.step(action)
+                return np.array(agent.get_state().position)
+
+        elif action in ("turn_left", "turn_right"):
+            # Rotate by 30° (standard R2R turn angle)
+            angle = math.radians(30)
+            if action == "turn_left":
+                angle = -angle
+            new_yaw = yaw + angle
+            # Create rotation quaternion for Y-axis rotation
+            new_q = quaternion.from_rotation_vector(np.array([0, new_yaw, 0]))
+            state.rotation = new_q
+            agent.set_state(state)
+            return pos
+
+        else:  # stop, look_up, look_down
+            sim.step(action)
+            return np.array(agent.get_state().position)
 
     def _get_simulator(self, scene_id: str, scene_path: str) -> Any:
         """Get or create Simulator"""
@@ -1380,6 +1522,8 @@ def main():
     # Random seed for reproducibility
     parser.add_argument("--seed", type=int, default=42,
                         help="Random seed for reproducibility (default: 42)")
+    parser.add_argument("--r2r-discrete", action="store_true", default=False,
+                        help="Use R2R discrete nav-graph mode (viewpoint teleportation instead of physical stepping)")
 
     # Output arguments
     parser.add_argument("--output-dir", type=str, default="results",
@@ -1424,6 +1568,7 @@ def main():
         "siliconflow_model": args.siliconflow_model,
         "vlm_server_url": args.vlm_server,
         "output_dir": args.output_dir,
+        "r2r_discrete": args.r2r_discrete,
     }
 
     print("=" * 70)
