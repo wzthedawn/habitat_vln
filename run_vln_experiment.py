@@ -1,32 +1,22 @@
 #!/usr/bin/env python3
 """
-R2R VLN Evaluation Experiment Script
-Uses real Matterport3D scenes and R2R dataset
-Integrates multi-agent LLM navigation system
+R2R VLN Evaluation with Pipeline Agent Architecture.
 
-Multi-Agent Architecture:
-- InstructionAgent: Rule matching, subtask decomposition
-- PerceptionAgent: Visual perception
-- TrajectoryAgent: Mapping + trajectory summary
-- DecisionAgent: Decision making
-- EvaluationAgent: Evaluation (optional)
-
-Dual-environment IPC Architecture:
-- Python 3.9 (Habitat): VLN main process, habitat-sim, YOLO
-- Python 3.10 (LLM Server): Qwen3.5 model inference service
+6-agent pipeline with multi-tier model allocation:
+- SubtaskDecompositionAgent: LLM instruction decomposition (Qwen3.5-9B)
+- ObservationAgent: Structured VLM perception (Qwen3-VL-8B)
+- AnalysisAgent: CoT/Debate/Reflection reasoning (Qwen3.6-35B)
+- PlanningAgent: LLM + topology + A* path planning (Qwen3.6-35B)
+- ReviewAgent: Rule-based + LLM completion verification (Qwen3.5-9B)
+- EmergencyAgent: Depth-based obstacle detection & handling (Qwen3.5-9B)
 
 Usage:
-    # Option 1: Start LLM service (Python 3.10)
-    conda activate habitat_py310
-    python llm_server.py --port 8000
+    # Start vLLM servers
+    bash scripts/start_vllm_multi.sh
 
-    # Run VLN evaluation (Python 3.9)
+    # Run experiment
     conda activate Habitat
-    python run_vln_experiment.py --use-remote-llm --llm-server http://localhost:8000 ...
-
-    # Option 2: Use SiliconFlow API (no local LLM server needed)
-    conda activate Habitat
-    python run_vln_experiment.py --use-siliconflow ...
+    python run_vln_experiment.py --use-remote-llm --episodes 10 --seed 42
 """
 
 import argparse
@@ -1166,7 +1156,7 @@ class MultiAgentVLNEvaluator:
 
     def _should_call_evaluation(self, task_level: str, step_count: int) -> bool:
         """
-        Decide whether to call EvaluationAgent based on task level.
+        Decide whether to call ReviewAgent completion check.
 
         Args:
             task_level: Task level (easy/medium/hard)

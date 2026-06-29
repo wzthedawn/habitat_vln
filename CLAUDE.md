@@ -1,20 +1,10 @@
 # CLAUDE.md
 
-本文件为 Claude Code (claude.ai/code) 在此代码库中工作时提供指导。
+本文件为 Claude Code 在此代码库中工作时提供指导。
 
 ## 项目概述
 
-这是一个多智能体视觉-语言导航（VLN）系统，基于 DiscussNav、MSNav 和 Multi-agent Architecture Search via Agentic Supernet 论文的思路。该系统使用 Habitat 模拟环境实现了分层导航架构。
-
-## 要求
-
-使用第一性原理思考。你不能总是假设我非常清楚自己想要什么和该怎么得到。请保持审慎，从原始需求和问题出发，如果动机和目标不清晰，停下来和我讨论。如果目标清晰但是路径不是最短，告诉我，并且建议更好的办法
-
-1.不能写兼容性代码，除非我主动要求
-2.需求模糊时，先提问澄清再写代码
-3.每次被纠正后，反思并制定不再犯的计划
-4.始终使用中文思考与回答
-
+Pipeline VLN 导航系统：基于 Habitat 模拟器的 6-Agent 流水线架构，使用三层异构模型部署。
 
 ## 常用命令
 
@@ -23,127 +13,81 @@
 pip install -e .
 ```
 
-### 测试
+### 启动多模型 vLLM 服务
 ```bash
-pytest tests/                          # 运行所有测试
-pytest tests/test_agents.py            # 运行指定测试文件
-pytest tests/ -v                       # 详细输出模式
+bash scripts/start_vllm_multi.sh          # 全部3个模型
+bash scripts/start_vllm_multi.sh --no-35b # 跳过35B（节省显存）
 ```
 
-### 训练
+### 运行实验
 ```bash
-python scripts/train.py --config configs/default.yaml --episodes 1000
-```
-
-### 评估（实际主入口）
-```bash
-# 使用远程LLM服务器
-python run_vln_experiment.py --use-remote-llm --llm-server http://localhost:8000 --episodes 5
-
-# 紧急导航评估
-python scripts/run_emergency_eval.py --exp baseline --episodes 10 --use-remote-llm --llm-server http://localhost:8000
-```
-
-### 评估（备用入口）
-```bash
-python scripts/evaluate.py --config configs/default.yaml --episodes 100 --scenes data/scene_datasets/
-```
-
-### 推理
-```bash
-python scripts/inference.py --instruction "turn left and go to the kitchen"
+conda activate Habitat
+python run_vln_experiment.py --use-remote-llm --episodes 10 --seed 42
 ```
 
 ## 系统架构
 
-### 当前实际架构（重要）
-
-**主实验入口**: `run_vln_experiment.py`（根目录）直接管理所有agents，**不使用Supernet/VLNNavigator**。
-
+### Pipeline 流程（唯一架构）
 ```
-run_vln_experiment.py (主实验)
-    ↓ 直接创建
-agents/InstructionAgent, PerceptionAgent, TrajectoryAgent, DecisionAgent
-    ↓ 直接调用
-strategies/ReAct, CoT, Debate, Reflection
+Navigator (编排器 + 双层难度分级)
+    │
+    ├─ SubtaskDecompositionAgent (Qwen3.5-9B, 每episode 1次)
+    │     指令 → 子任务列表 + 静态难度
+    │
+    └─ 导航循环 (每5步=1周期):
+       ├─ ObservationAgent (Qwen3-VL-8B, GPU 0:8000)
+       │     RGB+Depth → 结构化JSON
+       ├─ 深度图障碍检测 (规则, 零LLM)
+       ├─ 动态难度分类 (规则, 零LLM)
+       ├─ EmergencyAgent (Qwen3.5-9B, GPU 1:8001)
+       │     仅触发时调用LLM
+       ├─ AnalysisAgent (Qwen3.6-35B, GPU 2+3:8002)
+       │     CoT / Debate(Light/Standard/Deep) / Reflection
+       ├─ PlanningAgent (Qwen3.6-35B, GPU 2+3:8002)
+       │     LLM + Topology + A* → 5个动作
+       └─ ReviewAgent (Qwen3.5-9B, GPU 1:8001)
+             规则优先(4种条件) + LLM辅助
 ```
 
-**备用入口点**: scripts/inference.py等使用VLNNavigator架构（设计但实际实验未使用）。
+### 三层模型部署 (4x RTX 4090)
+| GPU | 模型 | 端口 | 用途 |
+|-----|------|------|------|
+| 0 | Qwen3-VL-8B-Instruct | 8000 | VLM 结构化感知 |
+| 1 | Qwen3.5-9B-AWQ | 8001 | 快速LLM (分解/审查/应急) |
+| 2+3 | Qwen3.6-35B-A3B FP8 | 8002 | 强推理LLM (CoT/Debate/规划) |
 
+### 难度分级策略
+| 最终难度 | 策略 | LLM调用 | 模型 |
+|---------|------|---------|------|
+| easy | 规则 (跳过LLM) | 0 | 无 |
+| medium | CoT | 1 | 35B |
+| hard (首次) | Debate Light | 2 | 35B |
+| hard (二次) | Debate Standard | 3 | 35B |
+| hard (三次+) | Debate Deep | 4-5 | 35B |
+
+## 项目结构
 ```
-scripts/inference.py (备用)
-    ↓
-VLNNavigator → Supernet → Agents + Strategies
+habitat_vln/
+├── agents/pipeline/         # 6个SubAgent + 工具
+│   ├── navigator.py         # 编排器 + 难度分级
+│   ├── observation_agent.py # VLM 感知
+│   ├── analysis_agent.py    # CoT/Debate/Reflection
+│   ├── planning_agent.py    # LLM + 拓扑 + A*
+│   ├── review_agent.py      # 完成验证
+│   ├── emergency_agent.py   # 应急检测
+│   └── subtask_decomposition_agent.py
+├── core/                    # Action, Context
+├── models/                  # ModelManager (多server路由)
+├── environment/             # Habitat 集成
+├── utils/                   # 工具函数
+├── configs/                 # 配置文件
+├── scripts/                 # 启动脚本
+├── envs/                    # Conda 环境文件
+├── run_vln_experiment.py    # 主实验入口
+└── vllm_server.py           # vLLM 推理服务
 ```
 
-### 分层结构
-- **弱层（Weak level）**：本地小模型处理简单任务（Type-0）
-- **强层（Strong level）**：多智能体协作处理复杂任务（Type-1 至 Type-4）
-
-### 任务类型分类
-系统根据复杂度将导航任务分为 5 类：
-| 类型 | 描述 | 智能体 | 策略 |
-|------|------|--------|------|
-| Type-0 | 单步指令 | 无 | 无 |
-| Type-1 | 走廊导航 | perception, decision | ReAct |
-| Type-2 | 物体查找 | perception, trajectory, decision | ReAct, CoT |
-| Type-3 | 跨房间导航 | 全部智能体 | CoT, Reflection |
-| Type-4 | 模糊场景 | 全部智能体 | CoT, Debate, Reflection |
-
-### 核心组件流程
-1. `VLNNavigator` (core/navigator.py) - 主入口点，协调导航流程
-2. `TaskTypeClassifier` (classifiers/task_classifier.py) - 确定任务复杂度
-3. `Supernet` (supernet/supernet.py) - 选择并执行智能体-策略组合
-4. `Agents` (agents/) - 专用智能体：InstructionAgent、PerceptionAgent、TrajectoryAgent、DecisionAgent
-5. `Strategies` (strategies/) - 执行策略：ReAct、CoT、Debate、Reflection
-6. `FailureHandler` (fallback/failure_handler.py) - 失败时的级联降级处理
-
-### 主要模块结构
-- `core/` - 上下文管理、动作定义、导航器（VLNNavigator备用）
-- `agents/` - BaseAgent 抽象类及其专用实现
-- `strategies/` - BaseStrategy 及策略实现（ReAct、CoT、Debate、Reflection）
-- `supernet/` - 架构编排（备用，主实验不使用）
-- `classifiers/` - 任务类型分类（规则-based + LLM 回退）
-- `models/` - 模型实现（LocalModel、LLMModel、VisualEncoder）
-- `environment/` - Habitat 环境封装器
-- `fallback/` - 失败处理（备用，主实验不使用）
-- `configs/` - YAML 和 Python 配置文件
-- `emergency/` - 紧急导航处理（EmergencyDetector、PathReplanner）
-- `evaluation/` - 评估脚本
-
-## 配置说明
-
-主配置文件：`configs/default.yaml`
-
-主要配置项：
-- `navigation` - 最大步数、停止距离、转向角度
-- `classifier` - 任务分类阈值
-- `supernet` - 架构搜索与自适应选择
-- `agents` - 各智能体设置（超时时间、并行执行）
-- `strategies` - 策略特定参数（最大迭代次数、共识阈值）
-- `optimization` - 各任务类型的 Token 预算、上下文压缩
-- `fallback` - 级联降级层级
-
-## 环境设置
-
-项目集成了位于 `src/habitat-lab-0-3-3/` 的 Habitat 模拟环境。Habitat 依赖为可选项，可单独安装：
+## 测试
 ```bash
-# habitat-sim 和 habitat-lab 为可选依赖
-# 安装说明请参考 src/habitat-lab-0-3-3/
+pytest tests/pipeline/
 ```
-
-## 命令行入口点
-
-setup.py 中定义的命令行脚本：
-- `vln-train` - 训练
-- `vln-eval` - 评估
-- `vln-infer` - 推理
-
-## 测试方法
-
-测试使用 pytest 配合组件 mock。测试文件遵循以下模式：
-- `test_agents.py` - 智能体单元测试与集成测试
-- `test_classifiers.py` - 任务分类器测试
-- `test_strategies.py` - 策略执行测试
-- `test_system_full.py` - 全系统集成测试
-- `test_vln_mock.py` - Mock 导航测试

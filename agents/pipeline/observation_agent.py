@@ -1,10 +1,10 @@
-"""ObservationAgent - VLM核心，任务导向感知。
+"""ObservationAgent - VLM core, task-oriented perception.
 
-与 PerceptionAgent 的关键区别：
-- PerceptionAgent（旧）：通用场景描述 "走廊、椅子、白墙"
-- ObservationAgent（新）：任务相关观察 "楼梯入口在右侧，可行走"
+Uses Qwen3-VL-8B-Instruct for structured scene analysis.
+Outputs structured JSON with objects, navigation cues, and task-relevant hints.
 
-职责：任务导向感知，输出与子任务相关的观察
+Key difference from generic VLMs: outputs task-specific observations
+rather than generic scene descriptions.
 """
 
 import json

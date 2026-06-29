@@ -309,10 +309,12 @@ class StatusReporter:
         """生成Agent卡片HTML"""
         cards = []
         agent_names = {
-            "perception": "👁️ PerceptionAgent",
-            "instruction": "📋 InstructionAgent",
-            "trajectory": "🛤️ TrajectoryAgent",
-            "decision": "🧠 DecisionAgent"
+            "observation": "👁️ ObservationAgent",
+            "analysis": "🧠 AnalysisAgent",
+            "planning": "🗺️ PlanningAgent",
+            "review": "✅ ReviewAgent",
+            "emergency": "🚨 EmergencyAgent",
+            "decomposition": "📋 DecompositionAgent",
         }
 
         for key, name in agent_names.items():

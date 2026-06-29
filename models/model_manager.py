@@ -1,17 +1,11 @@
-"""Model Manager for local and remote model management.
+"""Model Manager with multi-server routing for 3-tier model architecture.
 
-Manages Qwen3.5 series models with INT8 quantization:
-- Qwen3.5-4B (perception): For PerceptionAgent visual descriptions
-- Qwen3.5-2B (trajectory): For TrajectoryAgent path summarization
-- Qwen3.5-4B: For DecisionAgent action selection
-- Qwen3.5-4B (evaluation): For EvaluationAgent decision assessment
-- YOLOv5s: Object detection (compatible with numpy 2.x)
+GPU allocation (4x RTX 4090 24GB):
+- GPU 0: Qwen3-VL-8B-Instruct (17GB) -> port 8000
+- GPU 1: Qwen3.5-9B-AWQ (12GB) -> port 8001
+- GPU 2+3: Qwen3.6-35B-A3B FP8 (~34GB) -> port 8002
 
-Supports dual-environment IPC architecture:
-- Local mode: Load models directly (requires Python 3.10+)
-- Remote mode: Use HTTP API to communicate with LLM server
-
-Total VRAM (INT8, 方案二): ~14.1GB + Habitat ~2GB = ~18GB
+Each model tier gets its own vLLM server instance for isolation.
 """
 
 from typing import Dict, Any, Optional, List, Tuple
