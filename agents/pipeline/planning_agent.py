@@ -359,17 +359,22 @@ Position: {position}
 3. If A* direction available → Reference math suggestion for direction
 4. Synthesize analysis reasoning with above sources
 
-## CRITICAL: Alignment-First Rule
-Before going forward, you MUST align with the target. Check visible objects:
-- If a target object (stairs, door, etc.) has direction "forward_left" → start with 1x turn_left
-- If direction is "forward_right" → start with 1x turn_right
-- If direction is "left" → start with 2x turn_left
-- If direction is "right" → start with 2x turn_right
-- ONLY if all target objects show direction="forward" → all forward actions
+## CRITICAL: Alignment-First Rule + Stair Persistence
+1. TARGET ALIGNMENT:
+   - "forward_left" → turn_left ×1, then forward
+   - "forward_right" → turn_right ×1, then forward
+   - "left" → turn_left ×2, then forward
+   - "right" → turn_right ×2, then forward
+   - ONLY "forward" → all forward
+
+2. STAIR PERSISTENCE (when subtask is about stairs/vertical movement):
+   If you've been trying forward and NOT descending → VARY YOUR APPROACH:
+   - Try: turn_left, forward, forward (approach from slight left)
+   - Or: turn_right, forward, forward (approach from slight right)
+   - The exact stair heading may require fine-tuning. Don't just repeat the same heading!
 
 ## Task
-Generate exactly 5 actions. Apply the Alignment-First Rule above.
-First 1-2 actions: turn to face the target. Remaining actions: move forward.
+Generate exactly 5 actions. Apply rules above.
 
 ## Output Format (JSON)
 Output only valid JSON:
@@ -379,6 +384,7 @@ Output only valid JSON:
 - actions must contain exactly 5 items
 - Each action must be one of: forward, turn_left, turn_right
 - First action(s) MUST be turns if target is not directly forward
+- For stairs: if stuck, vary approach angle, don't repeat same heading
 - decision_source indicates which information source influenced your decision most
 - Output ONLY the JSON, no additional text
 """

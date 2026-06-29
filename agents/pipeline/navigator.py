@@ -481,9 +481,19 @@ class Navigator(BaseAgent):
             )
             self._last_planning_output = planning_output
 
-        # 6. Convert actions
+        # 6. Convert actions - use shorter sequences for stair navigation
         actions = self._action_converter.convert(planning_output.actions)
-        actions = self._action_converter.ensure_5_actions(actions)
+
+        # Stair descent: use only 2-3 actions per cycle for frequent re-alignment
+        is_stair_nav = (observation_output and
+                        hasattr(observation_output, 'stair_position') and
+                        observation_output.stair_position in ("top", "bottom"))
+        if is_stair_nav:
+            # Limit to first 2-3 actions so agent re-observes frequently
+            actions = actions[:3]
+            self.logger.info(f"[Navigator] Stair mode: reduced to {len(actions)} actions for re-alignment")
+        else:
+            actions = self._action_converter.ensure_5_actions(actions)
 
         return actions
 
