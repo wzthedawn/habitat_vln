@@ -276,9 +276,8 @@ class AnalysisAgent(SubAgent):
             Analysis result dictionary
         """
         prompt = self._build_cot_prompt(observation, subtask, history, subtask_progress)
-        # Use strong model for better reasoning quality
         model = self.config.get("strong_model_key", "qwen3.6-35b-strong")
-        response = self._call_llm(prompt, max_tokens=400, temperature=0.3,
+        response = self._call_llm(prompt, max_tokens=250, temperature=0.3,
                                   model_key=model)
 
         return self._parse_response(response)

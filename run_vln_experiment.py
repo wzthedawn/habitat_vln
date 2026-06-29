@@ -1005,6 +1005,15 @@ class MultiAgentVLNEvaluator:
                     # 计算距离目标
                     distance_to_goal = calc.compute_distance(position, self.navigator._current_subtask.get("completion_condition", {}).get("goal_position", [0,0,0]))
 
+                    # Early termination: stuck + far from goal
+                    if self.config.get("fast_mode", False) and step_count > 20:
+                        recent_positions = trajectory[-20:]
+                        unique = set((round(p[0], 1), round(p[2], 1)) for p in recent_positions)
+                        if len(unique) <= 3 and distance_to_goal > 5.0:
+                            self.logger.info(f"[EarlyStop] Stuck: {len(unique)} unique positions in last 20 steps, NE={distance_to_goal:.1f}m")
+                            step_count = self.config.get("max_steps", 999) + 1  # force exit
+                            break
+
                     # 更新 reporter
                     if reporter:
                         reporter.update_position(position[0], position[1], position[2])
@@ -1530,12 +1539,23 @@ def main():
                         help="Use R2R discrete nav-graph mode (viewpoint teleportation instead of physical stepping)")
     parser.add_argument("--shuffle", action="store_true", default=False,
                         help="Randomly shuffle episodes for diverse scene coverage")
+    parser.add_argument("--fast", action="store_true", default=False,
+                        help="Fast dev mode: all models route to 9B, max-steps=80, early termination")
 
     # Output arguments
     parser.add_argument("--output-dir", type=str, default="results",
                         help="Output directory for results (default: results)")
 
     args = parser.parse_args()
+
+    # Fast mode: all models → 9B, shorter episodes, early termination
+    if args.fast:
+        from models.model_manager import ModelManager
+        for k in ModelManager.MODEL_SERVER_MAP:
+            ModelManager.MODEL_SERVER_MAP[k] = ('http://localhost:8000', True)
+        if args.max_steps == 50:  # only override if user didn't specify
+            args.max_steps = 80
+        print("[FAST MODE] All models → 9B (GPU 0), max_steps=80, early termination ON")
 
     # Set random seed for reproducibility
     random.seed(args.seed)
@@ -1576,6 +1596,7 @@ def main():
         "output_dir": args.output_dir,
         "r2r_discrete": args.r2r_discrete,
         "shuffle_episodes": args.shuffle,
+        "fast_mode": args.fast,
     }
 
     print("=" * 70)

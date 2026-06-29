@@ -239,7 +239,7 @@ class PlanningAgent(SubAgent):
         )
 
         mk = self.config.get("strong_model_key", self.config.get("model_key", "qwen3.5-9b-fast"))
-        response = self._call_llm(prompt, max_tokens=400, temperature=0.5, model_key=mk)
+        response = self._call_llm(prompt, max_tokens=200, temperature=0.5, model_key=mk)
         return self._parse_response(response)
 
     def _build_llm_prompt(
