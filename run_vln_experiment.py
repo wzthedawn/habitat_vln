@@ -1541,6 +1541,8 @@ def main():
                         help="Randomly shuffle episodes for diverse scene coverage")
     parser.add_argument("--fast", action="store_true", default=False,
                         help="Fast dev mode: all models route to 9B, max-steps=80, early termination")
+    parser.add_argument("--resolution", type=int, default=480,
+                        help="Camera resolution (height, default 480). Width=height*4/3")
 
     # Output arguments
     parser.add_argument("--output-dir", type=str, default="results",
@@ -1597,6 +1599,8 @@ def main():
         "r2r_discrete": args.r2r_discrete,
         "shuffle_episodes": args.shuffle,
         "fast_mode": args.fast,
+        "image_width": int(args.resolution * 4 / 3),
+        "image_height": args.resolution,
     }
 
     print("=" * 70)
