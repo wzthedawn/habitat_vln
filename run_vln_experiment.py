@@ -606,8 +606,13 @@ class MultiAgentVLNEvaluator:
         episodes_to_run = self.episodes[start_idx:]
         num_to_run = min(num_episodes or len(episodes_to_run), len(episodes_to_run))
 
+        # Random shuffle for diverse scene coverage
+        if self.config.get("shuffle_episodes", False):
+            random.shuffle(episodes_to_run)
+            self.logger.info("Episodes shuffled for random sampling")
+
         self.logger.info("=" * 60)
-        self.logger.info(f"Starting evaluation - {num_to_run} episodes (from Episode {episodes_to_run[0].episode_id if episodes_to_run else 'N/A'})")
+        self.logger.info(f"Starting evaluation - {num_to_run} episodes")
         self.logger.info("=" * 60)
 
         start_time = time.time()
@@ -1523,6 +1528,8 @@ def main():
                         help="Random seed for reproducibility (default: 42)")
     parser.add_argument("--r2r-discrete", action="store_true", default=False,
                         help="Use R2R discrete nav-graph mode (viewpoint teleportation instead of physical stepping)")
+    parser.add_argument("--shuffle", action="store_true", default=False,
+                        help="Randomly shuffle episodes for diverse scene coverage")
 
     # Output arguments
     parser.add_argument("--output-dir", type=str, default="results",
@@ -1568,6 +1575,7 @@ def main():
         "vlm_server_url": args.vlm_server,
         "output_dir": args.output_dir,
         "r2r_discrete": args.r2r_discrete,
+        "shuffle_episodes": args.shuffle,
     }
 
     print("=" * 70)
