@@ -1,109 +1,107 @@
-# Multi-Agent VLN Navigation System
+# Pipeline VLN Navigation System
 
-A hierarchical multi-agent collaborative vision-language navigation system based on the ideas from DiscussNav, MSNav, and Multi-agent Architecture Search via Agentic Supernet papers.
+Hierarchical vision-language navigation system with multi-tier model allocation.
 
-## Features
+## Architecture
 
-- **Hierarchical Architecture**: Weak level (local small model) + Strong level (multi-agent collaboration)
-- **Task-Driven Selection**: Automatic agent and strategy selection based on task complexity
-- **Token Optimization**: Layered prompts, context compression, and cache reuse
-- **Multiple Strategies**: ReAct, Chain of Thought, Debate, and Reflection strategies
+```
+ObservationAgent (Qwen3-VL-8B)  →  EmergencyAgent  →  AnalysisAgent (CoT/Debate/Reflection)
+        ↓                              ↓                        ↓
+  Structured JSON              Depth obstacle check      Qwen3.6-35B strong LLM
+        ↓                                                     ↓
+  Dynamic Difficulty  ←──────────────────────────→  PlanningAgent (LLM + Topology + A*)
+                                                            ↓
+                                                     ActionConverter (5 actions)
+                                                            ↓
+                                                      ReviewAgent (rule + LLM)
+```
 
 ## Project Structure
 
 ```
 habitat_vln/
-├── configs/           # Configuration files
-├── core/              # Core modules (context, action, navigator)
-├── classifiers/       # Task type classifiers
-├── supernet/          # Agent-strategy orchestration
-├── agents/            # Specialized agents
-├── strategies/        # Navigation strategies
-├── models/            # Model implementations
-├── optimization/      # Token optimization
-├── fallback/          # Failure handling
-├── environment/       # Habitat integration
-├── utils/             # Utilities
-├── scripts/           # Training and evaluation scripts
-└── tests/             # Unit tests
+├── agents/                  # Pipeline Agent architecture
+│   ├── base_agent.py        # Shared base class
+│   └── pipeline/
+│       ├── navigator.py     # Orchestrator + difficulty grading
+│       ├── observation_agent.py    # VLM perception (Qwen3-VL-8B)
+│       ├── analysis_agent.py      # CoT/Debate/Reflection reasoning
+│       ├── planning_agent.py      # LLM + topology + A* planning
+│       ├── review_agent.py        # Completion verification
+│       ├── emergency_agent.py     # Obstacle detection & handling
+│       ├── subtask_decomposition_agent.py
+│       └── tools/                 # ActionConverter, TopologyGraph, etc.
+├── core/                    # Action, Context, EscapePlanner
+├── models/                  # ModelManager, RemoteLLMClient
+├── environment/             # Habitat simulator integration
+├── utils/                   # Metrics, logging, visualization
+├── configs/                 # YAML configuration files
+├── data/                    # Dataset preparation scripts
+├── scripts/                 # Entry point scripts
+│   ├── start_vllm.sh        # vLLM server launcher
+│   ├── download_qwen.py     # Model download tool
+│   └── download_r2r.py      # R2R dataset download
+├── envs/                    # Conda environment files
+├── docs/                    # Design docs & specifications
+├── tests/                   # Unit tests
+├── run_vln_experiment.py    # Main experiment runner
+├── vllm_server.py           # vLLM inference server
+└── setup.py                 # Package setup
 ```
-
-## Task Type Classification
-
-| Type | Name | Description | Agents | Strategies |
-|------|------|-------------|--------|------------|
-| Type-0 | Simple Navigation | Single step instruction | None | None |
-| Type-1 | Path Following | Corridor navigation | perception + decision | ReAct |
-| Type-2 | Target Search | Object finding | perception + trajectory + decision | ReAct + CoT |
-| Type-3 | Spatial Reasoning | Cross-room navigation | All | CoT + Reflection |
-| Type-4 | Complex Decision | Ambiguous scenes | All | CoT + Debate + Reflection |
 
 ## Quick Start
 
-### Installation
+### 1. Setup Environment
 
 ```bash
-pip install -r requirements.txt
+# Create conda environments
+conda env create -f envs/habitat_env.yml      # Python 3.9 + Habitat
+conda env create -f envs/vllm_env.yml         # Python 3.10 + vLLM
+
+# Install package
 pip install -e .
 ```
 
-### Basic Usage
-
-```python
-from core.navigator import VLNNavigator
-
-# Initialize navigator
-navigator = VLNNavigator()
-navigator.initialize()
-
-# Set instruction and navigate
-navigator.set_instruction("turn left and go to the kitchen")
-action = navigator.navigate()
-
-print(f"Action: {action.action_type.name}")
-```
-
-### Training
+### 2. Download Models
 
 ```bash
-python scripts/train.py --config configs/default.yaml --episodes 1000
+python scripts/download_qwen.py --model qwen3-vl-8b --output /data/WZ/Model/Qwen/
 ```
 
-### Evaluation
+### 3. Start vLLM Server
 
 ```bash
-python scripts/evaluate.py --config configs/default.yaml --episodes 100
+bash scripts/start_vllm.sh vl8b 8000
 ```
 
-### Inference
+### 4. Run Experiment
 
 ```bash
-python scripts/inference.py --instruction "find the red chair"
+conda activate Habitat
+python run_vln_experiment.py \
+    --use-remote-llm \
+    --llm-server http://localhost:8000 \
+    --episodes 10 \
+    --seed 42
 ```
 
-## Configuration
+## Model Tiers
 
-Configuration files are located in `configs/`:
+| Tier | Model | Size | Purpose |
+|------|-------|------|---------|
+| VLM | Qwen3-VL-8B-Instruct | 17GB | Structured scene perception |
+| Fast LLM | Qwen3.5-9B-AWQ | 12GB | Decomposition, review, emergency |
+| Strong LLM | Qwen3.6-35B-A3B | 67GB | CoT, Debate, Reflection, Planning |
 
-- `default.yaml`: Main configuration
-- `model_config.yaml`: Model settings
-- `architecture_config.yaml`: Agent-strategy mapping
+## Difficulty-Graded Strategy
 
-## Testing
-
-```bash
-pytest tests/
-```
-
-## Architecture
-
-The system uses a hierarchical architecture:
-
-1. **Task Classifier**: Determines task complexity (Type-0 to Type-4)
-2. **Supernet**: Orchestrates agent-strategy combinations
-3. **Agents**: Instruction, Perception, Trajectory, Decision
-4. **Strategies**: ReAct, CoT, Debate, Reflection
-5. **Fallback**: Cascading degradation for failures
+| Difficulty | Strategy | LLM Calls | Model |
+|-----------|----------|-----------|-------|
+| easy | Rule (skip LLM) | 0 | None |
+| medium | CoT | 1 | 35B |
+| hard (1st) | Debate Light | 2 | 35B |
+| hard (2nd) | Debate Standard | 3 | 35B |
+| hard (3rd+) | Debate Deep | 4-5 | 35B |
 
 ## License
 

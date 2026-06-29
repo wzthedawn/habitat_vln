@@ -1,17 +1,13 @@
 #!/usr/bin/env python3
-"""Setup script for Multi-Agent VLN Navigation System."""
+"""Setup script for Pipeline VLN Navigation System."""
 
 from setuptools import setup, find_packages
 from pathlib import Path
 
-# Read README
 readme_path = Path(__file__).parent / "README.md"
-long_description = ""
-if readme_path.exists():
-    long_description = readme_path.read_text()
+long_description = readme_path.read_text() if readme_path.exists() else ""
 
-# Read requirements
-requirements_path = Path(__file__).parent / "requirements.txt"
+requirements_path = Path(__file__).parent / "envs" / "requirements.txt"
 requirements = []
 if requirements_path.exists():
     requirements = [
@@ -22,14 +18,13 @@ if requirements_path.exists():
 
 setup(
     name="habitat_vln",
-    version="1.0.0",
-    description="Multi-Agent VLN Navigation System",
+    version="2.0.0",
+    description="Pipeline VLN Navigation System with Multi-Tier Model Architecture",
     long_description=long_description,
     long_description_content_type="text/markdown",
     author="VLN Research Team",
-    author_email="",
-    url="https://github.com/example/habitat_vln",
-    packages=find_packages(),
+    url="https://github.com/wzthedawn/habitat_vln",
+    packages=find_packages(exclude=["tests", "src", "docs", "logs", "results"]),
     install_requires=requirements,
     python_requires=">=3.9",
     classifiers=[
@@ -39,14 +34,12 @@ setup(
         "Programming Language :: Python :: 3",
         "Programming Language :: Python :: 3.9",
         "Programming Language :: Python :: 3.10",
-        "Programming Language :: Python :: 3.11",
         "Topic :: Scientific/Engineering :: Artificial Intelligence",
     ],
     entry_points={
         "console_scripts": [
-            "vln-train=scripts.train:main",
-            "vln-eval=scripts.evaluate:main",
-            "vln-infer=scripts.inference:main",
+            "vln-eval=run_vln_experiment:main",
+            "vln-server=vllm_server:main",
         ],
     },
     include_package_data=True,
