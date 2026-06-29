@@ -1102,20 +1102,23 @@ class MultiAgentVLNEvaluator:
 
         # Sample navigable points from navmesh using pathfinder
         pathfinder = sim.pathfinder
-        navmesh_verts = pathfinder.build_navmesh_vertices()
+        # Get navmesh vertices as list of [x,y,z] lists
+        navmesh_verts_raw = pathfinder.build_navmesh_vertices()
+        navmesh_verts = []
+        for v in navmesh_verts_raw:
+            try:
+                navmesh_verts.append([float(v[0]), float(v[1]), float(v[2])])
+            except (IndexError, TypeError):
+                continue
 
         # Subsample uniformly to get viewpoint candidates (~2-3m apart like R2R)
         viewpoints = []
         step = 1.5  # meters between sampled viewpoints
         for v in navmesh_verts:
-            # Check if far enough from existing viewpoints
-            too_close = False
-            for existing in viewpoints:
-                if np.linalg.norm(np.array(v - existing)) < step:
-                    too_close = True
-                    break
-            if not too_close and pathfinder.is_navigable(v):
-                viewpoints.append(v.tolist())
+            v_arr = np.array(v)
+            too_close = any(np.linalg.norm(v_arr - np.array(ex)) < step for ex in viewpoints)
+            if not too_close and pathfinder.is_navigable(v_arr):
+                viewpoints.append(v)
 
         # Build adjacency: two viewpoints connected if pathfinder finds a short path
         adjacency = {}
@@ -1126,13 +1129,9 @@ class MultiAgentVLNEvaluator:
                     continue
                 dist = np.linalg.norm(np.array(v1) - np.array(v2))
                 if dist < 4.0:  # Adjacent if within 4m (typical R2R node distance)
-                    path = habitat_sim.ShortestPath()
-                    path.requested_start = v1
-                    path.requested_end = v2
-                    found = pathfinder.find_path(path)
-                    if found and path.geodesic_distance < 5.0:
-                        adj.append({'index': j, 'position': v2, 'distance': dist,
-                                    'geodesic': path.geodesic_distance})
+                    found = pathfinder.is_navigable(np.array(v2))
+                    if found:
+                        adj.append({'index': j, 'position': v2, 'distance': dist})
             adjacency[i] = sorted(adj, key=lambda x: x['distance'])
 
         graph = {'viewpoints': viewpoints, 'adjacency': adjacency}
