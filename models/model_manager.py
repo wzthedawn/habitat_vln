@@ -151,24 +151,18 @@ class ModelManager:
     }
 
     # Multi-server routing: model_key → (server_url, use_openai)
-    # Matches the 3-server deployment in scripts/start_vllm_multi.sh
-    # TODO: uncomment multi-server config once all 3 servers are running
+    # 3-server deployment: VLM GPU0:8000, Fast GPU0:8000, Strong GPU2+3:8002
     MODEL_SERVER_MAP = {
-        # Single-server mode (all models → GPU 0:8000, for testing)
-        "qwen3-vl-8b":           ("http://localhost:8000", True),
-        "qwen3.5-9b-fast":       ("http://localhost:8000", True),
-        "qwen3.6-35b-strong":    ("http://localhost:8000", True),
-        # Backward compat aliases
+        # Multi-server: GPU0=9B(8000), GPU2+3=35B FP8(8002)
+        "qwen3-vl-8b":           ("http://localhost:8000", True),   # GPU 0 (shared 9B)
+        "qwen3.5-9b-fast":       ("http://localhost:8000", True),   # GPU 0
+        "qwen3.6-35b-strong":    ("http://localhost:8002", True),   # GPU 2+3 FP8
         "qwen-9b":               ("http://localhost:8000", True),
         "qwen-9b-perception":    ("http://localhost:8000", True),
         "qwen-9b-decision":      ("http://localhost:8000", True),
         "qwen-9b-instruction":   ("http://localhost:8000", True),
         "qwen-9b-evaluation":    ("http://localhost:8000", True),
         "qwen-9b-trajectory":    ("http://localhost:8000", True),
-        # Multi-server mode (uncomment when all servers are up):
-        # "qwen3-vl-8b":           ("http://localhost:8000", True),   # GPU 0
-        # "qwen3.5-9b-fast":       ("http://localhost:8001", True),   # GPU 1
-        # "qwen3.6-35b-strong":    ("http://localhost:8002", True),   # GPU 2+3
     }
 
     def __new__(cls, config: Dict[str, Any] = None):
@@ -230,9 +224,8 @@ class ModelManager:
     def _resolve_served_name(self, model_key: str) -> str:
         """Resolve the actual served model name on the vLLM server.
 
-        When all models share one vLLM instance (single-server mode),
-        all keys map to the same served name. In multi-server mode,
-        each server has its own served name.
+        In multi-server mode, each server has its own --served-model-name.
+        In single-server mode, all keys map to one unified name.
 
         Args:
             model_key: Internal model key
@@ -240,13 +233,20 @@ class ModelManager:
         Returns:
             Model name string to send to vLLM server
         """
-        # In single-server mode, everything goes to qwen3.5-9b-fast
-        # In multi-server mode, the key itself is the served name
-        # When all servers point to the same URL, use unified name
-        unique_servers = set(url for url, _ in self.MODEL_SERVER_MAP.values())
-        if len(unique_servers) == 1:
-            return "qwen3.5-9b-fast"
-        return model_key
+        # Multi-server: each server registers its own name via --served-model-name
+        # GPU 0:8000 → qwen3.5-9b-fast, GPU 2+3:8002 → qwen3.6-35b-strong
+        server_map = {
+            "qwen3-vl-8b": "qwen3.5-9b-fast",       # shares GPU 0 with 9B
+            "qwen3.5-9b-fast": "qwen3.5-9b-fast",
+            "qwen3.6-35b-strong": "qwen3.6-35b-strong",  # GPU 2+3 dedicated server
+            "qwen-9b": "qwen3.5-9b-fast",
+            "qwen-9b-perception": "qwen3.5-9b-fast",
+            "qwen-9b-decision": "qwen3.5-9b-fast",
+            "qwen-9b-instruction": "qwen3.5-9b-fast",
+            "qwen-9b-evaluation": "qwen3.5-9b-fast",
+            "qwen-9b-trajectory": "qwen3.5-9b-fast",
+        }
+        return server_map.get(model_key, model_key)
 
     def _get_client_for_model(self, model_key: str):
         """Get or create a RemoteLLMClient for the given model_key.
