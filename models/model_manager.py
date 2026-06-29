@@ -154,7 +154,7 @@ class ModelManager:
     # 3-server deployment: VLM GPU0:8000, Fast GPU0:8000, Strong GPU2+3:8002
     MODEL_SERVER_MAP = {
         # Multi-server: GPU0=9B(8000), GPU2+3=35B FP8(8002)
-        "qwen3-vl-8b":           ("http://localhost:8000", True),   # GPU 0 (shared 9B)
+        "qwen3-vl-8b":           ("http://localhost:8001", True),   # GPU 1 dedicated VLM
         "qwen3.5-9b-fast":       ("http://localhost:8000", True),   # GPU 0
         "qwen3.6-35b-strong":    ("http://localhost:8002", True),   # GPU 2+3 FP8
         "qwen-9b":               ("http://localhost:8000", True),
@@ -236,7 +236,7 @@ class ModelManager:
         # Multi-server: each server registers its own name via --served-model-name
         # GPU 0:8000 → qwen3.5-9b-fast, GPU 2+3:8002 → qwen3.6-35b-strong
         server_map = {
-            "qwen3-vl-8b": "qwen3.5-9b-fast",       # shares GPU 0 with 9B
+            "qwen3-vl-8b": "qwen3-vl-8b",             # GPU 1 dedicated VLM
             "qwen3.5-9b-fast": "qwen3.5-9b-fast",
             "qwen3.6-35b-strong": "qwen3.6-35b-strong",  # GPU 2+3 dedicated server
             "qwen-9b": "qwen3.5-9b-fast",
