@@ -79,7 +79,7 @@ class PlanningAgent(SubAgent):
             PlanningOutput with action sequence and expected result
         """
         # Algorithm selection (rule-based, no LLM)
-        algorithm = self._select_algorithm(topology, goal)
+        algorithm = self._select_algorithm(topology, goal, observation)
 
         self.logger.info(f"[PlanningAgent] Selected algorithm: {algorithm}")
 
@@ -98,22 +98,30 @@ class PlanningAgent(SubAgent):
 
         return PlanningOutput(**result)
 
-    def _select_algorithm(self, topology: TopologyGraph, goal: Optional[List[float]]) -> str:
+    def _select_algorithm(self, topology: TopologyGraph, goal: Optional[List[float]],
+                          observation: Optional[ObservationOutput] = None) -> str:
         """Select planning algorithm based on available information.
 
         Rule-based selection logic (no LLM):
-        - topology: when topology has key nodes (highest priority)
-        - astar: when goal coordinates available (no key nodes)
+        - llm: when stairs are detected (needs semantic reasoning)
+        - topology: when topology has key nodes and no stairs
+        - astar: when goal coordinates available
         - llm: default fallback
 
         Args:
             topology: Topology graph
             goal: Goal position (optional)
+            observation: Observation output for stair detection
 
         Returns:
             Algorithm name: "topology", "astar", or "llm"
         """
-        # Topology planning: highest priority when key nodes exist
+        # Stair navigation needs LLM semantic reasoning
+        if observation and hasattr(observation, 'stair_position'):
+            if observation.stair_position in ("top", "bottom"):
+                return "llm"
+
+        # Topology planning: when key nodes exist
         if topology.has_key_nodes():
             return "topology"
 
@@ -449,7 +457,7 @@ Output only valid JSON:
 ## Navigation Goal
 - Goal: {analysis.goal_summary}
 - Current gap: {analysis.current_gap}
-- Recommended: {analysis.recommended_action}
+- Recommended action: {analysis.recommended_action}
 
 ## Current Position
 Position: {position}
@@ -457,9 +465,16 @@ Position: {position}
 ## Nearby Key Nodes (Navigation landmarks)
 {nodes_text if nodes_text else "No nearby key nodes found"}
 
+## CRITICAL: Alignment-First Rule
+Before moving forward, turn to face the target direction:
+- If recommended_action is "turn_left" → start with turn_left
+- If recommended_action is "turn_right" → start with turn_right
+- If recommended_action is "forward" BUT the nearest valuable node is to the left/right → turn toward it first
+- Stairs nodes (stairs_entry) with direction "descend" → must walk forward toward them
+- ONLY all forward if target is directly ahead
+
 ## Task
-Select the best key node to navigate toward and generate actions to reach it.
-Key nodes like turn_point, room_entry, stairs_entry are useful landmarks.
+Generate exactly 5 actions. Apply the Alignment-First Rule above.
 
 ## Output Format (JSON)
 Output only valid JSON:
@@ -468,6 +483,7 @@ Output only valid JSON:
 ## Rules
 - actions must contain exactly 5 items
 - Each action must be one of: forward, turn_left, turn_right
+- First action MUST turn toward the target if not directly forward
 - Choose actions that navigate toward the most useful key node
 - Output ONLY the JSON"""
 
