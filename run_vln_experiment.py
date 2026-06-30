@@ -1508,8 +1508,8 @@ def main():
     parser.add_argument("--start-episode", type=int, default=None, help="Starting episode ID (default: start from first)")
     parser.add_argument("--max-steps", type=int, default=50, help="Maximum steps per episode")
     parser.add_argument("--success-distance", type=float, default=3.0, help="Success distance threshold (meters)")
-    parser.add_argument("--output", type=str, default=None,
-                        help="Output JSON filename (default: results_timestamp.json)")
+    parser.add_argument("--output", type=str, default="results/results.json",
+                        help="Output JSON filename (default: results/results.json)")
     parser.add_argument("--log-level", type=str, default="INFO")
     parser.add_argument("--device", type=str, default="cuda")
     parser.add_argument("--no-int8", action="store_true", default=False, help="Disable INT8 quantization (use FP16)")
@@ -1657,6 +1657,7 @@ def main():
     print("=" * 70)
 
     # Save results
+    os.makedirs(os.path.dirname(args.output) or ".", exist_ok=True)
     with open(args.output, "w") as f:
         json.dump(results, f, indent=2)
     print(f"\nResults saved to: {args.output}")

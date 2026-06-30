@@ -408,6 +408,14 @@ class Navigator(BaseAgent):
         # 2.6 Depth-based obstacle check with smart escape direction
         depth_info = self._check_depth_obstacle(depth)
         self._last_depth_info = depth_info
+
+        # Only trigger emergency when BOTH depth-blocked AND position stuck
+        # (walking close to walls is normal; stuck + wall = real emergency)
+        is_stuck = self._consecutive_low_confidence > 0 or (
+            len(self._last_positions) >= 3 and
+            len(set((round(p[0], 1), round(p[2], 1)) for p in self._last_positions[-3:])) <= 1
+        )
+        depth_info["blocked_and_stuck"] = depth_info.get("blocked", False) and is_stuck
         if not depth_info.get("blocked", False):
             self._clear_emergency_state()
 
@@ -421,7 +429,7 @@ class Navigator(BaseAgent):
                     "collision_status": False,
                     "position": self._position,
                     "topology": self._topology,
-                    "depth_blocked": depth_info["blocked"],
+                    "depth_blocked": depth_info["blocked_and_stuck"],
                     "depth_info": depth_info,
                 },
             )
@@ -640,7 +648,7 @@ class Navigator(BaseAgent):
     def _check_completion(self) -> bool:
         """Check if current subtask is completed.
 
-        Uses ReviewAgent for verification.
+        Uses ReviewAgent for structured verification + direct proximity fallback.
 
         Returns:
             True if task completed, False otherwise
@@ -652,6 +660,21 @@ class Navigator(BaseAgent):
         completion_condition = self._current_subtask.get("completion_condition")
         if completion_condition is None:
             return False
+
+        # Direct proximity check: if within 3m of goal, succeed immediately
+        goal_pos = completion_condition.get("goal_position")
+        if goal_pos and self._position:
+            dist = self._state_calculator.compute_distance(self._position, goal_pos)
+            if dist < 3.0:
+                self.logger.info(f"[Completion] Proximity: {dist:.1f}m < 3.0m = SUCCESS")
+                # If this is the last subtask, done. Otherwise advance.
+                if self._current_subtask_index >= len(self._subtasks) - 1:
+                    return True
+                else:
+                    self._current_subtask_index += 1
+                    self._current_subtask = self._subtasks[self._current_subtask_index]
+                    self.logger.info(f"[Completion] Advanced to subtask {self._current_subtask_index + 1}")
+                    return False
 
         # Need at least 2 history entries for state change
         if len(self._history) < 2:
@@ -670,6 +693,13 @@ class Navigator(BaseAgent):
             start_rot, self._rotation
         )
         state_change["rotation_change"] = rotation_change
+
+        # Add absolute distance to goal (critical for completion check)
+        goal_pos = self._current_subtask.get("completion_condition", {}).get("goal_position")
+        if goal_pos:
+            state_change["distance_to_goal"] = self._state_calculator.compute_distance(
+                self._position, goal_pos
+            )
 
         # Create subtask object for ReviewAgent
         class SubtaskObj:
