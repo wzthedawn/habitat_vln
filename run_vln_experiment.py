@@ -1002,6 +1002,15 @@ class MultiAgentVLNEvaluator:
                     rotation = self.navigator._rotation
                     trajectory.append(position)
 
+                    # 检查完成条件
+                    if self.navigator._check_completion():
+                        self.logger.info(f"[Pipeline] Task completed at step {step_count}")
+                        return {
+                            "success": True, "steps": step_count,
+                            "reason": "task_completed",
+                            "trajectory": trajectory, "images": images,
+                        }
+
                     # 计算距离目标
                     distance_to_goal = calc.compute_distance(position, self.navigator._current_subtask.get("completion_condition", {}).get("goal_position", [0,0,0]))
 
